@@ -15,6 +15,7 @@
 #include "engine/assets/ftex.h"
 #include "engine/core/log.h"
 #include "engine/fs/vfs.h"
+#include "engine/render/bc_decode.h"
 
 namespace pt {
 namespace {
@@ -88,6 +89,10 @@ const char* DebugViewNames() {
 bool SceneRenderer::EnsureShadowTarget() {
     const vk::AllocTag tag("shadow atlas");
     uint32_t tile = graphics.shadow_quality<=1?512u:graphics.shadow_quality==2?1024u:2048u;
+#if defined(PT_IOS)
+    // a phone GPU: the original's shadows at 1024 px tiles (a 4096 atlas, a quarter of the fill and 64 MB instead of 256)
+    tile = std::min(tile, 1024u);
+#endif
     tile = std::min(tile, shadow_tile_cap_);
     uint32_t size=tile*4;
     if(shadow_.Valid() && shadow_.Extent().width==size) return true;
@@ -950,6 +955,16 @@ void SceneRenderer::WriteImageDescriptors() {
 bool SceneRenderer::UploadImage(gpu::ImageResource& image, gpu::Format format, gpu::Extent3D extent, const void* data, size_t size) {
     const vk::AllocTag tag("scene images");
     bool created = false;
+    std::vector<uint8_t> decoded;
+    if (!renderer_->Context().bc_textures && BcDecodedFormat(static_cast<VkFormat>(format)) != VK_FORMAT_UNDEFINED) {
+        // a GPU without BC textures (render/bc_decode.h)
+        if (!DecodeBc(static_cast<VkFormat>(format), extent.width, extent.height, {static_cast<const uint8_t*>(data), size}, decoded)) {
+            return false;
+        }
+        format = static_cast<gpu::Format>(BcDecodedFormat(static_cast<VkFormat>(format)));
+        data = decoded.data();
+        size = decoded.size();
+    }
     if (!image.image || image.format != format || image.extent.width != extent.width || image.extent.height != extent.height ||
         image.extent.depth != extent.depth) {
         if (image.image) {
@@ -983,8 +998,20 @@ bool SceneRenderer::UploadImage(gpu::ImageResource& image, gpu::Format format, g
     return true;
 }
 
-bool SceneRenderer::UploadImageMips(gpu::ImageResource& image, gpu::Format format, gpu::Extent3D extent, const std::vector<std::vector<uint8_t>>& mips) {
+bool SceneRenderer::UploadImageMips(gpu::ImageResource& image, gpu::Format format, gpu::Extent3D extent, const std::vector<std::vector<uint8_t>>& source) {
     const vk::AllocTag tag("scene images");
+    std::vector<std::vector<uint8_t>> decoded;
+    if (!renderer_->Context().bc_textures && BcDecodedFormat(static_cast<VkFormat>(format)) != VK_FORMAT_UNDEFINED) {
+        decoded.resize(source.size());
+        for (size_t level = 0; level < source.size(); ++level) {
+            if (!DecodeBc(static_cast<VkFormat>(format), std::max(extent.width >> level, 1u), std::max(extent.height >> level, 1u), source[level],
+                          decoded[level])) {
+                return false;
+            }
+        }
+        format = static_cast<gpu::Format>(BcDecodedFormat(static_cast<VkFormat>(format)));
+    }
+    const std::vector<std::vector<uint8_t>>& mips = decoded.empty() ? source : decoded;
     const uint32_t levels = static_cast<uint32_t>(mips.size());
     if (image.image) {
         gpu_->WaitIdle();

@@ -59,6 +59,8 @@ public:
     static constexpr uint32_t kGreySrgb = 5;
     static constexpr uint32_t kMaxCubeTextures = 64;
     static constexpr uint32_t kNoCube = 0xFFFFFFFFu;
+    // the largest level a BC texture keeps when the GPU has no BC and it is decoded on the CPU
+    static constexpr uint32_t kMaxDecodedSize = 512;
 
     bool Init(gpu::Device& device);
     void Shutdown();
@@ -85,6 +87,8 @@ public:
     bool AdoptDecoded(const std::string& path, std::shared_ptr<FtexTexture> decoded);
     void DropDecoded(const std::vector<std::string>& paths);
     std::unordered_set<std::string> Names() const;
+    uint32_t DecodedTextures() const { return decoded_textures_; }
+    uint64_t DecodedBytes() const { return decoded_bytes_; }
     double ReadMs() const { return read_ms_; }
     double UploadMs() const { return upload_ms_; }
     uint32_t AddMaterial(const MaterialGpu& material);
@@ -174,6 +178,8 @@ private:
     std::unordered_map<std::string, std::shared_ptr<ParallelTask>> decode_jobs_;
     double read_ms_ = 0.0;
     double upload_ms_ = 0.0;
+    uint32_t decoded_textures_ = 0;
+    uint64_t decoded_bytes_ = 0;
 };
 
 uint32_t FormatBlockBytes(gpu::Format format, bool& compressed);

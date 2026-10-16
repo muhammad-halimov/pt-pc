@@ -11,7 +11,9 @@ namespace pt::gpu {
 enum class Format : uint32_t {
     Undefined = 0,
     R8Unorm = 9,
+    R8Snorm = 10,
     R8G8Unorm = 16,
+    R8G8Snorm = 17,
     R8G8B8A8Unorm = 37,
     R8G8B8A8Uint = 41,
     R8G8B8A8Srgb = 43,

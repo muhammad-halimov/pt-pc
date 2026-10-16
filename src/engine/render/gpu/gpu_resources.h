@@ -279,6 +279,8 @@ struct DeviceInfo {
     bool luid_valid = false;
     uint64_t dedicated_video_memory = 0;
     bool ray_query = false;
+    // the GPU samples BC textures; without them TextureManager decodes BC on the CPU (render/bc_decode.h)
+    bool bc_textures = true;
     bool depth_bounds = false;
     bool dynamic_depth_bias = false;
     double timestamp_period_ns = 1.0;

@@ -18,6 +18,7 @@
 #include "engine/core/log.h"
 #include "engine/fs/mods.h"
 #include "engine/render/vk/vk_device.h"
+#include "engine/render/bc_decode.h"
 
 namespace pt {
 namespace {
@@ -360,6 +361,36 @@ uint32_t TextureManager::Create(const std::string& name, gpu::Format format, std
     }
     if (mips.empty() || (images_.size() >= kMaxTextures && (free_.empty() || cube))) {
         return kWhite;
+    }
+    std::vector<std::vector<uint8_t>> decoded_data;
+    std::vector<TextureMip> decoded_mips;
+    if (!device_->Info().bc_textures && BcDecodedFormat(static_cast<VkFormat>(format)) != VK_FORMAT_UNDEFINED) {
+        // decoded, a texture takes four to eight times its BC size: the levels above kMaxDecodedSize are left out to keep the
+        // game within a phone's memory, the next level down standing in for them
+        const uint32_t levels = static_cast<uint32_t>(mips.size()) / layers;
+        uint32_t skip = 0;
+        while (skip + 1 < levels && std::max(mips[skip].width, mips[skip].height) > kMaxDecodedSize) {
+            ++skip;
+        }
+        const VkFormat bc = static_cast<VkFormat>(format);
+        decoded_data.resize(size_t(layers) * (levels - skip));
+        for (uint32_t layer = 0; layer < layers; ++layer) {
+            for (uint32_t level = skip; level < levels; ++level) {
+                const TextureMip& mip = mips[layer * levels + level];
+                std::vector<uint8_t>& texels = decoded_data[size_t(layer) * (levels - skip) + (level - skip)];
+                if (!DecodeBc(bc, mip.width, mip.height, mip.data, texels)) {
+                    LogWarn("textures: {} level {} could not be decoded", name, level);
+                    return kWhite;
+                }
+                decoded_mips.push_back({mip.width, mip.height, texels});
+                decoded_bytes_ += texels.size();
+            }
+        }
+        format = static_cast<gpu::Format>(BcDecodedFormat(bc));
+        mips = decoded_mips;
+        if (++decoded_textures_ % 256 == 1) {
+            LogInfo("textures: {} decoded from BC on the CPU, {} MB", decoded_textures_, decoded_bytes_ >> 20);
+        }
     }
     const bool enhanced = name.find("#enhanced-") != std::string::npos;
     gpu::ImageResource image;

@@ -35,6 +35,7 @@ Device::Device(pt::vk::Context& ctx) : ctx_(ctx) {
     info_.device_id = ctx.properties.deviceID;
     info_.dedicated_video_memory = ctx.allocator ? ctx.DeviceLocalBytes() : 0;
     info_.ray_query = ctx.ray_query;
+    info_.bc_textures = ctx.bc_textures;
     info_.depth_bounds = ctx.depth_bounds;
     info_.dynamic_depth_bias = true;
     info_.timestamp_period_ns = ctx.properties.limits.timestampPeriod;
