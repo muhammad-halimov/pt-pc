@@ -9,25 +9,15 @@ jobs:
     runs-on: macos-latest
     timeout-minutes: 90
     env:
-      VULKAN_VERSION: 1.4.363.0
       MOLTENVK_VERSION: v1.4.2
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Install Vulkan SDK with iOS support
-        shell: bash
-        run: |
-          set -euo pipefail
-          curl -fL "https://sdk.lunarg.com/sdk/download/${VULKAN_VERSION}/mac/vulkansdk-macos-${VULKAN_VERSION}.zip" -o vulkan-sdk.zip
-          unzip -q vulkan-sdk.zip
-          sudo "vulkansdk-macOS-${VULKAN_VERSION}.app/Contents/MacOS/vulkansdk-macOS-${VULKAN_VERSION}" \
-            --root "$HOME/VulkanSDK/${VULKAN_VERSION}" \
-            --accept-licenses --default-answer --confirm-command install \
-            com.lunarg.vulkan.core com.lunarg.vulkan.ios
-          echo "VULKAN_SDK=$HOME/VulkanSDK/${VULKAN_VERSION}/macOS" >> "$GITHUB_ENV"
-          echo "VULKAN_SDK_IOS=$HOME/VulkanSDK/${VULKAN_VERSION}/iOS" >> "$GITHUB_ENV"
-          echo "$HOME/VulkanSDK/${VULKAN_VERSION}/macOS/bin" >> "$GITHUB_PATH"
+      # the Vulkan headers and glslc from Homebrew; MoltenVK, the iOS Vulkan, is the dynamic framework of the official
+      # MoltenVK-ios.tar that cmake/IOSApp.cmake embeds in the app. No Vulkan SDK installer is needed.
+      - name: Install the Vulkan headers and glslc
+        run: brew install shaderc vulkan-headers
 
       - name: Download the dynamic iOS MoltenVK framework
         shell: bash
@@ -38,20 +28,22 @@ jobs:
           tar -xf "$RUNNER_TEMP/moltenvk/MoltenVK-ios.tar" -C "$RUNNER_TEMP/moltenvk"
           echo "VULKAN_SDK_IOS=$RUNNER_TEMP/moltenvk/MoltenVK/MoltenVK" >> "$GITHUB_ENV"
 
+      # find_package(Vulkan) looks inside the iOS SDK for an iOS build: its headers, library and glslc are named outright
       - name: Configure
+        shell: bash
         run: |
+          set -euo pipefail
+          brew_prefix="$(brew --prefix)"
           cmake -S . -B build-ios -G Xcode \
             -DCMAKE_TOOLCHAIN_FILE=cmake/iOS.cmake \
-            -DCMAKE_SYSTEM_NAME=iOS \
-            -DCMAKE_OSX_SYSROOT=iphoneos \
-            -DCMAKE_OSX_ARCHITECTURES=arm64 \
-            -DCMAKE_OSX_DEPLOYMENT_TARGET=16.4 \
-            -DPT_IOS=ON \
-            -DPT_GAMEPLUS=ON
+            -DPT_GAMEPLUS=ON \
+            -DVulkan_INCLUDE_DIR="$brew_prefix/include" \
+            -DVulkan_LIBRARY="$VULKAN_SDK_IOS/dynamic/MoltenVK.xcframework/ios-arm64/MoltenVK.framework/MoltenVK" \
+            -DVulkan_GLSLC_EXECUTABLE="$brew_prefix/bin/glslc"
 
       - name: Build unsigned app
         run: |
-          cmake --build build-ios --config Release --target pt -- \
+          cmake --build build-ios --config Release --target pt -- -sdk iphoneos \
             CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO
 
       - name: Package unsigned IPA
