@@ -57,10 +57,17 @@ Clicking the left stick (L3) hurries until you click it again or stop.
 
 ## What is different on iOS
 
+![PC settings, Display, on an iPhone 15](docs/media/ios_touch_display.jpg)
+
+![PC settings, Upscaling, on an iPhone 15](docs/media/ios_touch_upscaling.jpg)
+
+*PC settings on an iPhone 15: Display with the render scale, Upscaling with Apple MetalFX and its frame generation.*
+
 - Display: no window modes or sizes; PC settings > Display > Render scale (50 to 100 %, 67 % by default) is the share of
   the screen's resolution the game draws at, applied at the next start. HDR works on an EDR screen.
 - Upscaling: Apple MetalFX (Quality to Ultra performance) instead of FSR, DLSS and XeSS. On an A16 MetalFX itself costs
-  about 10 ms a frame, so it pays off only at the lower steps.
+  about 10 ms a frame, so it pays off only at the lower steps. MetalFX frame generation (iOS 26 or newer, with the
+  MetalFX upscaler) shows a generated frame between two rendered ones; on an A16 the interpolation itself is heavy.
 - Hurry (Fast Walk, PC settings > Extras) is on by default: walk 50 % faster with the Hurry button, L3, or Shift.
 - Shadows are capped at 1024 px tiles; texture levels over 512 px are left out where the textures are decoded on the
   CPU.
