@@ -6,10 +6,18 @@ if(CMAKE_HOST_APPLE AND NOT CMAKE_OSX_DEPLOYMENT_TARGET)
 endif()
 # OBJCXX on macOS for the Apple MetalFX upscaler (cmake/MacOS.cmake, metalfx_backend.mm); the language is set here so its
 # variables are initialized, as enable_language after project does not
-if(CMAKE_HOST_APPLE OR APPLE)
+if(CMAKE_SYSTEM_NAME STREQUAL "iOS")
+  # iOS (cmake/iOS.cmake, cmake/IOSApp.cmake): SDL3's UIKit code is Objective-C, the UIKit side of the port Objective-C++
+  project(pt_port LANGUAGES C CXX OBJC OBJCXX)
+elseif(CMAKE_HOST_APPLE OR APPLE)
   project(pt_port LANGUAGES C CXX OBJCXX)
 else()
   project(pt_port LANGUAGES C CXX)
+endif()
+
+set(PT_IOS OFF)
+if(CMAKE_SYSTEM_NAME STREQUAL "iOS")
+  set(PT_IOS ON)
 endif()
 
 set(CMAKE_CXX_STANDARD 20)
@@ -95,7 +103,11 @@ if(WIN32)
   # in pt.exe. The manifest (UTF-8 ANSI code page, long paths) goes in as a resource; the linker must not make its own.
   set_source_files_properties("${CMAKE_BINARY_DIR}/pt.rc" PROPERTIES OBJECT_DEPENDS "${CMAKE_SOURCE_DIR}/assets/pt.ico;${CMAKE_SOURCE_DIR}/assets/pt.manifest")
 endif()
-add_executable(pt WIN32 src/main.cpp)
+if(PT_IOS)
+  add_executable(pt MACOSX_BUNDLE src/main.cpp)
+else()
+  add_executable(pt WIN32 src/main.cpp)
+endif()
 if(WIN32)
   target_sources(pt PRIVATE "${CMAKE_BINARY_DIR}/pt.rc")
   target_link_options(pt PRIVATE /MANIFEST:NO)
@@ -190,7 +202,7 @@ if(WIN32)
   endif()
   add_dependencies(pt pt_updater)
 endif()
-if(NOT WIN32)
+if(NOT WIN32 AND NOT PT_IOS)
   # the Linux installer (installer/Native/setup_linux.cpp); tools/linux/attach_payload.py appends the payload after the build
   add_executable(pt_setup_linux EXCLUDE_FROM_ALL installer/Native/setup_linux.cpp src/engine/platform/http.cpp
     src/engine/platform/update_check.cpp src/engine/platform/ed25519.cpp src/engine/platform/os.cpp src/engine/core/log.cpp)
@@ -204,11 +216,16 @@ if(MSVC)
 endif()
 
 include(cmake/D3D12.cmake)
-include(cmake/Upscalers.cmake)
-include(cmake/EnhancedTextures.cmake)
-include(cmake/OpenXR.cmake)
-if(APPLE)
-  include(cmake/MacOS.cmake)
+if(PT_IOS)
+  # the SDK upscalers, the Real-ESRGAN texture runtime and OpenXR are desktop programs; iOS has Apple MetalFX (cmake/IOSApp.cmake)
+  include(cmake/IOSApp.cmake)
+else()
+  include(cmake/Upscalers.cmake)
+  include(cmake/EnhancedTextures.cmake)
+  include(cmake/OpenXR.cmake)
+  if(APPLE)
+    include(cmake/MacOS.cmake)
+  endif()
 endif()
 list(APPEND PT_UPSCALER_RUNTIME_FILES ${PT_OPENXR_RUNTIME_FILES})
 list(APPEND PT_UPSCALER_NOTICES ${PT_OPENXR_NOTICES})
@@ -469,6 +486,14 @@ target_compile_definitions(pt_engine PUBLIC PT_LISA_DATE_DIR="${CMAKE_SOURCE_DIR
 # copied on every build (a text or picture change alone relinks nothing)
 add_custom_target(pt_lisa_date_assets ALL COMMAND ${CMAKE_COMMAND} -E copy_directory "${CMAKE_SOURCE_DIR}/assets/lisa_date" "${CMAKE_BINARY_DIR}/lisa_date")
 add_dependencies(pt pt_lisa_date_assets)
+if(PT_IOS)
+  # SDL_GetBasePath() is the top of pt.app on iOS: the shaders, the voice models and Lisa's files go there beside the fonts
+  # (no VERBATIM: Xcode expands its own build variables in these paths)
+  add_custom_command(TARGET pt POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E copy_directory "${PT_SPIRV_DIR}" "$<TARGET_FILE_DIR:pt>/shaders"
+    COMMAND ${CMAKE_COMMAND} -E copy_directory "${PT_VOICE_DIR}" "$<TARGET_FILE_DIR:pt>/voice"
+    COMMAND ${CMAKE_COMMAND} -E copy_directory "${CMAKE_SOURCE_DIR}/assets/lisa_date" "$<TARGET_FILE_DIR:pt>/lisa_date")
+endif()
 # the bundled fonts' SIL OFL notices also go to licenses/, beside the SDK notices
 file(GLOB PT_FONT_LICENSES CONFIGURE_DEPENDS "${CMAKE_SOURCE_DIR}/assets/fonts/OFL-*.txt")
 foreach(license ${PT_FONT_LICENSES})

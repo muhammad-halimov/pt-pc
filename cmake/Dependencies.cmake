@@ -22,6 +22,8 @@ FetchContent_Declare(vma GIT_REPOSITORY https://github.com/GPUOpen-LibrariesAndS
 FetchContent_Declare(glm GIT_REPOSITORY https://github.com/g-truc/glm.git GIT_TAG 1.0.3 GIT_SHALLOW TRUE)
 FetchContent_Declare(imgui GIT_REPOSITORY https://github.com/ocornut/imgui.git GIT_TAG v1.92.9b-docking GIT_SHALLOW TRUE)
 FetchContent_Declare(stb GIT_REPOSITORY https://github.com/nothings/stb.git GIT_TAG master GIT_SHALLOW TRUE)
+# bcdec (MIT or Unlicense): BC1-7 decoding on the CPU for GPUs without BC textures (src/engine/render/bc_decode.cpp)
+FetchContent_Declare(bcdec URL https://codeload.github.com/iOrange/bcdec/zip/80859ed3b7afb1c527a2a99d70c61457bea72d0c)
 FetchContent_Declare(lua51 URL https://www.lua.org/ftp/lua-5.1.5.tar.gz
   URL_HASH SHA256=2640fc56a795f29d28ef15e13c34a47e223960b0240e8cb0a82d9b0738695333)
 
@@ -36,8 +38,14 @@ FetchContent_Declare(whisper URL https://github.com/ggml-org/whisper.cpp/archive
 FetchContent_Populate(whisper)
 set(PT_VOICE_DIR ${CMAKE_BINARY_DIR}/voice)
 set(GGML_NATIVE OFF CACHE BOOL "" FORCE)
-set(GGML_BACKEND_DL ON CACHE BOOL "" FORCE)
-set(GGML_CPU_ALL_VARIANTS ON CACHE BOOL "" FORCE)
+if(PT_IOS)
+  # an iOS app cannot load libraries of its own at run time: whisper and ggml are linked into it (voice_recognizer.cpp)
+  set(GGML_BACKEND_DL OFF CACHE BOOL "" FORCE)
+  set(GGML_CPU_ALL_VARIANTS OFF CACHE BOOL "" FORCE)
+else()
+  set(GGML_BACKEND_DL ON CACHE BOOL "" FORCE)
+  set(GGML_CPU_ALL_VARIANTS ON CACHE BOOL "" FORCE)
+endif()
 set(GGML_OPENMP OFF CACHE BOOL "" FORCE)
 set(GGML_CCACHE OFF CACHE BOOL "" FORCE)
 set(WHISPER_BUILD_TESTS OFF CACHE BOOL "" FORCE)
@@ -50,7 +58,11 @@ if(APPLE)
   set(GGML_BLAS OFF CACHE BOOL "" FORCE)
 endif()
 set(CMAKE_POLICY_DEFAULT_CMP0077 NEW)
-set(BUILD_SHARED_LIBS ON)
+if(PT_IOS)
+  set(BUILD_SHARED_LIBS OFF)
+else()
+  set(BUILD_SHARED_LIBS ON)
+endif()
 add_subdirectory(${whisper_SOURCE_DIR} ${whisper_BINARY_DIR} EXCLUDE_FROM_ALL)
 unset(BUILD_SHARED_LIBS)
 add_custom_target(pt_voice_runtime)
@@ -58,7 +70,7 @@ add_dependencies(pt_voice_runtime whisper)
 # whisper.cpp names its own output folder (bin); the DLLs go to voice/ next to the models
 foreach(lib whisper ggml ggml-base)
   set_target_properties(${lib} PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${PT_VOICE_DIR} LIBRARY_OUTPUT_DIRECTORY ${PT_VOICE_DIR})
-  if(NOT WIN32)
+  if(NOT WIN32 AND NOT PT_IOS)
     # plain libwhisper.so (macOS: .dylib) files (no version symlinks to package) that find each other in voice/
     set_property(TARGET ${lib} PROPERTY VERSION)
     set_property(TARGET ${lib} PROPERTY SOVERSION)
@@ -158,8 +170,19 @@ if(MSVC)
   target_compile_options(pt_bc7enc PRIVATE /w)
 endif()
 
+FetchContent_Populate(bcdec)
 file(GLOB LUA51_SOURCES ${lua51_SOURCE_DIR}/src/*.c)
 list(FILTER LUA51_SOURCES EXCLUDE REGEX ".*/(lua|luac|print)\\.c$")
+if(PT_IOS)
+  # iOS has no system(): a copy of loslib.c whose os.execute reports that no shell is available
+  file(READ ${lua51_SOURCE_DIR}/src/loslib.c PT_LUA_LOSLIB)
+  string(REPLACE "lua_pushinteger(L, system(luaL_optstring(L, 1, NULL)));"
+    "(void)luaL_optstring(L, 1, NULL);\n  lua_pushinteger(L, -1);" PT_LUA_LOSLIB "${PT_LUA_LOSLIB}")
+  file(WRITE ${CMAKE_BINARY_DIR}/generated/lua_loslib_ios.c "${PT_LUA_LOSLIB}")
+  list(FILTER LUA51_SOURCES EXCLUDE REGEX ".*/loslib\\.c$")
+  list(APPEND LUA51_SOURCES ${CMAKE_BINARY_DIR}/generated/lua_loslib_ios.c)
+  set_source_files_properties(${CMAKE_BINARY_DIR}/generated/lua_loslib_ios.c PROPERTIES INCLUDE_DIRECTORIES ${lua51_SOURCE_DIR}/src)
+endif()
 
 add_library(pt_thirdparty STATIC
   ${volk_SOURCE_DIR}/volk.c
@@ -178,7 +201,8 @@ target_include_directories(pt_thirdparty PUBLIC
   ${imgui_SOURCE_DIR}
   ${imgui_SOURCE_DIR}/backends
   ${lua51_SOURCE_DIR}/src
-  ${stb_SOURCE_DIR})
+  ${stb_SOURCE_DIR}
+  ${bcdec_SOURCE_DIR})
 target_compile_definitions(pt_thirdparty PUBLIC VK_NO_PROTOTYPES IMGUI_IMPL_VULKAN_USE_VOLK)
 if(WIN32)
   target_compile_definitions(pt_thirdparty PUBLIC VK_USE_PLATFORM_WIN32_KHR)

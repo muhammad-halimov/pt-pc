@@ -171,6 +171,19 @@ void TestLoaderStall() {
 bool LoadRuntime(const std::filesystem::path& dir, VoiceRecognizer::Failure& failure) {
     std::lock_guard lock(g_api_mutex);
     if (g_api.ready) return true;
+#if defined(PT_IOS)
+    // an iOS app loads no libraries of its own: whisper.cpp and ggml (its CPU backend registered by ggml itself) are linked in
+    (void)dir;
+#define PT_WHISPER_BIND(name) g_api.name = &::name;
+    PT_WHISPER_FUNCTIONS(PT_WHISPER_BIND)
+#undef PT_WHISPER_BIND
+    g_api.cpu = "ios-arm64";
+    g_api.whisper_log_set(WhisperLog, nullptr);
+    g_api.ready = true;
+    failure = VoiceRecognizer::Failure::None;
+    LogInfo("voice: whisper.cpp linked into the app (iOS)");
+    return true;
+#endif
     TestLoaderStall();
     failure = VoiceRecognizer::Failure::Runtime;
     const Library base = LoadNear(dir / LibraryName("ggml-base"));
@@ -431,7 +444,12 @@ bool VoiceRecognizer::Init(const std::filesystem::path& model_dir, const std::st
     ApplyTune(settings);
     if (const char* prompt = std::getenv("PT_VOICE_PROMPT")) settings.prompt = prompt;
     if (const char* model = std::getenv("PT_VOICE_RESCUE_MODEL")) settings.rescue_model = model;
+#if defined(PT_IOS)
+    // whisper.cpp is linked into the iOS app (LoadRuntime), only the models are files
+    for (const std::string& name : {WhisperModelName(), std::string(kVadModel)}) {
+#else
     for (const std::string& name : {WhisperModelName(), std::string(kVadModel), LibraryName("whisper")}) {
+#endif
         if (!std::filesystem::is_regular_file(model_dir / name)) {
             LogError("voice: {} is missing from {}", name, os::PathToUtf8(model_dir));
             failure_ = Failure::Files;

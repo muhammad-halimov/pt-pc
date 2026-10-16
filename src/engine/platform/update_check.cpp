@@ -77,6 +77,9 @@ std::string_view CurrentVersion() { return PT_VERSION; }
 std::string_view Platform() {
 #ifdef _WIN32
     return "windows";
+#elif defined(PT_IOS)
+    // no release of the iOS app is published: its name matches none of the release's assets
+    return "ios";
 #elif defined(__APPLE__)
 #if defined(__aarch64__)
     return "macos-arm64";
