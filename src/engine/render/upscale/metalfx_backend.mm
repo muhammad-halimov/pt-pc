@@ -401,7 +401,12 @@ protected:
 // swapchain recreation. The interpolated images are the HUD-less copies the renderer composites into one target per
 // swapchain image, as for FSR 3, and the interpolation's depth and motion are the upscaler's inputs at the render extent, so
 // it needs an upscaler. macOS 26 or newer: the frame interpolator is that API's (MTLFXFrameInterpolator, macOS 26).
-#if defined(__MAC_OS_X_VERSION_MAX_ALLOWED) && __MAC_OS_X_VERSION_MAX_ALLOWED >= 260000
+// the frame interpolator came with the macOS 26 and iOS 26 SDKs
+#if (defined(__MAC_OS_X_VERSION_MAX_ALLOWED) && __MAC_OS_X_VERSION_MAX_ALLOWED >= 260000) || \
+    (defined(__IPHONE_OS_VERSION_MAX_ALLOWED) && __IPHONE_OS_VERSION_MAX_ALLOWED >= 260000)
+#define PT_METALFX_FRAME_INTERPOLATION 1
+#endif
+#if defined(PT_METALFX_FRAME_INTERPOLATION)
 class MetalFxFrameGeneration final : public FrameGeneration {
 public:
     explicit MetalFxFrameGeneration(vk::Context& ctx) : ctx_(ctx) {}
@@ -414,7 +419,7 @@ public:
         }
         checked_ = true;
         @autoreleasepool {
-            if (@available(macOS 26.0, *)) {
+            if (@available(macOS 26.0, iOS 26.0, *)) {
                 export_fn_ = reinterpret_cast<PFN_vkExportMetalObjectsEXT>(vkGetDeviceProcAddr(ctx_.device, "vkExportMetalObjectsEXT"));
                 VkExportMetalDeviceInfoEXT device_info{VK_STRUCTURE_TYPE_EXPORT_METAL_DEVICE_INFO_EXT};
                 VkExportMetalObjectsInfoEXT objects{VK_STRUCTURE_TYPE_EXPORT_METAL_OBJECTS_INFO_EXT};
@@ -433,7 +438,7 @@ public:
                     }
                 }
             } else {
-                reason_ = "needs macOS 26 or newer";
+                reason_ = "needs macOS 26 or iOS 26 or newer";
             }
         }
         reason = reason_;
@@ -612,7 +617,7 @@ private:
                 return false;
             }
         }
-        if (@available(macOS 26.0, *)) {
+        if (@available(macOS 26.0, iOS 26.0, *)) {
             // the interpolator itself is built in Interpolate, once the upscaler's render extent is known (its input sizes
             // are the motion and depth textures')
         } else {
@@ -646,7 +651,7 @@ private:
 
     const vk::Image* Interpolate() {
         @autoreleasepool {
-            if (@available(macOS 26.0, *)) {
+            if (@available(macOS 26.0, iOS 26.0, *)) {
                 id<MTLFXFrameInterpolator> interpolator = reinterpret_cast<id<MTLFXFrameInterpolator>>(interpolator_);
                 const auto export_texture = [&](const vk::Image& image) -> id<MTLTexture> {
                     if (!image.image) {
@@ -732,7 +737,7 @@ private:
         if (!device) {
             return false;
         }
-        if (@available(macOS 26.0, *)) {
+        if (@available(macOS 26.0, iOS 26.0, *)) {
             const MTLPixelFormat color = MetalFormat(format_);
             if (color == MTLPixelFormatInvalid) {
                 return false;
@@ -828,7 +833,7 @@ std::unique_ptr<UpscaleBackend> CreateMetalfxBackend(vk::Context& ctx) {
 }
 
 std::unique_ptr<FrameGeneration> CreateMetalfxFrameGeneration(vk::Context& ctx) {
-#if defined(__MAC_OS_X_VERSION_MAX_ALLOWED) && __MAC_OS_X_VERSION_MAX_ALLOWED >= 260000
+#if defined(PT_METALFX_FRAME_INTERPOLATION)
     return std::make_unique<MetalFxFrameGeneration>(ctx);
 #else
     (void)ctx;
