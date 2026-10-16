@@ -494,6 +494,9 @@ if(PT_IOS)
     COMMAND ${CMAKE_COMMAND} -E copy_directory "${PT_VOICE_DIR}" "$<TARGET_FILE_DIR:pt>/voice"
     COMMAND ${CMAKE_COMMAND} -E copy_directory "${CMAKE_SOURCE_DIR}/assets/lisa_date" "$<TARGET_FILE_DIR:pt>/lisa_date")
 endif()
+# bcdec's notice (MIT or Unlicense), the BC decoder of src/engine/render/bc_decode.cpp
+add_custom_command(TARGET pt POST_BUILD COMMAND ${CMAKE_COMMAND} -E make_directory "$<TARGET_FILE_DIR:pt>/licenses"
+  COMMAND ${CMAKE_COMMAND} -E copy_if_different "${CMAKE_SOURCE_DIR}/third_party/bcdec/LICENSE" "$<TARGET_FILE_DIR:pt>/licenses/bcdec.txt")
 # the bundled fonts' SIL OFL notices also go to licenses/, beside the SDK notices
 file(GLOB PT_FONT_LICENSES CONFIGURE_DEPENDS "${CMAKE_SOURCE_DIR}/assets/fonts/OFL-*.txt")
 foreach(license ${PT_FONT_LICENSES})
