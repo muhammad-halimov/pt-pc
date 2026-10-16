@@ -2778,7 +2778,10 @@ public:
             std::vector<pt::game::PcSettingSection> out;
             out.push_back(std::move(upscaling));
             out.push_back(std::move(generation));
+#if !defined(PT_IOS)
+            // DLSS 5 neural rendering is an NVIDIA RTX feature: no section for it on iOS
             out.push_back(std::move(neural_section));
+#endif
             return out;
         }
         pt::game::PcSettingSection sound{"pc_section_sound", 1, {}};
