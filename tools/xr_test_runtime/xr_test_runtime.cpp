@@ -5,6 +5,10 @@
 #define NOMINMAX
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
+#include <d3d12.h>
+#include <dxgi1_4.h>
+#include <wrl/client.h>
+#define XR_USE_GRAPHICS_API_D3D12
 #endif
 #include <openxr/openxr.h>
 #include <openxr/openxr_loader_negotiation.h>
@@ -24,6 +28,7 @@
 #include <cstring>
 #include <deque>
 #include <filesystem>
+#include <functional>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -271,11 +276,15 @@ struct VkFunctions {
 struct SwapchainImage {
     VkImage image = VK_NULL_HANDLE;
     VkDeviceMemory memory = VK_NULL_HANDLE;
+#ifdef _WIN32
+    Microsoft::WRL::ComPtr<ID3D12Resource> texture;
+#endif
 };
 
 struct Swapchain : Object {
     Session* session = nullptr;
     XrSwapchainCreateInfo info{};
+    int64_t vk_format = 0;
     std::vector<SwapchainImage> images;
     std::deque<uint32_t> acquired;
     bool waited = false;
@@ -330,6 +339,15 @@ struct Session : Object {
     VkFunctions vk;
     VkCommandPool pool = VK_NULL_HANDLE;
     VkCommandBuffer cmd = VK_NULL_HANDLE;
+#ifdef _WIN32
+    bool d3d12 = false;
+    Microsoft::WRL::ComPtr<ID3D12Device> d3d_device;
+    Microsoft::WRL::ComPtr<ID3D12CommandQueue> d3d_queue;
+    Microsoft::WRL::ComPtr<ID3D12CommandAllocator> d3d_allocator;
+    Microsoft::WRL::ComPtr<ID3D12GraphicsCommandList> d3d_list;
+    Microsoft::WRL::ComPtr<ID3D12Fence> d3d_fence;
+    uint64_t d3d_fence_value = 0;
+#endif
     std::set<Swapchain*> swapchains;
     std::set<Space*> spaces;
     int64_t waited = 0;
@@ -359,11 +377,14 @@ struct Instance : Object {
     std::map<XrPath, std::set<XrPath>> suggested;
     bool system_got = false;
     bool requirements_checked = false;
+    bool d3d12 = false;
+    uint64_t adapter_luid = 0;
     VkInstance created_vk_instance = VK_NULL_HANDLE;
     PFN_vkGetInstanceProcAddr vk_gipa = nullptr;
     Script script;
     uint32_t view_w = 1024, view_h = 1104;
     float ipd = 0.064f;
+    float floor = 1.6f;
     std::vector<int64_t> formats;
     std::string out_dir;
 };
@@ -560,7 +581,7 @@ bool SpaceInLocal(Space* space, int frame, Pose& out) {
     } else {
         switch (space->type) {
         case XR_REFERENCE_SPACE_TYPE_VIEW: base = HeadPose(inst, frame); break;
-        case XR_REFERENCE_SPACE_TYPE_STAGE: base = {Quat{}, {0.0f, -1.6f, 0.0f}}; break;
+        case XR_REFERENCE_SPACE_TYPE_STAGE: base = {Quat{}, {0.0f, -inst->floor, 0.0f}}; break;
         default: base = {}; break;
         }
     }
@@ -679,13 +700,77 @@ float HalfToFloat(uint16_t h) {
     return f;
 }
 
+#ifdef _WIN32
+int64_t DxgiOf(int64_t vk) {
+    switch (vk) {
+    case VK_FORMAT_R8G8B8A8_SRGB: return DXGI_FORMAT_R8G8B8A8_UNORM_SRGB;
+    case VK_FORMAT_B8G8R8A8_SRGB: return DXGI_FORMAT_B8G8R8A8_UNORM_SRGB;
+    case VK_FORMAT_R8G8B8A8_UNORM: return DXGI_FORMAT_R8G8B8A8_UNORM;
+    case VK_FORMAT_B8G8R8A8_UNORM: return DXGI_FORMAT_B8G8R8A8_UNORM;
+    case VK_FORMAT_R16G16B16A16_SFLOAT: return DXGI_FORMAT_R16G16B16A16_FLOAT;
+    case VK_FORMAT_D32_SFLOAT: return DXGI_FORMAT_D32_FLOAT;
+    default: return 0;
+    }
+}
+
+int64_t VkOfDxgi(int64_t dxgi) {
+    for (int64_t vk : {VK_FORMAT_R8G8B8A8_SRGB, VK_FORMAT_B8G8R8A8_SRGB, VK_FORMAT_R8G8B8A8_UNORM, VK_FORMAT_B8G8R8A8_UNORM,
+                       VK_FORMAT_R16G16B16A16_SFLOAT, VK_FORMAT_D32_SFLOAT}) {
+        if (DxgiOf(vk) == dxgi) return vk;
+    }
+    return 0;
+}
+
+bool D3dWaitIdle(Session* s) {
+    if (!s->d3d_fence && FAILED(s->d3d_device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&s->d3d_fence)))) return false;
+    ++s->d3d_fence_value;
+    if (FAILED(s->d3d_queue->Signal(s->d3d_fence.Get(), s->d3d_fence_value))) return false;
+    HANDLE event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+    if (!event) return false;
+    bool ok = true;
+    if (s->d3d_fence->GetCompletedValue() < s->d3d_fence_value) {
+        ok = SUCCEEDED(s->d3d_fence->SetEventOnCompletion(s->d3d_fence_value, event)) && WaitForSingleObject(event, 10000) == WAIT_OBJECT_0;
+    }
+    CloseHandle(event);
+    return ok;
+}
+
+bool D3dRun(Session* s, const std::function<void(ID3D12GraphicsCommandList*)>& record) {
+    if (!s->d3d_list) {
+        if (FAILED(s->d3d_device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&s->d3d_allocator))) ||
+            FAILED(s->d3d_device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, s->d3d_allocator.Get(), nullptr, IID_PPV_ARGS(&s->d3d_list))) ||
+            FAILED(s->d3d_device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&s->d3d_fence)))) {
+            return false;
+        }
+        s->d3d_list->Close();
+    }
+    s->d3d_allocator->Reset();
+    s->d3d_list->Reset(s->d3d_allocator.Get(), nullptr);
+    record(s->d3d_list.Get());
+    s->d3d_list->Close();
+    ID3D12CommandList* lists[] = {s->d3d_list.Get()};
+    s->d3d_queue->ExecuteCommandLists(1, lists);
+    return D3dWaitIdle(s);
+}
+#endif
+
+bool WritePng(Swapchain* sc, const void* mapped, size_t pitch, const std::string& path, const XrRect2Di* rect);
+#ifdef _WIN32
+bool DumpImageD3D12(Session* s, Swapchain* sc, uint32_t index, uint32_t layer, const std::string& path, const XrRect2Di* rect);
+#endif
+
 bool DumpImage(Session* s, Swapchain* sc, uint32_t index, uint32_t layer, const std::string& path, const XrRect2Di* rect) {
     const uint32_t w = sc->info.width;
     const uint32_t h = sc->info.height;
-    const int64_t format = sc->info.format;
+    const int64_t format = sc->vk_format;
     const bool half = format == VK_FORMAT_R16G16B16A16_SFLOAT;
     const VkDeviceSize texel = half ? 8 : 4;
     if (AspectOf(format) != VK_IMAGE_ASPECT_COLOR_BIT) return false;
+#ifdef _WIN32
+    if (s->d3d12) {
+        return DumpImageD3D12(s, sc, index, layer, path, rect);
+    }
+#endif
     VkBufferCreateInfo buffer_info{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
     buffer_info.size = VkDeviceSize(w) * h * texel;
     buffer_info.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
@@ -726,6 +811,22 @@ bool DumpImage(Session* s, Swapchain* sc, uint32_t index, uint32_t layer, const 
     bool written = false;
     void* mapped = nullptr;
     if (ok && s->vk.MapMemory(s->vk_device, memory, 0, VK_WHOLE_SIZE, 0, &mapped) == VK_SUCCESS) {
+        written = WritePng(sc, mapped, static_cast<size_t>(w) * texel, path, rect);
+        s->vk.UnmapMemory(s->vk_device, memory);
+    }
+    s->vk.DestroyBuffer(s->vk_device, buffer, nullptr);
+    s->vk.FreeMemory(s->vk_device, memory, nullptr);
+    Log("dump %s %s", path.c_str(), written ? "written" : "FAILED");
+    return written;
+}
+
+bool WritePng(Swapchain* sc, const void* mapped, size_t pitch, const std::string& path, const XrRect2Di* rect) {
+    const uint32_t w = sc->info.width;
+    const uint32_t h = sc->info.height;
+    const int64_t format = sc->vk_format;
+    const bool half = format == VK_FORMAT_R16G16B16A16_SFLOAT;
+    bool written = false;
+    {
         const bool bgra = format == VK_FORMAT_B8G8R8A8_SRGB || format == VK_FORMAT_B8G8R8A8_UNORM;
         const bool linear = format == VK_FORMAT_R8G8B8A8_UNORM || format == VK_FORMAT_B8G8R8A8_UNORM || half;
         const int x0 = rect ? std::clamp(rect->offset.x, 0, static_cast<int>(w)) : 0;
@@ -739,15 +840,16 @@ bool DumpImage(Session* s, Swapchain* sc, uint32_t index, uint32_t layer, const 
             return static_cast<uint8_t>(std::lround(v * 255.0f));
         };
         for (int y = 0; y < rh; ++y) {
+            const uint8_t* row = static_cast<const uint8_t*>(mapped) + size_t(y0 + y) * pitch;
             for (int x = 0; x < rw; ++x) {
-                const size_t src = (size_t(y0 + y) * w + (x0 + x));
+                const size_t src = size_t(x0 + x);
                 uint8_t* dst = &rgba[(size_t(y) * rw + x) * 4];
                 if (half) {
-                    const uint16_t* p = static_cast<const uint16_t*>(mapped) + src * 4;
+                    const uint16_t* p = reinterpret_cast<const uint16_t*>(row) + src * 4;
                     for (int c = 0; c < 3; ++c) dst[c] = encode(HalfToFloat(p[c]));
                     dst[3] = static_cast<uint8_t>(std::lround(std::clamp(HalfToFloat(p[3]), 0.0f, 1.0f) * 255.0f));
                 } else {
-                    const uint8_t* p = static_cast<const uint8_t*>(mapped) + src * 4;
+                    const uint8_t* p = row + src * 4;
                     const uint8_t r = bgra ? p[2] : p[0];
                     const uint8_t b = bgra ? p[0] : p[2];
                     dst[0] = linear ? encode(r / 255.0f) : r;
@@ -758,13 +860,64 @@ bool DumpImage(Session* s, Swapchain* sc, uint32_t index, uint32_t layer, const 
             }
         }
         written = stbi_write_png(path.c_str(), rw, rh, 4, rgba.data(), rw * 4) != 0;
-        s->vk.UnmapMemory(s->vk_device, memory);
     }
-    s->vk.DestroyBuffer(s->vk_device, buffer, nullptr);
-    s->vk.FreeMemory(s->vk_device, memory, nullptr);
+    return written;
+}
+
+#ifdef _WIN32
+bool DumpImageD3D12(Session* s, Swapchain* sc, uint32_t index, uint32_t layer, const std::string& path, const XrRect2Di* rect) {
+    ID3D12Resource* texture = sc->images[index].texture.Get();
+    const D3D12_RESOURCE_DESC desc = texture->GetDesc();
+    const UINT subresource = layer * desc.MipLevels;
+    D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprint{};
+    UINT64 total = 0;
+    s->d3d_device->GetCopyableFootprints(&desc, subresource, 1, 0, &footprint, nullptr, nullptr, &total);
+    D3D12_HEAP_PROPERTIES heap{D3D12_HEAP_TYPE_READBACK};
+    D3D12_RESOURCE_DESC buffer_desc{};
+    buffer_desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+    buffer_desc.Width = total;
+    buffer_desc.Height = 1;
+    buffer_desc.DepthOrArraySize = 1;
+    buffer_desc.MipLevels = 1;
+    buffer_desc.SampleDesc.Count = 1;
+    buffer_desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+    Microsoft::WRL::ComPtr<ID3D12Resource> buffer;
+    if (FAILED(s->d3d_device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &buffer_desc, D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+                                                      IID_PPV_ARGS(&buffer)))) {
+        return false;
+    }
+    const bool ok = D3dRun(s, [&](ID3D12GraphicsCommandList* list) {
+        D3D12_RESOURCE_BARRIER barrier{};
+        barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        barrier.Transition.pResource = texture;
+        barrier.Transition.Subresource = subresource;
+        barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
+        barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+        list->ResourceBarrier(1, &barrier);
+        D3D12_TEXTURE_COPY_LOCATION src{};
+        src.pResource = texture;
+        src.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+        src.SubresourceIndex = subresource;
+        D3D12_TEXTURE_COPY_LOCATION dst{};
+        dst.pResource = buffer.Get();
+        dst.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+        dst.PlacedFootprint = footprint;
+        list->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+        std::swap(barrier.Transition.StateBefore, barrier.Transition.StateAfter);
+        list->ResourceBarrier(1, &barrier);
+    });
+    bool written = false;
+    void* mapped = nullptr;
+    const D3D12_RANGE range{0, static_cast<SIZE_T>(total)};
+    if (ok && SUCCEEDED(buffer->Map(0, &range, &mapped))) {
+        written = WritePng(sc, mapped, footprint.Footprint.RowPitch, path, rect);
+        const D3D12_RANGE none{0, 0};
+        buffer->Unmap(0, &none);
+    }
     Log("dump %s %s", path.c_str(), written ? "written" : "FAILED");
     return written;
 }
+#endif
 
 std::string FormatName(int64_t f) {
     switch (f) {
@@ -787,7 +940,11 @@ std::string FormatName(int64_t f) {
 XRAPI_ATTR XrResult XRAPI_CALL GetInstanceProcAddr(XrInstance instance, const char* name, PFN_xrVoidFunction* function);
 
 const std::vector<std::pair<const char*, uint32_t>>& Extensions() {
-    static const std::vector<std::pair<const char*, uint32_t>> list = {{XR_KHR_VULKAN_ENABLE2_EXTENSION_NAME, 2}};
+    static const std::vector<std::pair<const char*, uint32_t>> list = {{XR_KHR_VULKAN_ENABLE2_EXTENSION_NAME, 2},
+#ifdef _WIN32
+                                                                        {XR_KHR_D3D12_ENABLE_EXTENSION_NAME, 9}
+#endif
+    };
     return list;
 }
 
@@ -843,6 +1000,7 @@ XRAPI_ATTR XrResult XRAPI_CALL CreateInstance(const XrInstanceCreateInfo* info, 
         }
     }
     if (const char* ipd = std::getenv("PT_XRTEST_IPD")) inst->ipd = static_cast<float>(std::atof(ipd));
+    if (const char* floor = std::getenv("PT_XRTEST_FLOOR")) inst->floor = static_cast<float>(std::atof(floor));
     if (const char* formats = std::getenv("PT_XRTEST_FORMATS")) {
         for (const std::string& f : Split(formats, ", "))
             if (const int64_t v = ParseFormat(f)) inst->formats.push_back(v);
@@ -851,6 +1009,12 @@ XRAPI_ATTR XrResult XRAPI_CALL CreateInstance(const XrInstanceCreateInfo* info, 
         inst->formats = {VK_FORMAT_R8G8B8A8_SRGB, VK_FORMAT_B8G8R8A8_SRGB, VK_FORMAT_R8G8B8A8_UNORM, VK_FORMAT_B8G8R8A8_UNORM,
                          VK_FORMAT_R16G16B16A16_SFLOAT, VK_FORMAT_D32_SFLOAT};
     }
+#ifdef _WIN32
+    inst->d3d12 = inst->extensions.count(XR_KHR_D3D12_ENABLE_EXTENSION_NAME) != 0;
+    if (inst->d3d12) {
+        for (int64_t& f : inst->formats) f = DxgiOf(f);
+    }
+#endif
     if (const char* out_dir = std::getenv("PT_XRTEST_OUT")) {
         inst->out_dir = out_dir;
         std::error_code ec;
@@ -1019,6 +1183,45 @@ XRAPI_ATTR XrResult XRAPI_CALL GetVulkanGraphicsRequirements2(XrInstance h, XrSy
     return XR_SUCCESS;
 }
 
+#ifdef _WIN32
+
+XRAPI_ATTR XrResult XRAPI_CALL GetD3D12GraphicsRequirements(XrInstance h, XrSystemId id, XrGraphicsRequirementsD3D12KHR* req) {
+    Instance* inst = GetInstance(h);
+    if (!inst) return Violation(XR_ERROR_HANDLE_INVALID, "xrGetD3D12GraphicsRequirementsKHR: invalid instance");
+    if (!inst->d3d12) return Violation(XR_ERROR_FUNCTION_UNSUPPORTED, "D3D12_enable not enabled");
+    if (id != kSystemId) return XR_ERROR_SYSTEM_INVALID;
+    PT_CHECK_STRUCT(req, XR_TYPE_GRAPHICS_REQUIREMENTS_D3D12_KHR);
+    using CreateFactory = HRESULT(WINAPI*)(REFIID, void**);
+    HMODULE dxgi = LoadLibraryW(L"dxgi.dll");
+    auto create = dxgi ? reinterpret_cast<CreateFactory>(reinterpret_cast<void*>(GetProcAddress(dxgi, "CreateDXGIFactory1"))) : nullptr;
+    Microsoft::WRL::ComPtr<IDXGIFactory1> factory;
+    if (!create || FAILED(create(IID_PPV_ARGS(&factory)))) return XR_ERROR_RUNTIME_FAILURE;
+    int wanted = 0;
+    if (const char* n = std::getenv("PT_XRTEST_ADAPTER")) wanted = std::atoi(n);
+    Microsoft::WRL::ComPtr<IDXGIAdapter1> adapter;
+    int hardware = 0;
+    bool found = false;
+    for (UINT i = 0; factory->EnumAdapters1(i, &adapter) != DXGI_ERROR_NOT_FOUND; ++i) {
+        DXGI_ADAPTER_DESC1 desc{};
+        adapter->GetDesc1(&desc);
+        if (desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE) continue;
+        if (hardware++ == wanted) {
+            req->adapterLuid = desc.AdapterLuid;
+            inst->adapter_luid = (static_cast<uint64_t>(static_cast<uint32_t>(desc.AdapterLuid.HighPart)) << 32) | desc.AdapterLuid.LowPart;
+            char name[128]{};
+            WideCharToMultiByte(CP_UTF8, 0, desc.Description, -1, name, sizeof(name) - 1, nullptr, nullptr);
+            Log("d3d12: adapter %d asked for: %s (LUID %08lx:%08lx)", wanted, name, desc.AdapterLuid.HighPart, desc.AdapterLuid.LowPart);
+            found = true;
+            break;
+        }
+    }
+    if (!found) return XR_ERROR_RUNTIME_FAILURE;
+    req->minFeatureLevel = D3D_FEATURE_LEVEL_11_0;
+    inst->requirements_checked = true;
+    return XR_SUCCESS;
+}
+#endif
+
 XRAPI_ATTR XrResult XRAPI_CALL CreateVulkanInstance(XrInstance h, const XrVulkanInstanceCreateInfoKHR* info, VkInstance* out, VkResult* vk_result) {
     Instance* inst = GetInstance(h);
     if (!inst) return Violation(XR_ERROR_HANDLE_INVALID, "xrCreateVulkanInstanceKHR: invalid instance");
@@ -1098,9 +1301,42 @@ XRAPI_ATTR XrResult XRAPI_CALL CreateSession(XrInstance h, const XrSessionCreate
     if (info->systemId != kSystemId) return XR_ERROR_SYSTEM_INVALID;
     if (!inst->requirements_checked) return Violation(XR_ERROR_GRAPHICS_REQUIREMENTS_CALL_MISSING, "xrCreateSession before the graphics requirements");
     const XrGraphicsBindingVulkanKHR* binding = nullptr;
+#ifdef _WIN32
+    const XrGraphicsBindingD3D12KHR* d3d_binding = nullptr;
+#endif
     for (auto* n = static_cast<const XrBaseInStructure*>(info->next); n; n = n->next) {
         if (n->type == XR_TYPE_GRAPHICS_BINDING_VULKAN2_KHR) binding = reinterpret_cast<const XrGraphicsBindingVulkanKHR*>(n);
+#ifdef _WIN32
+        if (n->type == XR_TYPE_GRAPHICS_BINDING_D3D12_KHR) d3d_binding = reinterpret_cast<const XrGraphicsBindingD3D12KHR*>(n);
+#endif
     }
+#ifdef _WIN32
+    if (inst->d3d12) {
+        if (!d3d_binding || !d3d_binding->device || !d3d_binding->queue) {
+            return Violation(XR_ERROR_GRAPHICS_DEVICE_INVALID, "xrCreateSession without a D3D12 graphics binding");
+        }
+        if (!inst->sessions.empty()) return XR_ERROR_LIMIT_REACHED;
+        const LUID luid = d3d_binding->device->GetAdapterLuid();
+        const uint64_t got = (static_cast<uint64_t>(static_cast<uint32_t>(luid.HighPart)) << 32) | luid.LowPart;
+        if (got != inst->adapter_luid) {
+            Violation(XR_ERROR_GRAPHICS_DEVICE_INVALID, "xrCreateSession: the D3D12 device is on adapter %08lx:%08lx, not the one asked for", luid.HighPart,
+                      luid.LowPart);
+        }
+        auto s = std::make_unique<Session>();
+        s->magic = kMagicSession;
+        s->instance = inst;
+        s->d3d12 = true;
+        s->d3d_device = d3d_binding->device;
+        s->d3d_queue = d3d_binding->queue;
+        Session* raw = s.release();
+        inst->sessions.insert(raw);
+        *out = reinterpret_cast<XrSession>(raw);
+        Log("session created on a D3D12 device and queue (adapter %08lx:%08lx)", luid.HighPart, luid.LowPart);
+        SetState(raw, XR_SESSION_STATE_IDLE);
+        SetState(raw, XR_SESSION_STATE_READY);
+        return XR_SUCCESS;
+    }
+#endif
     if (!binding) return Violation(XR_ERROR_GRAPHICS_DEVICE_INVALID, "xrCreateSession without a Vulkan graphics binding");
     if (!inst->sessions.empty()) return XR_ERROR_LIMIT_REACHED;
     if (binding->instance != inst->created_vk_instance) Violation(XR_ERROR_GRAPHICS_DEVICE_INVALID, "xrCreateSession: VkInstance not the one created through the runtime");
@@ -1133,10 +1369,13 @@ XRAPI_ATTR XrResult XRAPI_CALL DestroySession(XrSession h) {
         static_cast<long long>(s->begun), static_cast<long long>(s->ended), static_cast<long long>(s->projection_layers),
         static_cast<long long>(s->quad_layers));
     if (s->vk.DeviceWaitIdle) s->vk.DeviceWaitIdle(s->vk_device);
+#ifdef _WIN32
+    if (s->d3d12) D3dWaitIdle(s);
+#endif
     for (Swapchain* sc : s->swapchains) {
         for (SwapchainImage& i : sc->images) {
-            s->vk.DestroyImage(s->vk_device, i.image, nullptr);
-            s->vk.FreeMemory(s->vk_device, i.memory, nullptr);
+            if (s->vk.DestroyImage) s->vk.DestroyImage(s->vk_device, i.image, nullptr);
+            if (s->vk.FreeMemory) s->vk.FreeMemory(s->vk_device, i.memory, nullptr);
         }
         sc->magic = 0;
         delete sc;
@@ -1389,12 +1628,14 @@ XRAPI_ATTR XrResult XRAPI_CALL LocateViews(XrSession h, const XrViewLocateInfo* 
 }
 
 XRAPI_ATTR XrResult XRAPI_CALL EnumerateReferenceSpaces(XrSession h, uint32_t capacity, uint32_t* count, XrReferenceSpaceType* spaces) {
-    if (!GetSession(h)) return Violation(XR_ERROR_HANDLE_INVALID, "xrEnumerateReferenceSpaces: invalid session");
+    Session* s = GetSession(h);
+    if (!s) return Violation(XR_ERROR_HANDLE_INVALID, "xrEnumerateReferenceSpaces: invalid session");
     static const XrReferenceSpaceType types[] = {XR_REFERENCE_SPACE_TYPE_VIEW, XR_REFERENCE_SPACE_TYPE_LOCAL, XR_REFERENCE_SPACE_TYPE_STAGE};
-    *count = 3;
+    const uint32_t n = s->instance->floor > 0.0f ? 3u : 2u;
+    *count = n;
     if (capacity == 0) return XR_SUCCESS;
-    if (capacity < 3) return XR_ERROR_SIZE_INSUFFICIENT;
-    std::copy(std::begin(types), std::end(types), spaces);
+    if (capacity < n) return XR_ERROR_SIZE_INSUFFICIENT;
+    std::copy(std::begin(types), std::begin(types) + n, spaces);
     return XR_SUCCESS;
 }
 
@@ -1404,7 +1645,7 @@ XRAPI_ATTR XrResult XRAPI_CALL CreateReferenceSpace(XrSession h, const XrReferen
     if (!s) return Violation(XR_ERROR_HANDLE_INVALID, "xrCreateReferenceSpace: invalid session");
     PT_CHECK_STRUCT(info, XR_TYPE_REFERENCE_SPACE_CREATE_INFO);
     if (info->referenceSpaceType != XR_REFERENCE_SPACE_TYPE_VIEW && info->referenceSpaceType != XR_REFERENCE_SPACE_TYPE_LOCAL &&
-        info->referenceSpaceType != XR_REFERENCE_SPACE_TYPE_STAGE) {
+        (info->referenceSpaceType != XR_REFERENCE_SPACE_TYPE_STAGE || s->instance->floor <= 0.0f)) {
         return XR_ERROR_REFERENCE_SPACE_UNSUPPORTED;
     }
     if (!Normalized(info->poseInReferenceSpace.orientation)) return Violation(XR_ERROR_POSE_INVALID, "xrCreateReferenceSpace: pose not normalized");
@@ -1501,6 +1742,48 @@ XRAPI_ATTR XrResult XRAPI_CALL CreateSwapchain(XrSession h, const XrSwapchainCre
                          info->arraySize, info->mipCount, info->sampleCount, info->faceCount);
     }
     if (info->faceCount != 1 || info->sampleCount != 1) return XR_ERROR_FEATURE_UNSUPPORTED;
+#ifdef _WIN32
+    if (s->d3d12) {
+        const int64_t vk_format = VkOfDxgi(info->format);
+        const bool d3d_depth = AspectOf(vk_format) != VK_IMAGE_ASPECT_COLOR_BIT;
+        if (d3d_depth && (info->usageFlags & XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT)) {
+            return Violation(XR_ERROR_VALIDATION_FAILURE, "colour usage on a depth format");
+        }
+        auto sc = std::make_unique<Swapchain>();
+        sc->magic = kMagicSwapchain;
+        sc->session = s;
+        sc->info = *info;
+        sc->info.next = nullptr;
+        sc->vk_format = vk_format;
+        sc->images.resize(3);
+        D3D12_HEAP_PROPERTIES heap{D3D12_HEAP_TYPE_DEFAULT};
+        D3D12_RESOURCE_DESC desc{};
+        desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+        desc.Width = info->width;
+        desc.Height = info->height;
+        desc.DepthOrArraySize = static_cast<UINT16>(info->arraySize);
+        desc.MipLevels = static_cast<UINT16>(info->mipCount);
+        desc.Format = static_cast<DXGI_FORMAT>(info->format);
+        desc.SampleDesc.Count = 1;
+        desc.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+        if (info->usageFlags & XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT) desc.Flags |= D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+        if (info->usageFlags & XR_SWAPCHAIN_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT) desc.Flags |= D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL;
+        if (info->usageFlags & XR_SWAPCHAIN_USAGE_UNORDERED_ACCESS_BIT) desc.Flags |= D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+        const D3D12_RESOURCE_STATES state = d3d_depth ? D3D12_RESOURCE_STATE_DEPTH_WRITE : D3D12_RESOURCE_STATE_RENDER_TARGET;
+        for (SwapchainImage& image : sc->images) {
+            if (FAILED(s->d3d_device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, state, nullptr, IID_PPV_ARGS(&image.texture)))) {
+                return XR_ERROR_RUNTIME_FAILURE;
+            }
+            image.texture->SetName(L"pt_xr_test_runtime swapchain image");
+        }
+        Swapchain* raw = sc.release();
+        s->swapchains.insert(raw);
+        *out = reinterpret_cast<XrSwapchain>(raw);
+        Log("swapchain %p: %ux%u %s (DXGI %lld), array %u, usage %llx", static_cast<void*>(raw), info->width, info->height,
+            FormatName(vk_format).c_str(), static_cast<long long>(info->format), info->arraySize, static_cast<unsigned long long>(info->usageFlags));
+        return XR_SUCCESS;
+    }
+#endif
     const bool depth = AspectOf(info->format) != VK_IMAGE_ASPECT_COLOR_BIT;
     VkImageUsageFlags usage = VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
     if (info->usageFlags & XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT) usage |= VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
@@ -1515,6 +1798,7 @@ XRAPI_ATTR XrResult XRAPI_CALL CreateSwapchain(XrSession h, const XrSwapchainCre
     sc->session = s;
     sc->info = *info;
     sc->info.next = nullptr;
+    sc->vk_format = info->format;
     sc->images.resize(3);
     for (SwapchainImage& image : sc->images) {
         VkImageCreateInfo ci{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
@@ -1564,6 +1848,15 @@ XRAPI_ATTR XrResult XRAPI_CALL DestroySwapchain(XrSwapchain h) {
     Swapchain* sc = GetSwapchain(h);
     if (!sc) return Violation(XR_ERROR_HANDLE_INVALID, "xrDestroySwapchain: invalid swapchain");
     Session* s = sc->session;
+#ifdef _WIN32
+    if (s->d3d12) {
+        D3dWaitIdle(s);
+        s->swapchains.erase(sc);
+        sc->magic = 0;
+        delete sc;
+        return XR_SUCCESS;
+    }
+#endif
     s->vk.DeviceWaitIdle(s->vk_device);
     for (SwapchainImage& i : sc->images) {
         s->vk.DestroyImage(s->vk_device, i.image, nullptr);
@@ -1581,6 +1874,18 @@ XRAPI_ATTR XrResult XRAPI_CALL EnumerateSwapchainImages(XrSwapchain h, uint32_t 
     *count = static_cast<uint32_t>(sc->images.size());
     if (capacity == 0) return XR_SUCCESS;
     if (capacity < *count) return XR_ERROR_SIZE_INSUFFICIENT;
+#ifdef _WIN32
+    if (sc->session->d3d12) {
+        auto* d3d_images = reinterpret_cast<XrSwapchainImageD3D12KHR*>(images);
+        for (uint32_t i = 0; i < *count; ++i) {
+            if (d3d_images[i].type != XR_TYPE_SWAPCHAIN_IMAGE_D3D12_KHR) {
+                return Violation(XR_ERROR_VALIDATION_FAILURE, "xrEnumerateSwapchainImages: image %u type %d", i, d3d_images[i].type);
+            }
+            d3d_images[i].texture = sc->images[i].texture.Get();
+        }
+        return XR_SUCCESS;
+    }
+#endif
     auto* vk_images = reinterpret_cast<XrSwapchainImageVulkanKHR*>(images);
     for (uint32_t i = 0; i < *count; ++i) {
         if (vk_images[i].type != XR_TYPE_SWAPCHAIN_IMAGE_VULKAN2_KHR) {
@@ -2045,6 +2350,9 @@ const Entry kEntries[] = {
     PT_ENTRY("xrCreateVulkanInstanceKHR", CreateVulkanInstance),
     PT_ENTRY("xrCreateVulkanDeviceKHR", CreateVulkanDevice),
     PT_ENTRY("xrGetVulkanGraphicsDevice2KHR", GetVulkanGraphicsDevice2),
+#ifdef _WIN32
+    PT_ENTRY("xrGetD3D12GraphicsRequirementsKHR", GetD3D12GraphicsRequirements),
+#endif
 };
 #undef PT_ENTRY
 
@@ -2055,6 +2363,7 @@ XRAPI_ATTR XrResult XRAPI_CALL GetInstanceProcAddr(XrInstance instance, const ch
         if (std::strcmp(e.name, name) == 0) {
             if (e.needs_instance && !GetInstance(instance)) return XR_ERROR_HANDLE_INVALID;
             if (std::strstr(name, "Vulkan") && !g_instance->extensions.count(XR_KHR_VULKAN_ENABLE2_EXTENSION_NAME)) return XR_ERROR_FUNCTION_UNSUPPORTED;
+            if (std::strstr(name, "D3D12") && !g_instance->d3d12) return XR_ERROR_FUNCTION_UNSUPPORTED;
             *function = e.fn;
             return XR_SUCCESS;
         }

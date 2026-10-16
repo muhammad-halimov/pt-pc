@@ -4,6 +4,7 @@
 
 #include <cstdint>
 #include <filesystem>
+#include <functional>
 #include <map>
 #include <memory>
 #include <optional>
@@ -31,12 +32,18 @@
 #include "game/parameters.h"
 #include "game/player.h"
 #include "game/save_data.h"
+#include "game/sound_captions.h"
 #include "game/screen_effects.h"
 #include "game/game_plus_arm.h"
+#include "game/game_plus_intercom.h"
 #include "game/speedrun.h"
 #include "game/script_host.h"
 #include "game/stage_manager.h"
 #include "game/trap_system.h"
+
+namespace pt::audio {
+class Media;
+}
 
 namespace pt::game {
 
@@ -47,6 +54,7 @@ public:
     virtual uint32_t PostEventId(uint32_t id, const glm::vec3* position) = 0;
     virtual bool IsEventPlaying(std::string_view name) const = 0;
     virtual bool IsPlaying(uint32_t playing_id) const = 0;
+    virtual bool IsEventIdPlaying(uint32_t) const { return false; }
     virtual void SetListener(const glm::vec3& position, const glm::vec3& forward, const glm::vec3& up) = 0;
     virtual void Update(float dt) = 0;
     virtual void OnStageLoaded(Stage&) {}
@@ -54,7 +62,10 @@ public:
     virtual void Footstep(bool, const glm::vec3&) {}
     virtual void AnimEvent(std::string_view, uint64_t, const glm::vec3&) {}
     virtual void StopAll() {}
+    virtual void ResetSession() {}
     virtual uint32_t PlayStream(std::vector<uint8_t>, const glm::vec3*) { return 0; }
+    virtual uint32_t PlayStreamAs(std::vector<uint8_t>, std::string_view, const glm::vec3&) { return 0; }
+    virtual uint32_t PlayMedia(std::shared_ptr<const audio::Media>, const glm::vec3*) { return 0; }
     virtual uint32_t PostEventMedia(std::string_view, std::vector<uint32_t>, const glm::vec3*) { return 0; }
     virtual void SeekPlayingId(uint32_t, float) {}
     virtual void StopPlayingId(uint32_t, float) {}
@@ -63,6 +74,7 @@ public:
     virtual uint32_t PostRecordEvent(int, std::string_view name, const glm::vec3& position) { return PostEvent(name, &position); }
     virtual uint32_t PostRecordEventId(int, uint32_t id, const glm::vec3& position) { return PostEventId(id, &position); }
     virtual void MoveRecordSound(int, const glm::vec3&) {}
+    virtual void SetPostObserver(std::function<void(uint32_t, const std::optional<glm::vec3>&)>) {}
 };
 
 struct HandyReflection {
@@ -123,6 +135,7 @@ struct GameConfig {
 };
 
 struct ArchiveEntry;
+class LisaDate;
 
 class Game {
 public:
@@ -135,14 +148,19 @@ public:
     void CollectDraws(std::vector<DrawItem>& out);
     Camera GetCamera() const;
     void SetShowBody(bool on) { show_body_ = on; }
+    void SetTracedBody(bool on) { traced_body_ = on; }
     bool ShowBody() const { return show_body_; }
-    bool BodyShown() const { return show_body_ || third_person_shown_; }
+    bool BodyShown() const { return show_body_ || (third_person_shown_ && !camera_override_); }
     void SetDetachedView(bool on) { detached_view_ = on; }
     bool DetachedView() const { return detached_view_ || third_person_shown_; }
     bool FreeView() const { return detached_view_; }
     void SetThirdPerson(bool on);
     bool ThirdPerson() const { return third_person_; }
-    Camera ViewCamera() const;
+    bool ThirdPersonCameraActive() const { return third_person_ && third_person_primed_ && !detached_view_; }
+    Camera ViewCamera(bool fov_offset = true) const;
+    void SetFovOffset(int degrees) { fov_offset_ = static_cast<float>(degrees); }
+    float FovOffsetNow() const;
+    Camera PlayerViewCamera() const;
     float ThirdPersonWeight() const { return third_person_weight_; }
     Camera ThirdPersonTurn(const Camera& before, const Camera& after) const;
     Camera PeepholeTurn(const Camera& turned) const;
@@ -154,6 +172,10 @@ public:
     int TakePhotoModeRequest() { const int r = photo_request_; photo_request_ = 0; return r; }
     void RequestFreeCamera(bool on) { freecam_request_ = on ? 1 : 2; }
     int TakeFreeCameraRequest() { return std::exchange(freecam_request_, 0); }
+    void RequestEnhancedTextures(bool on) { enhanced_request_ = on ? 1 : 2; }
+    int TakeEnhancedTexturesRequest() { return std::exchange(enhanced_request_, 0); }
+    void RequestNeuralRendering(int value) { neural_request_ = value + 1; }
+    int TakeNeuralRenderingRequest() { return std::exchange(neural_request_, 0); }
     void RequestPhotoCamera(const glm::vec4& offset_look) { photo_camera_request_ = offset_look; }
     std::optional<glm::vec4> TakePhotoCameraRequest() { auto r = photo_camera_request_; photo_camera_request_.reset(); return r; }
     void RequestPhotoTarget(const glm::vec2& right_forward) { photo_target_ = right_forward; }
@@ -203,7 +225,7 @@ public:
     uint64_t Frame() const { return frame_; }
     double Time() const { return time_; }
 
-    void SetAudio(GameAudio* audio) { audio_ = audio; }
+    void SetAudio(GameAudio* audio);
     GameAudio* Audio() { return audio_; }
     uint32_t PostSound(std::string_view event, const glm::vec3& position, bool positional);
     void PostSoundId(uint32_t id);
@@ -239,6 +261,8 @@ public:
     void QueueSubtitle(std::string_view subtitle_id, float offset_seconds = 0.0f, uint32_t sound = 0) {
         subtitle_requests_.push_back({std::string(subtitle_id), offset_seconds, sound});
     }
+    void SetSoundCaptions(bool on);
+    SoundCaptions& Captions() { return captions_; }
     std::vector<SubtitleRequest> TakeSubtitleRequests() { return std::exchange(subtitle_requests_, {}); }
     void ClearPendingSubtitles();
     bool TakeSubtitleClear() { return std::exchange(clear_subtitles_pending_, false); }
@@ -270,6 +294,7 @@ public:
     bool StartStreetWalk();
     void UpdateStreetWalk(float dt);
     bool StreetWalkActive() const { return street_walk_; }
+    void ToggleStreetFlashlight();
     bool StreetPending() const { return street_pending_; }
     bool OfferStreetWalk();
     bool StreetOfferPending() const { return street_offer_ == StreetOffer::Asking; }
@@ -290,9 +315,12 @@ public:
     }
     bool BrowseLocksOn() const { return config_.release_locks; }
     void NoteArchive(std::string_view key);
+    void LogModInspect(const Camera& camera);
+    void LogCapturePose(const Camera& camera);
     void SetArchiveSeen(std::set<std::string> keys) { archive_seen_ = std::move(keys); }
     const std::set<std::string>& ArchiveSeen() const { return archive_seen_; }
     bool ArchiveUnlocked(const ArchiveEntry& entry) const;
+    std::vector<std::string> BackfillArchive(uint32_t finishes);
     uint32_t ArchiveGeneration() const { return archive_generation_; }
     void RequestArchive(std::string_view id) { archive_request_ = std::string(id); }
     std::string TakeArchiveRequest() { return std::exchange(archive_request_, std::string()); }
@@ -312,11 +340,23 @@ public:
     uint32_t BrowseUnlockGeneration() const { return browse_unlock_generation_; }
     void NoteBrowseReached(int index);
     void NoteGameFinished();
+    void ReleaseUnusedAssets(std::string_view why);
+    bool VideoMemoryTight();
+    static constexpr float kEndingSkipHold = 1.5f;
+    void UpdateEndingSkip(bool pressed, bool held, float dt, bool blocked);
+    float EndingSkipAlpha() const { return ending_skip_alpha_; }
+    float EndingSkipProgress() const { return ending_skip_hold_ / kEndingSkipHold; }
     void OnFloorReached(std::string_view floor, int pass);
     void EnableGamePlus();
     bool GamePlus() const { return game_plus_; }
     uint32_t Finishes() const { return finishes_; }
+    int GamePlusNoticeDue();
+    int CurrentLoopIndex() const { return current_loop_index_; }
+    void TakeGamePlusNotice(int tier);
     int GamePlusTier() const;
+    void SetGamePlusSetting(bool on, bool now);
+    bool GamePlusSetting() const { return game_plus_setting_; }
+    void LatchGamePlus();
     static constexpr int kTierStreetAmbience = 3;
     static constexpr int kTierMazeMusic = 3;
     static constexpr int kTierBathroomMusic = 3;
@@ -325,7 +365,29 @@ public:
     static constexpr int kTierLaughs = 3;
     static constexpr int kTierDemos = 4;
     void OnTrapDemo(std::string_view demo_id, const glm::mat4& origin, bool loop);
+    static constexpr int kTierIntercom = 2;
+    bool GamePlusIntercomLight(glm::vec3& position, glm::vec3& direction, glm::mat4& area, bool& has_area, float& level) const;
+    void IntercomScript(std::string_view what);
+    int IntercomShown() const;
+    bool IntercomActive() const { return intercom_.phase != intercom::Play::Phase::Idle; }
     bool GamePlusTubShown() const;
+    bool GamePlusTubView(glm::vec3& eye, glm::vec3& target) const;
+    void OnLisaRush(std::string_view how);
+    void LisaDateFloorEntered(std::string_view from, std::string_view floor);
+    int LisaRushes() const { return lisa_rushes_; }
+    void SetLisaRushesForTest(int rushes);
+    bool LisaPortraitPosition(glm::vec3& out, glm::vec3* normal = nullptr) const;
+    glm::vec3 LisaHintLightColour() const { return lisa_hint_colour_; }
+    bool LisaHintGlint(glm::vec3& position, glm::vec3& normal, float& strength) const;
+    float LisaHintVignette() const { return lisa_vignette_; }
+    void RequestLisaDate(std::string cause) { lisa_date_request_ = std::move(cause); }
+    std::optional<std::string> TakeLisaDateRequest() { return std::exchange(lisa_date_request_, std::nullopt); }
+    void SetLisaDateScene(LisaDate* date) { lisa_date_scene_ = date; }
+    LisaDate* LisaDateScene() const { return lisa_date_scene_; }
+    bool LisaDateActive() const { return lisa_date_scene_ != nullptr; }
+    void RequestLeaveLisaDate() { leave_lisa_date_ = true; }
+    bool TakeLeaveLisaDateRequest() { return std::exchange(leave_lisa_date_, false); }
+    void HoldSaves(bool hold);
     void AddMockupDraw(const GpuMesh* mesh, const glm::mat4& world) { mockup_draws_.push_back({mesh, world}); }
     void ClearMockupDraws() { mockup_draws_.clear(); }
     bool ProgressResetPending() const { return progress_reset_pending_; }
@@ -342,14 +404,18 @@ public:
     bool SavesEnabled() const { return save_store_.Enabled(); }
     void RequestLoad();
     bool SaveBusy() const { return save_dialog_.has_value(); }
+    void SetBootHold(bool hold) { boot_hold_ = hold; }
+    bool BootHold() const { return boot_hold_; }
     struct SaveDialog {
         std::string key;
         enum class Then { Nothing, NewSave, Retry } then = Then::Nothing;
     };
     const std::optional<SaveDialog>& PendingSaveDialog() const { return save_dialog_; }
     void CloseSaveDialog();
+    void ShowNoticeDialog(std::string key) { save_dialog_ = SaveDialog{std::move(key), SaveDialog::Then::Nothing}; }
     uint32_t SaveIoCount() const { return save_io_count_; }
     bool SaveIoLoading() const { return save_io_loading_; }
+    uint32_t SaveLoads() const { return save_loads_; }
     bool ShowOptionMenuOnFirstBoot() const { return true; }
     bool OptionsUiAvailable() const { return options_ui_; }
     void SetOptionsUiAvailable(bool available) { options_ui_ = available; }
@@ -392,6 +458,7 @@ private:
     bool show_body_ = false;
     bool detached_view_ = false;
     bool third_person_ = false;
+    float fov_offset_ = 0.0f;
     bool third_person_shown_ = false;
     float third_person_weight_ = 0.0f;
     float third_person_distance_ = 0.0f;
@@ -408,9 +475,12 @@ private:
     glm::vec3 handy_direction_{0.0f};
     int photo_request_ = 0;
     int freecam_request_ = 0;
+    int enhanced_request_ = 0;
+    int neural_request_ = 0;
     std::optional<glm::vec4> photo_camera_request_;
     std::optional<std::pair<glm::vec3, glm::vec3>> photo_view_request_;
     std::vector<int> photo_settings_request_;
+    bool traced_body_ = false;
     glm::vec2 photo_target_{0.0f};
 
     Vfs& vfs_;
@@ -447,13 +517,16 @@ private:
     std::unique_ptr<ModLua> mod_scripts_;
     StatusFlags status_;
     GameAudio* audio_ = nullptr;
+    SoundCaptions captions_;
     std::set<std::string> bgm_playing_;
     InputState last_input_;
+    glm::vec2 demo_light_mouse_{0.0f};
     uint64_t frame_ = 0;
     double time_ = 0.0;
     double last_save_request_ = -1e9;
     std::optional<SaveProgress> saved_progress_;
     std::optional<SaveDialog> save_dialog_;
+    bool boot_hold_ = false;
     int save_retries_ = 0;
     void OnSaveWritten(bool ok);
     double grain_time_ = 0.0;
@@ -466,6 +539,7 @@ private:
     SaveStore save_store_;
     uint32_t save_io_count_ = 0;
     bool save_io_loading_ = false;
+    uint32_t save_loads_ = 0;
     GameOptions options_;
     bool options_ui_ = false;
     int previous_foot_steps_ = 0;
@@ -499,11 +573,23 @@ private:
     bool game_finished_ = false;
     uint32_t browse_unlock_generation_ = 0;
     bool game_plus_ = false;
+    bool game_plus_setting_ = true;
+    bool game_plus_active_ = true;
     SpeedrunTimer speedrun_;
     bool options_after_restart_ = false;
     const GpuMesh* tub_lisa_mesh_ = nullptr;
+    bool ending_skip_armed_ = false;
+    float ending_skip_hold_ = 0.0f;
+    float ending_skip_alpha_ = 0.0f;
     void UpdateGamePlusSounds();
     void UpdateGamePlusDemos();
+    void UpdateGamePlusIntercom(float dt);
+    bool SwapIntercom(Stage& stage, bool show, intercom::Play::Site& site);
+    void StartIntercom(intercom::Play::Phase phase, const intercom::Play::Site& site, std::string_view why);
+    void StopIntercom(std::string_view why);
+    void AddIntercomDraw(std::vector<DrawItem>& out) const;
+    const intercom::Play::Site* IntercomSite(bool inside_only) const;
+    intercom::Play intercom_;
     std::string gp_man_floor_;
     int gp_man_pass_ = 0;
     uint64_t gp_man_since_ = 0;
@@ -524,9 +610,51 @@ private:
     bool gp_laugh_near_ = false;
     int gp_laugh_visits_ = 0;
     uint32_t finishes_ = 0;
+    uint32_t gameplus_announced_ = 0;
+    bool gameplus_door_seen_ = false;
+    int current_loop_index_ = -1;
     GamePlusArm game_plus_arm_;
     std::vector<std::pair<const GpuMesh*, glm::mat4>> mockup_draws_;
     void UpdateGamePlus();
+    bool UpdateLisaPortrait(float dt);
+    bool InViewHeldZoom(const glm::vec3& position, float area) const;
+    void UpdateLisaHints(float dt);
+    void LisaRushCounted(int rush);
+    void LisaHintsOff(std::string_view why, bool sad);
+    void PlayLisaHint(int kind, int rush);
+    void LoadLisaHintSounds();
+    int lisa_hint_level_ = 0;
+    bool lisa_hint_lit_ = false;
+    glm::vec3 lisa_hint_colour_{1.0f};
+    bool lisa_hint_aside_ = false;
+    float lisa_glint_ = 0.0f;
+    float lisa_glint_time_ = 0.0f;
+    glm::vec3 lisa_glint_at_{0.0f};
+    glm::vec3 lisa_glint_normal_{0.0f, 0.0f, 1.0f};
+    bool lisa_glint_valid_ = false;
+    float lisa_vignette_ = 0.0f;
+    float lisa_heart_wait_ = 0.0f;
+    int lisa_heart_beats_ = 0;
+    float lisa_heart_pulse_ = 0.0f;
+    uint32_t lisa_heart_id_ = 0;
+    int lisa_sting_pending_ = 0;
+    float lisa_sting_wait_ = 0.0f;
+    bool lisa_hint_sounds_loaded_ = false;
+    std::vector<std::vector<uint8_t>> lisa_sting_wav_;
+    std::vector<uint8_t> lisa_heart_wav_;
+    std::vector<uint8_t> lisa_sad_wav_;
+    int lisa_rushes_ = 0;
+    bool lisa_rush_counted_ = false;
+    float lisa_portrait_time_ = 0.0f;
+    bool lisa_portrait_armed_ = false;
+    float lisa_portrait_lost_ = 0.0f;
+    bool lisa_portrait_release_ = false;
+    std::optional<std::string> lisa_date_request_;
+    LisaDate* lisa_date_scene_ = nullptr;
+    bool leave_lisa_date_ = false;
+    bool saves_held_ = false;
+    bool save_deferred_ = false;
+    bool options_save_deferred_ = false;
     bool locators_dirty_ = false;
     bool voice_listening_ = false;
     BlurSway blur_sway_;

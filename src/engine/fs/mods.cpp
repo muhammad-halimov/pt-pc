@@ -1,3 +1,5 @@
+#include "engine/core/ascii.h"
+#include "engine/platform/os.h"
 #include "engine/fs/mods.h"
 
 #include <algorithm>
@@ -5,6 +7,8 @@
 #include <cctype>
 #include <cstdlib>
 #include <fstream>
+#include <mutex>
+#include <unordered_map>
 #include <system_error>
 
 #include "engine/core/log.h"
@@ -15,7 +19,7 @@ namespace {
 std::atomic<const ModSet*> g_active{nullptr};
 
 char Lower(char c) {
-    return static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    return static_cast<char>(pt::AsciiLower(c));
 }
 
 std::string Utf8(const std::u8string& text) {
@@ -414,21 +418,54 @@ std::unique_ptr<ModSet> Load(const std::filesystem::path& dir, const std::map<st
         }
     }
     set->index.Build(set->mods);
+    for (auto it = set->mods.rbegin(); it != set->mods.rend(); ++it) {
+        const Mod& mod = *it;
+        if (!mod.enabled) continue;
+        const auto file = FindChild(mod.root, "level.json", false);
+        if (file.empty()) continue;
+        const auto bytes = ReadDiskFile(file);
+        std::string error;
+        std::vector<std::string> entry_warnings;
+        const std::string_view text = bytes ? std::string_view(reinterpret_cast<const char*>(bytes->data()), bytes->size()) : "";
+        if (!bytes || !ParseLevel(text, mod.folder, set->level_edits, set->level_adds, &entry_warnings, &error)) {
+            if (warnings) warnings->push_back(mod.folder + "/level.json: " + (bytes ? error : std::string("cannot be read")) + "; ignored");
+        }
+        if (warnings) {
+            for (const std::string& w : entry_warnings) warnings->push_back(mod.folder + "/level.json: " + w);
+        }
+    }
     return set;
 }
 
 void SetActive(const ModSet* set) {
-    g_active.store(set && !set->index.Empty() ? set : nullptr, std::memory_order_release);
+    g_active.store(set && (!set->index.Empty() || !set->level_edits.empty() || !set->level_adds.empty()) ? set : nullptr,
+                   std::memory_order_release);
 }
 
 const ModSet* Active() {
     return g_active.load(std::memory_order_acquire);
 }
 
+namespace {
+std::mutex g_generated_mutex;
+std::unordered_map<std::string, std::vector<uint8_t>> g_generated;
+}
+
+void RegisterGenerated(std::string asset_path, std::vector<uint8_t> bytes) {
+    std::lock_guard lock(g_generated_mutex);
+    g_generated[LowerCopy(asset_path)] = std::move(bytes);
+}
+
 std::optional<std::vector<uint8_t>> ReadOverride(std::string_view asset_path) {
     const ModSet* set = Active();
     if (!set) {
         return std::nullopt;
+    }
+    {
+        std::lock_guard lock(g_generated_mutex);
+        if (auto it = g_generated.find(LowerCopy(asset_path)); it != g_generated.end()) {
+            return it->second;
+        }
     }
     const OverrideIndex::Hit* hit = set->index.Find(asset_path);
     if (!hit) {
@@ -448,7 +485,7 @@ std::optional<std::vector<uint8_t>> ReadDiskFile(const std::filesystem::path& pa
     }
     constexpr std::streamoff kMaxFile = std::streamoff(1) << 30;
     if (size > kMaxFile) {
-        LogError("mods: {} is {} bytes, more than the {} an override may have; the game's own file is used", path.string(), size, kMaxFile);
+        LogError("mods: {} is {} bytes, more than the {} an override may have; the game's own file is used", pt::os::PathToUtf8(path), size, kMaxFile);
         return std::nullopt;
     }
     std::vector<uint8_t> data(static_cast<size_t>(size));

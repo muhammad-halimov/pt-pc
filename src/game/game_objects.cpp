@@ -238,6 +238,7 @@ void OchoLogic::RelocateForReset() {
 }
 
 void OchoLogic::LogicControl(int s) {
+    if (s == 4 && state_ != 4) game_.OnLisaRush("dash");
     timer_a_ = 0.0f;
     StopVoice();
     ResetState();
@@ -325,6 +326,7 @@ void OchoLogic::UpdateWarp() {
         if (appear_request_) {
             Appear();
             appear_request_ = false;
+            Sense(0.0f);
         }
         if (Detect()) {
             LogicControl(4);
@@ -336,7 +338,6 @@ void OchoLogic::UpdateWarp() {
             wait_ = static_cast<float>(Random() % 50) + 40.0f;
             visible_ = false;
             Show(false);
-            game_.PostSoundId(kHeraldStop);
             StopVoice();
         }
     }
@@ -417,6 +418,7 @@ void OchoLogic::UpdateDash(float frame_dt) {
 }
 
 void OchoLogic::Kill() {
+    game_.OnLisaRush("kill");
     has_killed_ = true;
     game_.Floor().SetLisaKilled(true);
     game_.Floor().SetPending(8);
@@ -1024,7 +1026,8 @@ bool Drawable(const Gimmick& g) {
 
 void GameObjects::DrawnCharacters(std::vector<glm::vec3>& feet) const {
     for (const Gimmick& g : gimmicks_) {
-        if (g.type == GimmickType::Ocho && Drawable(g) && (g.hidden_views & 1u) == 0) {
+        if (g.type == GimmickType::Ocho && Drawable(g) && (g.hidden_views & 1u) == 0 &&
+            !(game_.Demos().IsPlaying("gc_p00_020"))) {
             feet.push_back(glm::vec3(g.world[3]));
         }
     }
@@ -1042,6 +1045,9 @@ bool GameObjects::GimmickDrawn(std::string_view name) const {
 void GameObjects::CollectDraws(std::vector<DrawItem>& out) const {
     for (const Gimmick& g : gimmicks_) {
         if (!Drawable(g)) {
+            continue;
+        }
+        if (g.type == GimmickType::Ocho && game_.Demos().IsPlaying("gc_p00_020")) {
             continue;
         }
         DrawItem item;

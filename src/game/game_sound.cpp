@@ -1,3 +1,4 @@
+#include "engine/core/ascii.h"
 #include "game/game_sound.h"
 
 #include <algorithm>
@@ -5,19 +6,40 @@
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
+#include <unordered_map>
 
 #include "engine/core/log.h"
+#include "engine/core/strcode.h"
+#include "engine/audio/wwise_bank.h"
 #include "engine/vfx/vfx_file.h"
+#include "game/archive.h"
 
 namespace pt::game {
 namespace {
 
-const char* FootstepMaterial(uint32_t geom_material) {
+const std::unordered_map<uint32_t, std::string>& ArchiveEventIds() {
+    static const std::unordered_map<uint32_t, std::string> ids = [] {
+        std::unordered_map<uint32_t, std::string> out;
+        for (const ArchiveEntry& e : ArchiveEntries()) {
+            if (e.unlock.starts_with("event:")) out.emplace(audio::Fnv1Hash32(e.unlock.substr(6)), std::string(e.unlock.substr(6)));
+        }
+        return out;
+    }();
+    return ids;
+}
+
+struct FootstepSwitch {
+    const char* name;
+    uint32_t id;
+};
+
+FootstepSwitch FootstepMaterial(uint32_t geom_material) {
     switch (geom_material) {
-    case 0x59D11AF1: return "tile";
-    case 0x5F263606: return "conc";
-    case 0x2D2AEFA4: return "BLOOD";
-    default: return "wood";
+    case 0x59D11AF1: return {"tile", 0x9D366849};
+    case 0x5F263606: return {"conc", 0xDDC5A09E};
+    case 0x2D2AEFA4: return {"BLOOD", 0xEA8341EB};
+    case 0x4FB17187: return {"2780720025", 0xA5BE6B99};
+    default: return {"wood", 0x7AAB588A};
     }
 }
 
@@ -65,8 +87,8 @@ std::vector<glm::mat4> ShapeTransforms(const Stage& stage, const fox2::DataSetFi
 
 }
 
-bool GameSound::Init(bool open_device, std::string_view language) {
-    ready_ = system_.Init(game_.GetVfs(), open_device);
+bool GameSound::Init(bool open_device, std::string_view language, bool surround) {
+    ready_ = system_.Init(game_.GetVfs(), open_device, surround);
     if (!ready_) {
         LogError("sound: init failed");
         return false;
@@ -87,7 +109,7 @@ bool GameSound::Init(bool open_device, std::string_view language) {
         if (!id.empty()) {
             game_.QueueSubtitle(id, 0.0f, playing);
             std::string key = "voice:" + id;
-            std::transform(key.begin(), key.end(), key.begin(), [](char c) { return static_cast<char>(std::tolower(static_cast<unsigned char>(c))); });
+            std::transform(key.begin(), key.end(), key.begin(), [](char c) { return static_cast<char>(pt::AsciiLower(c)); });
             game_.NoteArchive(key);
         }
     });
@@ -101,10 +123,15 @@ void GameSound::Shutdown() {
         ready_ = false;
     }
     dialogue_objects_.clear();
+    one_shot_objects_.Reset();
 }
 
 audio::GameObjectId GameSound::OneShotObject(const glm::vec3& position) {
-    const audio::GameObjectId id = kOneShotBase + (next_one_shot_++ % kOneShotCount);
+    const size_t previous_size = one_shot_objects_.Size();
+    const audio::GameObjectId id = one_shot_objects_.Acquire([&](audio::PlayingId playing) { return system_.IsPlaying(playing); });
+    if (one_shot_objects_.Size() != previous_size) {
+        system_.RegisterObject(id, "OneShot");
+    }
     system_.SetObjectTransform(id, position, glm::vec3(0.0f, 0.0f, 1.0f));
     SetAreaSends(id, position);
     return id;
@@ -133,7 +160,10 @@ uint32_t GameSound::PostEvent(std::string_view name, const glm::vec3* position) 
         return 0;
     }
     NoteArchiveEvent(name);
-    return system_.PostEvent(name, position ? OneShotObject(*position) : 0);
+    const audio::GameObjectId object = position ? OneShotObject(*position) : 0;
+    const audio::PlayingId playing = system_.PostEvent(name, object);
+    if (position) one_shot_objects_.Track(object, playing);
+    return playing;
 }
 
 void GameSound::NoteArchiveEvent(std::string_view name) {
@@ -146,14 +176,21 @@ uint32_t GameSound::PostEventId(uint32_t id, const glm::vec3* position) {
     if (!ready_) {
         return 0;
     }
-    return system_.PostEventId(id, position ? OneShotObject(*position) : 0);
+    if (const auto it = ArchiveEventIds().find(id); it != ArchiveEventIds().end()) NoteArchiveEvent(it->second);
+    const audio::GameObjectId object = position ? OneShotObject(*position) : 0;
+    const audio::PlayingId playing = system_.PostEventId(id, object);
+    if (position) one_shot_objects_.Track(object, playing);
+    return playing;
 }
 
 uint32_t GameSound::PostEventMedia(std::string_view name, std::vector<uint32_t> media_ids, const glm::vec3* position) {
     if (!ready_) {
         return 0;
     }
-    return system_.PostEventMedia(name, std::move(media_ids), position ? OneShotObject(*position) : 0);
+    const audio::GameObjectId object = position ? OneShotObject(*position) : 0;
+    const audio::PlayingId playing = system_.PostEventMedia(name, std::move(media_ids), object);
+    if (position) one_shot_objects_.Track(object, playing);
+    return playing;
 }
 
 uint32_t GameSound::PostRecordEvent(int record, std::string_view name, const glm::vec3& position) {
@@ -218,11 +255,42 @@ void GameSound::StopAll() {
     current_area_.clear();
 }
 
+void GameSound::ResetSession() {
+    StopAll();
+    if (ready_) {
+        system_.ResetSession();
+    }
+    one_shot_objects_.Reset();
+}
+
 uint32_t GameSound::PlayStream(std::vector<uint8_t> wem, const glm::vec3* position) {
     if (!ready_) {
         return 0;
     }
-    return system_.PlayStream(std::move(wem), position ? OneShotObject(*position) : 0);
+    const audio::GameObjectId object = position ? OneShotObject(*position) : 0;
+    const audio::PlayingId playing = system_.PlayStream(std::move(wem), object);
+    if (position) one_shot_objects_.Track(object, playing);
+    return playing;
+}
+
+uint32_t GameSound::PlayStreamAs(std::vector<uint8_t> wem, std::string_view donor_event, const glm::vec3& position) {
+    if (!ready_) {
+        return 0;
+    }
+    const audio::GameObjectId object = OneShotObject(position);
+    const audio::PlayingId playing = system_.PlayStreamAs(std::move(wem), donor_event, object);
+    one_shot_objects_.Track(object, playing);
+    return playing;
+}
+
+uint32_t GameSound::PlayMedia(std::shared_ptr<const audio::Media> media, const glm::vec3* position) {
+    if (!ready_) {
+        return 0;
+    }
+    const audio::GameObjectId object = position ? OneShotObject(*position) : 0;
+    const audio::PlayingId playing = system_.PlayMedia(std::move(media), object);
+    if (position) one_shot_objects_.Track(object, playing);
+    return playing;
 }
 
 void GameSound::SeekPlayingId(uint32_t playing_id, float seconds) {
@@ -255,12 +323,14 @@ void GameSound::Footstep(bool left, const glm::vec3& position) {
     }
     system_.SetObjectTransform(kPlayerObject, position, game_.GetPlayer().BodyForward());
     SetAreaSends(kPlayerObject, position);
-    const char* material = FootstepMaterial(game_.SurfaceMaterial(position));
-    if (material != footstep_material_) {
-        footstep_material_ = material;
-        LogDebug("sound: footstep material {}", material);
+    const uint32_t surface = game_.SurfaceMaterial(position);
+    const FootstepSwitch material = FootstepMaterial(surface);
+    if (material.name != footstep_material_ || surface != footstep_surface_) {
+        footstep_material_ = material.name;
+        footstep_surface_ = surface;
+        LogDebug("sound: footstep material {} (surface {:#x} at {:.2f} {:.2f} {:.2f})", material.name, surface, position.x, position.y, position.z);
     }
-    system_.SetSwitch("Material", material, kPlayerObject);
+    system_.SetSwitchId(0xE6640542, material.id, kPlayerObject);
     system_.PostEvent(left ? "Play_plr_footstep_wk_l" : "Play_plr_footstep_wk_r", kPlayerObject);
 }
 
@@ -275,7 +345,19 @@ void GameSound::AnimEvent(std::string_view sound, uint64_t event, const glm::vec
     }
     system_.SetObjectTransform(o.object, position, game_.GetPlayer().BodyForward());
     SetAreaSends(o.object, position);
-    system_.SetSwitch("Material", FootstepMaterial(game_.SurfaceMaterial(position)), o.object);
+    const uint32_t surface = game_.SurfaceMaterial(position);
+    const FootstepSwitch material = FootstepMaterial(surface);
+    static const uint64_t kFootCreak = StrCode64("FOOT_CREAK") & kStrCode64Mask;
+    const bool silent = event == kFootCreak && material.id != FootstepMaterial(0).id;
+    if (surface != o.logged_surface) {
+        o.logged_surface = surface;
+        LogDebug("sound: motion event {} on material {} (surface {:#x} at {:.2f} {:.2f} {:.2f}){}", sound, material.name, surface, position.x, position.y,
+                 position.z, silent ? ", not posted" : "");
+    }
+    if (silent) {
+        return;
+    }
+    system_.SetSwitchId(0xE6640542, material.id, o.object);
     o.playing.push_back(system_.PostEvent(sound, o.object));
 }
 
@@ -308,7 +390,10 @@ audio::PlayingId GameSound::PostDialogueAt(uint32_t dialogue_event, std::span<co
     if (!ready_) {
         return 0;
     }
-    return system_.PostDialogueEventId(dialogue_event, arguments, OneShotObject(position));
+    const audio::GameObjectId object = OneShotObject(position);
+    const audio::PlayingId playing = system_.PostDialogueEventId(dialogue_event, arguments, object);
+    one_shot_objects_.Track(object, playing);
+    return playing;
 }
 
 void GameSound::UpdateGimmickDialogue() {
@@ -607,6 +692,7 @@ void GameSound::UpdateAreas(float dt) {
         a.fade = std::clamp(a.fade + (a.event == event ? step : -step), 0.0f, 1.0f);
         if (a.fade > 0.0f) {
             if (!a.playing || !system_.IsPlaying(a.playing)) {
+                NoteArchiveEvent(a.event);
                 a.playing = system_.PostEvent(a.event, a.object);
             }
             system_.SetRtpc(volume_rtpc_, a.fade, a.object);

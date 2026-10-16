@@ -129,8 +129,10 @@ void FloorLevel::NextFloor() {
     if (ModLua* mods = game_.ModScripts()) {
         mods->FloorEnter(CurrentFloorName(), loop_count_);
     }
+    game_.LatchGamePlus();
     game_.ApplyStageTransform();
     game_.OnFloorReached(CurrentFloorName(), loop_count_);
+    game_.LisaDateFloorEntered(current, CurrentFloorName());
     game_.OnBrowseFloorEntered();
     RelocateGimmicks();
     ResetBaby();
@@ -218,7 +220,7 @@ void FloorLevel::RelocateGimmicks() {
             objects.PlayGimmickMotion(GimmickType::CeilLamp, "CeilLampStrong", false);
         } else if (floor == "f120") {
             objects.PlayGimmickMotion(GimmickType::CeilLamp, "CeilLamp", true);
-            objects.PlayGimmickMotion(GimmickType::Baby, "Baby", true);
+            objects.SetGimmickEnabled(GimmickType::Baby, false);
         } else if (floor == "ending") {
             for (GimmickType type : {GimmickType::Ocho, GimmickType::Baby, GimmickType::CeilLamp, GimmickType::Freezer, GimmickType::Bag}) {
                 objects.SetGimmickEnabled(type, false);
@@ -228,6 +230,21 @@ void FloorLevel::RelocateGimmicks() {
         if (setup->light_row >= 0) {
             game_.SetFloorLighting(setup->light_row);
         }
+    }
+    {
+        const bool past_xmark = floor == "f070" || floor == "f080" || floor == "f090" || floor == "f100" || floor == "f110" ||
+                                floor == "f120" || floor == "f160";
+        const bool past_hello = floor == "f100" || floor == "f110" || floor == "f120" || floor == "f160";
+        const bool past_peephole = floor == "f120" || floor == "f160";
+        bool forced = false;
+        for (const auto& [past, id] : {std::pair{past_xmark, NazoId::XMark}, std::pair{past_hello, NazoId::Hello}, std::pair{past_peephole, NazoId::Peephole}}) {
+            if (past && !nazo.IsCleared(id)) {
+                LogInfo("floor: {} implies {} solved; it was not", floor, NazoName(id));
+                nazo.ForceClear(id);
+                forced = true;
+            }
+        }
+        if (forced) nazo.CancelPendingClearSound();
     }
     nazo.ApplyVisuals(NazoId::Photo);
     nazo.ApplyVisuals(NazoId::XMark);

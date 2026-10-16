@@ -14,31 +14,33 @@ layout(location = 0) in vec2 in_uv;
 layout(location = 0) out vec4 out_color;
 layout(location = 1) out vec4 out_factor;
 
+const float kBeamProbeDistance = 2.0;
+
+float BeamFactor(ivec2 pixel) {
+    if (pass.ids.y == 0xFFFFFFFFu) return 1.0;
+    View v = frame.views[pass.ids.x];
+    Light l = frame.lights[pass.ids.y];
+    Surface s;
+    vec2 frag = vec2(pixel) + 0.5;
+    vec3 ray = vec3(PixelNdc(v, frag) * v.projection_param.xy, 1.0);
+    s.P = normalize(ray) * kBeamProbeDistance;
+    s.world = (v.inv_view * vec4(s.P, 1.0)).xyz;
+    s.roughness = 1.0;
+    s.specular = 0.0;
+    s.material_u = 0.0;
+    vec3 to_light = (v.view * vec4(l.position.xyz, 1.0)).xyz - s.P;
+    s.N = to_light / max(length(to_light), 1.0e-6);
+    s.translucency = 0.0;
+    vec3 beam;
+    vec3 specular;
+    if (!EvaluateLight(l, v, s, false, frag, beam, specular)) return 1.0;
+    return min(65504.0, 1.0 + Luma709(max(beam, vec3(0.0))) / pass.f0.x);
+}
+
 void main() {
     ivec2 pixel = ivec2(gl_FragCoord.xy);
     vec4 hdr = ImgFetch(IMG_HDR, pixel);
-    float factor = 1.0;
-    float depth = ImgFetch(IMG_DEPTH, pixel).x;
-    if (depth > 0.0 && hdr.a < 1.0 && pass.ids.y != 0xFFFFFFFFu) {
-        View v = frame.views[pass.ids.x];
-        Light l = frame.lights[pass.ids.y];
-        Surface s;
-        s.P = ViewPosition(v, PixelNdc(v, gl_FragCoord.xy), depth);
-        s.world = (v.inv_view * vec4(s.P, 1.0)).xyz;
-        vec4 g_material = ImgFetch(IMG_MATERIAL, pixel);
-        s.N = DecodeNormal(ImgFetch(IMG_NORMAL, pixel).xyz);
-        s.roughness = g_material.x;
-        s.specular = g_material.y;
-        s.material_u = g_material.z;
-        s.translucency = g_material.w;
-        vec3 dh;
-        vec3 sh;
-        if (EvaluateLight(l, v, s, pass.ids.z != 0u, gl_FragCoord.xy, dh, sh)) {
-            float whole = Luma709(max(ImgFetch(IMG_DIFFUSE, pixel).rgb, vec3(0.0)));
-            float handy = clamp(Luma709(max(dh, vec3(0.0))), 0.0, whole);
-            factor = (whole + pass.f0.x) / (whole - handy + pass.f0.x);
-        }
-    }
+    float factor = BeamFactor(pixel);
     out_color = vec4(hdr.rgb / factor, hdr.a);
     out_factor = vec4(factor, 0.0, 0.0, 0.0);
 }

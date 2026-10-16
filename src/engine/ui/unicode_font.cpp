@@ -131,7 +131,7 @@ bool FfntFont::LoadUnicodeFont(std::string_view family, std::string_view charact
     std::sort(glyphs_.begin(),glyphs_.end(),[](auto& a,auto& b){return a.code<b.code;});
     unicode_ = std::move(state); return true;
 }
-std::vector<ShapedGlyph> FfntFont::ShapeLine(std::span<const uint32_t> codes, float inline_advance) const {
+std::vector<ShapedGlyph> FfntFont::ShapeLine(std::span<const uint32_t> codes, float inline_advance, std::span<const float> code_advances) const {
     std::vector<ShapedGlyph> out;
     if (!unicode_ || codes.empty()) return out;
     std::wstring text; for (auto c:codes) text.push_back(wchar_t(c));
@@ -154,10 +154,10 @@ std::vector<ShapedGlyph> FfntFont::ShapeLine(std::span<const uint32_t> codes, fl
         if (SUCCEEDED(hr)) hr = ScriptPlace(unicode_->dc,&unicode_->cache,glyphs.data(),glyph_count,attrs.data(),&item.a,advances.data(),offsets.data(),&abc);
         if (FAILED(hr)) return {};
         for(int g=0;g<glyph_count;++g) {
-            bool picture=false;
-            for(int c=0;c<n;++c) if (clusters[c]==g && text[item.iCharPos+c]==0xE000) picture=true;
-            const float advance = picture ? inline_advance : float(advances[g]);
-            out.push_back({picture ? nullptr : Find(0x100000 + glyphs[g]), pen, float(offsets[g].du), float(-offsets[g].dv), advance});
+            bool picture=false; int picture_code=-1;
+            for(int c=0;c<n;++c) if (clusters[c]==g && text[item.iCharPos+c]==0xE000) { picture=true; picture_code=item.iCharPos+c; }
+            const float advance = picture ? (size_t(picture_code) < code_advances.size() ? code_advances[size_t(picture_code)] : inline_advance) : float(advances[g]);
+            out.push_back({picture ? nullptr : Find(0x100000 + glyphs[g]), pen, float(offsets[g].du), float(-offsets[g].dv), advance, picture_code});
             pen += advance;
         }
     }

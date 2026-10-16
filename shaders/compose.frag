@@ -90,6 +90,11 @@ void main() {
         TppFog(v.eye.xyz, world_point, inscatter, transmittance);
         color = color * transmittance + inscatter;
     }
+    /* A NaN or infinite pixel from any lighting term would spread through the bloom chain as black blotches and poison the
+       exposure measurement; the scene colour leaves here finite. */
+    if (any(isnan(color)) || any(isinf(color))) {
+        color = vec3(0.0);
+    }
     float bloom_alpha = BloomAlpha(color);
     if ((tpp & 2u) != 0u) {
         color = TppShoulder(color);

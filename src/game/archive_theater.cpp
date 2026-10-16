@@ -11,6 +11,7 @@
 #include "engine/render/model_cache.h"
 #include "engine/render/scene_renderer.h"
 #include "game/archive.h"
+#include "game/archive_model_camera.h"
 #include "game/game.h"
 #include "game/game_sound.h"
 #include "game/input_script.h"
@@ -28,6 +29,10 @@ constexpr float kSpotAhead = 1.0f;
 constexpr float kTableBelow = 0.6f;
 constexpr float kTableHeight = 0.85f;
 constexpr const char* kTrapDemo = "ShTrapExecRelativeStageDemoPlayCallbackDataElement";
+constexpr float kFreeDistance = 2.6f;
+constexpr float kFreeAngle = 0.6f;
+constexpr float kFreeRise = 0.25f;
+constexpr float kFreeRange = 20.0f;
 
 constexpr const char* kWalkRoute =
     "20 sstep 15\n20 swait 5\n20 sfree\n20 goto 0 0 12.5 900\n20 swait 10\n20 sfree\n20 sbrowsed 900\n20 sstep 15\n20 swait 5\n20 sfree\n";
@@ -40,6 +45,7 @@ glm::vec3 FoxForward(float yaw) {
 
 ArchiveTheater::ArchiveTheater(Vfs& vfs, ModelCache& models, const ArchiveEntry& entry, const Settings& settings)
     : vfs_(vfs), models_(models), entry_(entry), settings_(settings) {
+    free_view_ = entry.free_camera && entry.media == ArchiveMedia::Demo;
     if (entry.media == ArchiveMedia::Model) {
         kind_ = Kind::Model;
     } else if (entry.extra == "preface") {
@@ -119,6 +125,9 @@ void ArchiveTheater::Stop() {
 void ArchiveTheater::Finish(const char* why) {
     if (phase_ == Phase::Done) return;
     phase_ = Phase::Done;
+    if (free_started_) {
+        LogInfo("theater: {} free camera moved {:.2f} m from where it started", entry_.id, glm::length(free_camera_.position - free_origin_));
+    }
     LogInfo("theater: {} done ({})", entry_.id, why);
 }
 
@@ -134,16 +143,13 @@ bool ArchiveTheater::Showing() const {
 }
 
 Camera ArchiveTheater::ViewCamera() const {
+    if (free_started_) {
+        return free_camera_;
+    }
     if (!model_mode_) {
         return game_->GetCamera();
     }
-    Camera camera;
-    const glm::vec3 look(-std::sin(yaw_) * std::cos(pitch_), std::sin(pitch_), -std::cos(yaw_) * std::cos(pitch_));
-    camera.position = target_ - look * distance_;
-    camera.yaw = yaw_;
-    camera.pitch = pitch_;
-    camera.fov_y = glm::radians(40.0f);
-    return camera;
+    return model_camera_;
 }
 
 void ArchiveTheater::CollectDraws(std::vector<DrawItem>& out) {
@@ -160,6 +166,14 @@ void ArchiveTheater::CollectDraws(std::vector<DrawItem>& out) {
         return;
     }
     out.insert(out.end(), model_draws_.begin(), model_draws_.end());
+}
+
+void ArchiveTheater::ApplyModelLighting(SceneLighting& lighting) const {
+    if (model_mode_) LightArchiveModel(lighting, ViewCamera(), model_home_, model_radius_, settings_.model_ev);
+    if (free_started_) {
+        lighting.screen.depth_of_field = false;
+        lighting.screen.motion_blur = false;
+    }
 }
 
 void ArchiveTheater::Update(float dt, const InputState& input) {
@@ -241,7 +255,8 @@ void ArchiveTheater::Update(float dt, const InputState& input) {
         } else {
             const bool playing = demos.IsPlaying(asset);
             demo_seen_ = demo_seen_ || playing;
-            if (aim_) UpdateAim(dt);
+            if (free_view_ && playing) UpdateFreeView();
+            if (aim_ && !free_started_) UpdateAim(dt);
             if (demo_seen_ && !playing) Finish("the demo ended");
             if (!demo_seen_ && phase_time_ > kStartLimit) Finish("the demo never started");
         }
@@ -355,6 +370,43 @@ void ArchiveTheater::UpdateAim(float dt) {
     game_->SetCameraOverride(camera);
 }
 
+void ArchiveTheater::UpdateFreeView() {
+    if (free_started_) {
+        game_->SetCameraOverride(free_camera_);
+        return;
+    }
+    for (const PlayingDemo& demo : game_->Demos().Playing()) {
+        if (demo.demo_id != entry_.asset) continue;
+        for (const DemoModel& model : demo.models) {
+            if (model.fmdl.find("och0") == std::string::npos || !model.drawn || !model.visible || !model.active) continue;
+            const int waist = model.skeleton ? model.skeleton->FindName("SKL_000_WAIST") : -1;
+            const glm::vec3 center = waist >= 0 && static_cast<size_t>(waist) < model.bone_world.size()
+                ? glm::vec3(model.world * model.bone_world[static_cast<size_t>(waist)][3])
+                : glm::vec3(model.world[3]) + glm::vec3(0.0f, 1.0f, 0.0f);
+            glm::vec3 offset(entry_.free_offset[0], entry_.free_offset[1], entry_.free_offset[2]);
+            if (glm::length(offset) < 0.1f) {
+                glm::vec3 front(model.world[2].x, 0.0f, model.world[2].z);
+                front = glm::length(front) > 1e-3f ? glm::normalize(front) : glm::vec3(0.0f, 0.0f, 1.0f);
+                offset = glm::angleAxis(kFreeAngle, glm::vec3(0.0f, 1.0f, 0.0f)) * front * kFreeDistance + glm::vec3(0.0f, kFreeRise, 0.0f);
+            }
+            free_camera_ = game_->GetCamera();
+            free_camera_.position = center + offset;
+            const glm::vec3 d = glm::normalize(center - free_camera_.position);
+            free_camera_.yaw = std::atan2(-d.x, -d.z);
+            free_camera_.pitch = std::asin(std::clamp(d.y, -1.0f, 1.0f));
+            free_camera_.roll = 0.0f;
+            free_origin_ = free_camera_.position;
+            free_started_ = true;
+            game_->SetShowBody(true);
+            game_->SetDetachedView(true);
+            game_->SetCameraOverride(free_camera_);
+            LogInfo("theater: {} free camera at ({:.2f} {:.2f} {:.2f}) looking at Lisa ({:.2f} {:.2f} {:.2f}), demo frame {:.0f}", entry_.id,
+                    free_camera_.position.x, free_camera_.position.y, free_camera_.position.z, center.x, center.y, center.z, demo.frame);
+            return;
+        }
+    }
+}
+
 void ArchiveTheater::Present() {
     game_->Theater().traps = false;
     game_->Theater().ocho = false;
@@ -462,14 +514,22 @@ void ArchiveTheater::StartModel() {
         }
     }
     target_ = spot_ + glm::vec3(0.0f, std::max(lo.y, 0.0f) + extent.y * 0.5f, 0.0f);
+    model_home_ = target_;
+    model_radius_ = size * 0.5f;
     distance_ = std::clamp(size * 1.9f + 0.05f, 0.1f, 6.0f);
     min_distance_ = std::max(0.08f, size * 0.6f);
     game_->Effects().ev_pinned = true;
     game_->Effects().pinned_ev = settings_.model_ev;
     max_distance_ = std::max(distance_ * 2.0f, 1.5f);
     const glm::vec3 facing = FoxForward(spot_yaw_);
-    yaw_ = std::atan2(facing.x, facing.z);
+    yaw_ = ArchiveModelFrontYaw(entry_.id, std::atan2(facing.x, facing.z));
     pitch_ = -0.12f;
+    const glm::vec3 look(-std::sin(yaw_) * std::cos(pitch_), std::sin(pitch_), -std::cos(yaw_) * std::cos(pitch_));
+    model_camera_.position = target_ - look * distance_;
+    model_camera_.yaw = yaw_;
+    model_camera_.pitch = pitch_;
+    model_camera_.fov_y = glm::radians(40.0f);
+    model_camera_origin_ = model_camera_.position;
     phase_ = Phase::Model;
 }
 
@@ -483,18 +543,19 @@ void ArchiveTheater::UpdateModel(float dt, const InputState& input) {
         g.world = place * model_offset_;
         if (type == GimmickType::Ocho) game_->Objects().SetOchoTransform(g.world);
     }
-    float turn = input.right_stick.x + input.left_stick.x;
-    float tilt = input.right_stick.y;
-    if (input.raw_held & kRawLeft) turn -= 1.0f;
-    if (input.raw_held & kRawRight) turn += 1.0f;
-    if (input.raw_held & kRawUp) tilt += 1.0f;
-    if (input.raw_held & kRawDown) tilt -= 1.0f;
-    float zoom = -input.left_stick.y;
-    if (input.raw_held & kRawR2) zoom -= 1.0f;
-    if (input.raw_held & kRawL2) zoom += 1.0f;
-    yaw_ -= turn * 1.6f * dt;
-    pitch_ = std::clamp(pitch_ - tilt * 1.2f * dt, -1.2f, 1.2f);
-    distance_ = std::clamp(distance_ * (1.0f + zoom * 1.2f * dt), min_distance_, max_distance_);
+
+}
+
+void ArchiveTheater::UpdateModelCamera(float dt, const FreeCameraControls& input) {
+    if (free_started_ && phase_ == Phase::Playing) {
+        AdvanceFreeCamera(free_camera_, input, dt, settings_.options.invert_x, settings_.options.invert_y);
+        LimitFreeCameraRange(free_camera_, free_origin_, kFreeRange);
+        game_->SetCameraOverride(free_camera_);
+        return;
+    }
+    if (!model_mode_ || phase_ != Phase::Model) return;
+    AdvanceFreeCamera(model_camera_, input, dt, settings_.options.invert_x, settings_.options.invert_y);
+    LimitFreeCameraRange(model_camera_, model_camera_origin_, 15.0f);
 }
 
 }

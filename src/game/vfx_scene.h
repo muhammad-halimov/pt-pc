@@ -44,6 +44,7 @@ public:
 
     vfx::System& System() { return system_; }
     size_t Instances() const { return system_.InstanceCount(); }
+    bool ViewDistortion() const { return system_.AnyLive("viwdis"); }
     size_t Particles() const { return system_.ParticleCount(); }
 
 private:
@@ -52,7 +53,7 @@ private:
         const fox2::DataSetFile* file = nullptr;
         std::string path;
         glm::mat4 file_transform{1.0f};
-        uint32_t seed = 1;
+        std::optional<uint32_t> seed;
         bool failed = false;
     };
 

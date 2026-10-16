@@ -12,6 +12,7 @@
 #include "engine/ui/text_layout.h"
 #include "engine/ui/uilb.h"
 #include "game/game.h"
+#include "game/ui/prompt_hint.h"
 #include "game/ui/ui_icons.h"
 
 namespace pt::game {
@@ -50,11 +51,12 @@ constexpr uint16_t kVerticalIcon = 89;
 constexpr uint16_t kVerticalGlow = 91;
 constexpr uint16_t kBackIcon = 113;
 constexpr uint16_t kBackGlow = 116;
-constexpr std::string_view kAcceptToken = "{accept}";
 constexpr uint16_t kSubtitleList = 118;
 constexpr uint16_t kVerticalRow = 79;
 constexpr uint16_t kGaugeGroup = 40;
 constexpr glm::vec2 kEntryAt{32.0f, -26.0f};
+constexpr glm::vec2 kButtonBarShift{3.0f, 0.0f};
+constexpr glm::vec2 kEntryBarShift{-15.5f, 0.0f};
 constexpr float kStreetReturnY = -24.0f;
 constexpr float kSwitchOut = 9.0f;
 constexpr float kSwitchIn = 13.0f;
@@ -68,15 +70,15 @@ constexpr int kFirstSubtitleSelector = 4;
 constexpr int kLastSubtitleSelector = kFirstSubtitleSelector + UiAssets::kLanguageCount;
 constexpr const char* kLanguageKeys[] = {"op_sub_none", "op_sub_english", "op_sub_french", "op_sub_german",
     "op_sub_spanish", "op_sub_japanese", "op_sub_itlian", "op_sub_portuguese", "op_sub_turkish",
-    "op_sub_chinese", "op_sub_arabic", "op_sub_russian", "op_sub_ukrainian"};
+    "op_sub_chinese", "op_sub_arabic", "op_sub_russian", "op_sub_ukrainian", "op_sub_czech", "op_sub_polish"};
 constexpr std::string_view kNativeLanguageNames[] = {"", "English", "Français", "Deutsch", "Español",
-    "日本語", "Italiano", "Português", "Türkçe", "Chinese (Simplified)", "Arabic", "Russian", "Ukrainian"};
+    "日本語", "Italiano", "Português", "Türkçe", "Chinese (Simplified)", "Arabic", "Russian", "Ukrainian", "Czech", "Polish"};
 static_assert(std::size(kLanguageKeys) == UiAssets::kLanguageCount + 1);
 static_assert(std::size(kNativeLanguageNames) == std::size(kLanguageKeys));
 
 }
 
-MenuInput MapMenuInput(const InputState& input, uint32_t previous_held) {
+MenuInput MapMenuInput(const InputState& input, uint32_t previous_held, uint32_t previous_dirs) {
     MenuInput out;
     out.subtitle_up = (input.raw_pressed & kRawUp) != 0;
     out.subtitle_down = (input.raw_pressed & kRawDown) != 0;
@@ -91,20 +93,24 @@ MenuInput MapMenuInput(const InputState& input, uint32_t previous_held) {
     out.back = (input.raw_pressed & kRawCircle) != 0 || input.cancel;
     out.open_pc = out.accept && !input.confirm;
     out.switch_column = (input.raw_pressed & (kRawL1 | kRawR1)) != 0;
+    out.tab_prev = (input.menu_keys_pressed & kMenuKeyTabPrev) != 0;
+    out.tab_next = (input.menu_keys_pressed & kMenuKeyTabNext) != 0;
+    out.tab_from_e = (input.menu_keys_pressed & kMenuKeyFromE) != 0;
+    out.donate = (input.menu_keys_pressed & kMenuKeyDonate) != 0;
     out.street_return = (input.raw_pressed & kRawL1) != 0 || input.house_pressed;
     out.held_dirs = input.raw_held & (kRawUp | kRawDown | kRawLeft | kRawRight);
-    if (input.left_stick.y > 0.5f) {
-        out.held_dirs |= kRawUp;
-    } else if (input.left_stick.y < -0.5f) {
-        out.held_dirs |= kRawDown;
-    }
-    if (input.left_stick.x > 0.5f) {
-        out.held_dirs |= kRawRight;
-    } else if (input.left_stick.x < -0.5f) {
-        out.held_dirs |= kRawLeft;
-    }
+    const auto stick = [&](float v, uint32_t positive, uint32_t negative) {
+        const float on = 0.5f;
+        const float off = 0.35f;
+        if (v > on || (v > off && (previous_dirs & positive))) out.held_dirs |= positive;
+        else if (v < -on || (v < -off && (previous_dirs & negative))) out.held_dirs |= negative;
+    };
+    stick(input.left_stick.y, kRawUp, kRawDown);
+    stick(input.left_stick.x, kRawRight, kRawLeft);
     out.click = input.click;
     out.right_click = input.right_click;
+    out.wheel = input.wheel;
+    out.music = input.music_pressed;
     return out;
 }
 
@@ -163,6 +169,22 @@ bool OptionsMenu::Init(UiAssets& assets) {
     bar_image.translate.x = 0.0f;
     bar_image.translate.y = 0.0f;
     derived_->AddNode(std::move(bar_image), StrCode64("option_language_bar_image"));
+    auto button_bar = [&](uint16_t label, glm::vec2 centre, std::string_view name) {
+        ui::UifNode node = *derived_->FindById(80);
+        const ui::UifNode& text = *derived_->FindById(label);
+        node.parent = text.parent;
+        node.translate = glm::vec4(glm::vec2(text.translate) + centre, 0.0f, 0.0f);
+        const uint16_t id = derived_->AddNode(std::move(node), StrCode64(std::format("option_{}_bar", name)));
+        ui::UifNode image = *derived_->FindById(81);
+        image.parent = derived_->IndexOfId(id);
+        image.translate.x = 0.0f;
+        image.translate.y = 0.0f;
+        derived_->AddNode(std::move(image), StrCode64(std::format("option_{}_bar_image", name)));
+        return id;
+    };
+    entry_bar_ = button_bar(entry_label_, kEntryBarShift, "entry");
+    back_bar_ = button_bar(kBack, kButtonBarShift, "back");
+    quit_bar_ = button_bar(quit_label_, kButtonBarShift, "quit");
     pc_.Build(*derived_, icon_atlas, icon_glow);
     prompt_nodes_ = {
         {kBrightnessIcon, kBrightnessGlow, {PromptButton::DpadLeftRight, KeyAction::PadLeft, KeyAction::PadRight}},
@@ -253,6 +275,7 @@ float OptionsMenu::TrackAlpha(std::string_view animation, float frame) const {
 }
 
 void OptionsMenu::SwitchPage(Game& game, Page page) {
+    LogDebug("ui: options page switch to {}", page == Page::Pc ? "PC" : "original");
     if (switch_frame_ >= 0.0f || page == page_ || (page == Page::Pc && !pc_source_)) {
         return;
     }
@@ -283,7 +306,7 @@ void OptionsMenu::ApplyPages() {
     }
     view_.State(kContent).visible = original > 0.0f;
     view_.State(kContent).color_scale.a = original;
-    view_.State(pc_.Root()).visible = pc > 0.0f;
+    view_.State(pc_.Root()).visible = pc > 0.0f && !pc_.IsQuestion();
     view_.State(pc_.Root()).color_scale.a = pc;
     view_.State(entry_group_).visible = pc_source_ != nullptr;
     view_.State(street_label_).visible = street_shown_;
@@ -291,6 +314,7 @@ void OptionsMenu::ApplyPages() {
     view_.State(street_glow_).visible = street_shown_;
     view_.State(entry_label_).text = std::string(PcText("pc_entry", text_language_));
     if (page_ == Page::Pc || next_page_ == Page::Pc) {
+        pc_.SetMeasure(view_, text_language_);
         pc_.Apply(view_, text_language_);
     }
     ApplyPrompts();
@@ -330,14 +354,17 @@ void OptionsMenu::ApplyPrompts() {
             state.positions = std::move(positions);
         }
     }
-    UifNodeState& help = view_.State(pc_.Help());
-    help.inline_picture.reset();
-    if (help.text) {
-        if (const size_t at = help.text->find(kAcceptToken); at != std::string::npos) {
-            const PromptGlyph glyph = assets_->PromptPicture({PromptButton::Cross, KeyAction::Confirm, KeyAction::Confirm}, prompt_style_);
-            help.text->replace(at, kAcceptToken.size(), "\xEE\x80\x80");
-            help.inline_picture = UifInlinePicture{derived_->AddTexture(glyph.icon), derived_->AddTexture(glyph.glow), glyph.uv0, glyph.uv1,
-                                                   glyph.width, glyph.body_width, glyph.body_height};
+    for (const uint16_t id : {pc_.Help(), pc_.NavigationText(), pc_.TabPrevText(), pc_.TabNextText(), pc_.DonateText()}) {
+        UifNodeState& help = view_.State(id);
+        help.inline_pictures.clear();
+        if (help.text && HasPromptTokens(*help.text)) {
+            const PromptLine line = ExpandPromptHint(*help.text, prompt_style_);
+            help.text = line.text;
+            for (const Prompt& prompt : line.pictures) {
+                const PromptGlyph glyph = assets_->PromptPicture(prompt, prompt_style_);
+                help.inline_pictures.push_back(UifInlinePicture{derived_->AddTexture(glyph.icon), derived_->AddTexture(glyph.glow), glyph.uv0, glyph.uv1,
+                                                                glyph.width, glyph.body_width, glyph.body_height});
+            }
         }
     }
     if (!prompts_shown_ || shown_prompts_ != prompt_style_.device) {
@@ -348,6 +375,27 @@ void OptionsMenu::ApplyPrompts() {
             LogInfo("ui: option menu prompts show {} buttons", PromptDeviceName(shown_prompts_));
         }
     }
+}
+
+std::string OptionsMenu::DialogKind(int* focus) const {
+    *focus = 0;
+    if (state_ != State::Active) return "none";
+    if (page_ == Page::Pc) {
+        if (pc_.IsQuestion()) {
+            *focus = pc_.Cursor();
+            return "question";
+        }
+        if (pc_.Confirming()) {
+            *focus = pc_.DialogFocus();
+            return "confirm";
+        }
+        return "none";
+    }
+    if (quit_confirming_ || street_confirming_) {
+        *focus = ask_nav_.Focus();
+        return quit_confirming_ ? "quit" : "street";
+    }
+    return "none";
 }
 
 const OptionsMenu::Animation* OptionsMenu::Find(std::string_view name) const {
@@ -424,7 +472,6 @@ void OptionsMenu::ApplyStatic() {
     view_.ResetStates();
     view_.State(kBack).font_type = UiFontType::System;
     view_.State(kImageLeft).color_scale = glm::vec4(kLeftImageLevel, kLeftImageLevel, kLeftImageLevel, 1.0f);
-    view_.State(kImageZoom).color_scale = glm::vec4(kLeftImageLevel, kLeftImageLevel, kLeftImageLevel, 1.0f);
     view_.State(kImageRight).color_scale = glm::vec4(kRightImageLevel, kRightImageLevel, kRightImageLevel, 1.0f);
 }
 
@@ -437,10 +484,10 @@ void OptionsMenu::ApplyTexts() {
     set(kTitle, "op_options");
     set(kBack, "op_back");
     view_.State(quit_label_).font_type = UiFontType::PcSystem;
-    view_.State(quit_label_).text = std::string(PcText(quit_confirming_ ? "pc_quit_confirm" : "pc_quit", text_language_));
+    view_.State(quit_label_).text = std::string(PcText("pc_quit", text_language_));
     view_.State(quit_label_).color = glm::vec4(1.0f, 1.0f, 1.0f, quit_focused_ || quit_confirming_ ? 1.0f : .65f);
     view_.State(street_label_).font_type = UiFontType::PcSystem;
-    view_.State(street_label_).text = std::string(PcText(street_confirming_ ? "pc_street_return_confirm" : "pc_street_return", text_language_));
+    view_.State(street_label_).text = std::string(PcText(leave_date_ ? "pc_lisa_date_leave" : "pc_street_return", text_language_));
     view_.State(street_label_).color = glm::vec4(1.0f, 1.0f, 1.0f, street_confirming_ ? 1.0f : .65f);
     set(kBrightnessLabel, "op_brightness_setting");
     set(kTip, "op_britness_tip");
@@ -473,13 +520,19 @@ void OptionsMenu::Show(Game& game, bool first_boot, Page page) {
     brightness_ = std::clamp(options.brightness, 0, 10);
     text_language_ = std::clamp(options.subtitle_language, 0, UiAssets::kLanguageCount - 1);
     language_timer_ = false;
+    if (pc_source_) pc_source_->MenuShown();
     quit_confirming_ = false;
     quit_focused_ = false;
-    street_shown_ = game.StreetWalkActive();
+    leave_date_ = game.LisaDateActive();
+    street_shown_ = game.StreetWalkActive() || leave_date_;
     street_confirming_ = false;
     street_return_ = false;
-    zoom_released_ = false;
-    zoom_started_ = false;
+    float zoom_frame[2] = {-1.0f, -1.0f};
+    const Animation* zoom_in = Find("UI_sys_opt_zoom_in");
+    if (zoom_in && zoom_started_) {
+        zoom_frame[0] = players_.PlayingFrame(zoom_in->main);
+        zoom_frame[1] = players_.PlayingFrame(zoom_in->shader);
+    }
     close_pending_ = false;
     resume_ = false;
     resume_sent_ = false;
@@ -498,6 +551,9 @@ void OptionsMenu::Show(Game& game, bool first_boot, Page page) {
     Play("UI_sys_opt_lp_2", true);
     PlaySelections();
     HoldBrightness();
+    if (zoom_in && zoom_frame[0] >= 0.0f) players_.Hold(zoom_in->main, zoom_frame[0]);
+    if (zoom_in && zoom_frame[1] >= 0.0f) players_.Hold(zoom_in->shader, zoom_frame[1]);
+    if (page_ == Page::Pc) CancelPhotoZoom();
     state_ = State::SetIn;
     ApplyPages();
     view_.ClearAnimation();
@@ -518,7 +574,6 @@ void OptionsMenu::CancelPhotoZoom() {
 
 void OptionsMenu::Close() {
     if (state_ == State::SetIn || state_ == State::Active) {
-        zoom_released_ = false;
         if (page_ == Page::Pc && pc_source_) pc_source_->Closed();
         resume_ = resume_ || !resume_sent_;
         resume_sent_ = true;
@@ -539,6 +594,11 @@ void OptionsMenu::Commit(Game& game) {
 }
 
 void OptionsMenu::Update(Game& game, const MenuInput& raw_input, float dt) {
+    {
+        const float target = state_ == State::SetIn || state_ == State::Active ? 1.0f : 0.0f;
+        const float step = dt / 0.25f;
+        pillar_alpha_ = target > pillar_alpha_ ? std::min(target, pillar_alpha_ + step) : std::max(target, pillar_alpha_ - step);
+    }
     if (state_ == State::Closed) {
         return;
     }
@@ -568,6 +628,15 @@ void OptionsMenu::Update(Game& game, const MenuInput& raw_input, float dt) {
     }
     if (state_ == State::SetIn && !Playing("UI_sys_opt_setin")) {
         state_ = State::Active;
+    }
+    {
+        const bool shown = page_ == Page::Original && state_ == State::Active && !switching;
+        if (!shown) hovered_ = Button::None;
+        const float flash = SelectionFlash(hover_frame_);
+        for (const auto& [bar, button] : {std::pair{entry_bar_, Button::PcSettings}, std::pair{back_bar_, Button::Back}, std::pair{quit_bar_, Button::Quit}}) {
+            view_.State(bar).visible = shown && hovered_ == button;
+            view_.State(bar).color = glm::vec4(1.0f, 1.0f, 1.0f, flash);
+        }
     }
     if (state_ == State::Active && !switching) {
         if (page_ == Page::Pc) {
@@ -602,46 +671,74 @@ void OptionsMenu::Update(Game& game, const MenuInput& raw_input, float dt) {
     ApplySubtitleSelection();
 }
 
-void OptionsMenu::StreetReturn(Game& game) {
-    if (!street_confirming_) {
-        street_confirming_ = true;
-        quit_confirming_ = quit_focused_ = false;
+void OptionsMenu::OpenAsk(Game& game, bool quit, uint32_t held) {
+    quit_confirming_ = quit;
+    quit_focused_ = quit;
+    street_confirming_ = !quit;
+    ask_nav_.Open(0, held);
+    ask_flash_ = 0.0f;
+    if (game.Audio()) game.Audio()->PostEvent(kCursorSound, nullptr);
+    ApplyTexts();
+}
+
+void OptionsMenu::UpdateAsk(Game& game, const MenuInput& input, float dt) {
+    ask_flash_ += dt * 60.0f;
+    const bool quit = quit_confirming_;
+    bool yes = quit ? input.switch_column : input.street_return;
+    bool answered = yes;
+    if (!yes) {
+        const dialog::Result result = ask_nav_.Update(input, 2, text_language_, true);
+        if (ask_nav_.Moved()) {
+            ask_flash_ = 0.0f;
+            if (game.Audio()) game.Audio()->PostEvent(kCursorSound, nullptr);
+        }
+        yes = result == dialog::Result::Chosen && ask_nav_.Chosen() == 0;
+        answered = result != dialog::Result::None;
+    }
+    if (!answered) return;
+    if (!yes) {
+        quit_confirming_ = street_confirming_ = quit_focused_ = false;
         if (game.Audio()) game.Audio()->PostEvent(kCursorSound, nullptr);
         ApplyTexts();
+        return;
+    }
+    if (quit) {
+        Commit(game);
+        game.RequestOptionsSave();
+        game.RequestQuit();
+        LogInfo("ui: quit selected from Options");
         return;
     }
     street_confirming_ = false;
     street_return_ = true;
     if (game.Audio()) game.Audio()->PostEvent(kChangeSound, nullptr);
-    LogInfo("ui: return to the house selected from Options");
+    LogInfo("ui: {} selected from Options", leave_date_ ? "leave the date" : "return to the house");
     Close();
 }
 
 void OptionsMenu::UpdateOriginal(Game& game, const MenuInput& raw_input, float dt) {
     MenuInput input = raw_input;
-    street_shown_ = game.StreetWalkActive();
+    leave_date_ = game.LisaDateActive();
+    street_shown_ = game.StreetWalkActive() || leave_date_;
+    if (quit_confirming_ || street_confirming_) {
+        UpdateAsk(game, input, dt);
+        return;
+    }
+    if (input.pointer_valid) {
+        const Button over = ButtonAt(input.pointer);
+        if (over != hovered_) {
+            hovered_ = over;
+            hover_frame_ = 0.0f;
+            if (over != Button::None && game.Audio()) game.Audio()->PostEvent(kCursorSound, nullptr);
+        }
+    }
+    hover_frame_ += dt * 30.0f;
     if (street_shown_ && input.street_return) {
-        StreetReturn(game);
+        OpenAsk(game, false, input.held_dirs);
         return;
     }
-    if (street_confirming_ && (input.accept || input.open_pc)) {
-        StreetReturn(game);
-        return;
-    }
-    if (street_confirming_ && (input.switch_column || input.back || input.close)) {
-        street_confirming_ = false;
-        ApplyTexts();
-        if (input.back || input.close) return;
-    }
-    if (input.switch_column) {
-        quit_focused_ = true;
-        if (quit_confirming_) { Commit(game); game.RequestOptionsSave(); game.RequestQuit(); LogInfo("ui: quit selected from Options"); }
-        else { quit_confirming_ = true; ApplyTexts(); }
-        return;
-    }
-    if (quit_focused_ && (input.accept || input.open_pc)) {
-        if (quit_confirming_) { Commit(game); game.RequestOptionsSave(); game.RequestQuit(); LogInfo("ui: quit selected from Options"); }
-        else { quit_confirming_ = true; ApplyTexts(); }
+    if (input.switch_column || (quit_focused_ && (input.accept || input.open_pc))) {
+        OpenAsk(game, true, input.held_dirs);
         return;
     }
     if (input.pointer_valid && input.click) {
@@ -649,6 +746,13 @@ void OptionsMenu::UpdateOriginal(Game& game, const MenuInput& raw_input, float d
     }
     if (input.open_pc && pc_source_) {
         Commit(game);
+        if (language_timer_) {
+            language_timer_ = false;
+            if (selector_ != 4) {
+                text_language_ = selector_ - 5;
+                ApplyTexts();
+            }
+        }
         SwitchPage(game, Page::Pc);
         return;
     }
@@ -699,16 +803,20 @@ void OptionsMenu::UpdateOriginal(Game& game, const MenuInput& raw_input, float d
     }
     if (game.Nazo().IsPhotoOptionPending()) {
         const bool zooming = Playing("UI_sys_opt_zoom_in");
+        if (zoom_started_) zoom_elapsed_ += dt;
         if (input.zoom_pressed) {
             zoom_started_ = true;
+            zoom_elapsed_ = 0.0f;
             Play("UI_sys_opt_zoom_in");
+            LogInfo("ui: option menu zoom pressed, zoom_in {}", zooming ? "restarted" : "started");
         } else if (input.zoom_released) {
             zoom_released_ = true;
+            LogInfo("ui: option menu zoom released{}", zooming ? ", PhotoOption waits for the zoom_in" : "");
         }
         if (zoom_released_ && !zooming) {
             Play("UI_sys_opt_zoom_out");
             game.Nazo().SetCondition("PhotoOption");
-            LogInfo("ui: option menu sent PhotoOption");
+            LogInfo("ui: option menu sent PhotoOption, {:.2f} s after the zoom press", zoom_elapsed_);
             zoom_released_ = false;
             zoom_started_ = false;
         }
@@ -719,25 +827,33 @@ void OptionsMenu::UpdateOriginal(Game& game, const MenuInput& raw_input, float d
     }
 }
 
+OptionsMenu::Button OptionsMenu::ButtonAt(glm::vec2 units) const {
+    if (street_shown_) {
+        const glm::vec2 street = view_.WorldPosition(street_label_);
+        if (units.x >= street.x - 6.0f && units.x <= street.x + 22.0f && std::abs(units.y - street.y) <= 1.2f) return Button::StreetReturn;
+    }
+    const glm::vec2 quit = view_.WorldPosition(quit_label_);
+    if (units.x >= quit.x - 6.0f && units.x <= quit.x + 15.0f && std::abs(units.y - quit.y) <= 1.2f) return Button::Quit;
+    const glm::vec2 entry = view_.WorldPosition(entry_group_);
+    if (pc_source_ && units.x >= entry.x - 22.0f && units.x <= entry.x + 12.0f && std::abs(units.y - entry.y) <= 1.5f) return Button::PcSettings;
+    const glm::vec2 back = view_.WorldPosition(kBack);
+    if (units.x >= back.x - 3.0f && units.x <= back.x + 10.0f && std::abs(units.y - back.y) <= 2.0f) return Button::Back;
+    return Button::None;
+}
+
 void OptionsMenu::OriginalClick(Game& game, glm::vec2 units, MenuInput& input) {
     if (street_shown_) {
         const glm::vec2 street = view_.WorldPosition(street_label_);
         if (units.x >= street.x - 6.0f && units.x <= street.x + 22.0f && std::abs(units.y - street.y) <= 1.2f) {
-            StreetReturn(game);
+            OpenAsk(game, false, input.held_dirs);
             return;
-        }
-        if (street_confirming_) {
-            street_confirming_ = false;
-            ApplyTexts();
         }
     }
     const glm::vec2 quit = view_.WorldPosition(quit_label_);
     if (units.x >= quit.x - 6.0f && units.x <= quit.x + 15.0f && std::abs(units.y - quit.y) <= 1.2f) {
-        if (quit_confirming_) { Commit(game); game.RequestOptionsSave(); game.RequestQuit(); LogInfo("ui: quit selected from Options"); }
-        else { quit_confirming_ = true; ApplyTexts(); }
+        OpenAsk(game, true, input.held_dirs);
         return;
     }
-    if (quit_confirming_) { quit_confirming_ = false; ApplyTexts(); }
     const glm::vec2 entry = view_.WorldPosition(entry_group_);
     if (pc_source_ && units.x >= entry.x - 22.0f && units.x <= entry.x + 12.0f && std::abs(units.y - entry.y) <= 1.5f) {
         input.open_pc = true;
@@ -801,10 +917,21 @@ void OptionsMenu::Draw(ui::UiBatch& batch, const UiCanvas& canvas) {
     }
     const bool settled = page_ == Page::Pc && state_ == State::Active && switch_frame_ < 0.0f;
     if (settled && pc_.FullScreen()) {
-        archive_view_.DrawFullScreen(batch, canvas, *assets_, pc_.Panel(), PcText(pc_.FullScreenHint(), text_language_), text_language_);
+        archive_view_.DrawFullScreen(batch, canvas, *assets_, pc_.Panel(), PcText(pc_.FullScreenHint(), text_language_), prompt_style_, text_language_);
         return;
     }
+    if (pillar_alpha_ > 0.0f) {
+        const float left = canvas.origin.x;
+        const float right = canvas.origin.x + UiCanvas::kWidth * canvas.scale;
+        const float width = static_cast<float>(batch.Extent().width);
+        const float height = static_cast<float>(batch.Extent().height);
+        const glm::vec4 black(0.0f, 0.0f, 0.0f, pillar_alpha_);
+        const auto plain = ui::UiDrawParams::Plain(TextureManager::kWhite);
+        if (left > 0.5f) batch.Quad(glm::vec2(0.0f), glm::vec2(left, height), glm::vec2(0.0f), glm::vec2(1.0f), black, plain, ui::UiShade::Solid, ui::UiBlend::Alpha);
+        if (width - right > 0.5f) batch.Quad(glm::vec2(right, 0.0f), glm::vec2(width, height), glm::vec2(0.0f), glm::vec2(1.0f), black, plain, ui::UiShade::Solid, ui::UiBlend::Alpha);
+    }
     view_.Draw(batch, canvas, text_language_, 1.0f);
+    if (settled) pc_.LogLayout(view_);
     if (page_ == Page::Pc && pc_.Gallery() != PcGallery::None && settled) {
         pc_.SetWallWidth(static_cast<float>(batch.Extent().width) / std::max(canvas.scale, 0.001f));
         assets_->PreloadPreviews(pc_.PreviewFiles());
@@ -816,6 +943,29 @@ void OptionsMenu::Draw(ui::UiBatch& batch, const UiCanvas& canvas) {
         const bool text = !panel.lines.empty();
         archive_view_.DrawPanel(batch, canvas, *assets_, panel, text ? glm::vec2(650.0f, 160.0f) : glm::vec2(650.0f, 170.0f),
                                 text ? glm::vec2(1190.0f, 560.0f) : glm::vec2(1190.0f, 474.0f), text_language_);
+    }
+    if ((state_ == State::Active || state_ == State::SetIn) && switch_frame_ < 0.0f) {
+        dialog::View view;
+        bool shown = false;
+        if (page_ == Page::Pc) {
+            shown = pc_.DialogView(view, text_language_);
+            view.flash = SelectionFlash(pc_.FlashFrame());
+        } else if (quit_confirming_ || street_confirming_) {
+            view.text = std::string(PcText(quit_confirming_ ? "pc_quit_confirm" : leave_date_ ? "pc_lisa_date_leave_confirm" : "pc_street_return_confirm",
+                                           text_language_));
+            view.choices = {std::string(PcText("pc_save_move_yes", text_language_)), std::string(PcText("pc_save_move_no", text_language_))};
+            view.focus = ask_nav_.Focus();
+            view.language = text_language_;
+            view.back_label = std::string(PcText("pc_back", text_language_));
+            view.flash = SelectionFlash(ask_flash_);
+            shown = true;
+        }
+        if (state_ == State::SetIn) {
+            const Animation* in = Find("UI_sys_opt_setin");
+            const float frame = in ? players_.PlayingFrame(in->main) : -1.0f;
+            view.alpha = frame >= 0.0f ? TrackAlpha("UI_sys_opt_setin", frame) : 1.0f;
+        }
+        if (shown) dialog::Draw(batch, canvas, *assets_, model_, prompt_style_, view);
     }
     std::string_view credit = page_ == Page::Pc && state_ == State::Active && switch_frame_ < 0.0f ? pc_.Credit() : std::string_view();
     std::string credit_text;

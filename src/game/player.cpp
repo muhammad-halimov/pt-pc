@@ -93,6 +93,15 @@ uint32_t PadLocks::Mask(char set) const {
     return mask;
 }
 
+uint32_t PadLocks::MaskExcept(char set, const std::string& except) const {
+    const auto& slots = set == 'A' ? a_ : set == 'B' ? b_ : c_;
+    uint32_t mask = 0;
+    for (const auto& [key, value] : slots) {
+        if (key != except) mask |= value;
+    }
+    return mask;
+}
+
 std::string PadLocks::Describe() const {
     std::string text;
     for (const auto* slots : {&a_, &b_, &c_}) {
@@ -132,6 +141,52 @@ void Player::Warp(const glm::vec3& position, float fox_yaw) {
     ResetLocomotion();
     UpdateEye(0.0f);
     PublishNow();
+}
+
+void Player::DemoWarp(const glm::vec3& position, float fox_yaw) {
+    const bool standing = standing_;
+    const float idle_timer = idle_timer_;
+    Warp(position, fox_yaw);
+    standing_ = standing;
+    idle_timer_ = idle_timer;
+    PublishNow();
+}
+
+void Player::DemoHeldFrame(const InputState& input) {
+    const bool left_locked = (locks.MaskExcept('B', "Demo") & 1) != 0;
+    glm::vec2 stick = left_locked ? glm::vec2(0.0f) : input.left_stick;
+    if (input.left_stick_from_pad) {
+        stick = glm::vec2(PadAxis(stick.x), -PadAxis(-stick.y));
+    }
+    float m = std::min(glm::length(stick), 1.0f);
+    if (m < 0.1f) {
+        m = 0.0f;
+    }
+    StepStandWalk(m, left_locked);
+}
+
+void Player::StepStandWalk(float m, bool left_locked) {
+    if (left_locked) {
+        idle_timer_ = 0.0f;
+        standing_ = true;
+    } else if (m >= 0.1f) {
+        idle_timer_ = 0.0f;
+        standing_ = false;
+    } else {
+        idle_timer_ += kOriginalFrame;
+        if (idle_timer_ >= kStandDebounce) {
+            standing_ = true;
+        }
+    }
+}
+
+glm::vec3 Player::FollowHead(const CollisionWorld& world, const glm::vec3& displacement) {
+    const glm::vec3 before = controller.position;
+    controller.Move(world, glm::vec3(displacement.x, 0.0f, displacement.z), 0.0f, 0.0f);
+    UpdateEye(0.0f);
+    PublishNow();
+    const glm::vec3 moved = controller.position - before;
+    return glm::vec3(moved.x, 0.0f, moved.z);
 }
 
 void Player::ResetLocomotion() {
@@ -249,18 +304,7 @@ void Player::UpdateLocomotion(const InputState& input) {
 
 void Player::LocomotionFrame(const PlayerFrameContext& context) {
     const float m = stick_magnitude_;
-    if (LeftStickLocked()) {
-        idle_timer_ = 0.0f;
-        standing_ = true;
-    } else if (m >= 0.1f) {
-        idle_timer_ = 0.0f;
-        standing_ = false;
-    } else {
-        idle_timer_ += kOriginalFrame;
-        if (idle_timer_ >= kStandDebounce) {
-            standing_ = true;
-        }
-    }
+    StepStandWalk(m, LeftStickLocked());
     const float delta = Wrap(stick_heading_ - body_yaw_);
     const int direction = WalkDirection(delta);
     motion_.rate = standing_ ? 1.0f : SpeedRate(delta, m, context.full_screen_blur);
@@ -284,9 +328,29 @@ void Player::LocomotionFrame(const PlayerFrameContext& context) {
     }
 }
 
+glm::vec2 Player::DemoLightStick(const InputState& input, bool invert_x, bool invert_y) const {
+    const uint32_t lock_b = locks.MaskExcept('B', "Demo");
+    glm::vec2 light(0.0f);
+    if (!(lock_b & 2)) {
+        light = glm::vec2(PadAxis(input.right_stick.x) * (invert_x ? -1.0f : 1.0f), PadAxis(input.right_stick.y) * (invert_y ? -1.0f : 1.0f));
+    }
+    if (!(lock_b & 1)) {
+        light.x += 0.5f * PadAxis(input.left_stick.x);
+    }
+    if (input.from_gamepad) {
+        const uint32_t held = input.held & ~locks.MaskExcept('A', "Demo");
+        light.y += ((held & kPadLookDown) ? 0.25f : 0.0f) - ((held & kPadLookUp) ? 0.25f : 0.0f);
+        light.x += ((held & kPadLookRight) ? 0.25f : 0.0f) - ((held & kPadLookLeft) ? 0.25f : 0.0f);
+    }
+    if (!(lock_b & 2)) {
+        light += input.gyro_light;
+    }
+    return glm::clamp(light, glm::vec2(-1.0f), glm::vec2(1.0f));
+}
+
 void Player::UpdateLook(float dt, const InputState& input, const PlayerFrameContext& context) {
     if (context.peephole_theater && !peephole_look_active_) {
-        peephole_yaw_ = yaw;
+        peephole_yaw_ = context.peephole_center_valid ? context.peephole_center_yaw : yaw;
         look_velocity_ = glm::vec2(0.0f);
     }
     peephole_look_active_ = context.peephole_theater;
@@ -324,6 +388,7 @@ void Player::UpdateLook(float dt, const InputState& input, const PlayerFrameCont
     const float k = std::pow(std::clamp(std::sqrt(x * x + y * y), 0.0f, 1.0f), kLookExponent);
     x *= k * sx;
     y *= k * sy;
+    const float gamepad_sensitivity = std::clamp(input.gamepad_sensitivity, 0.25f, 4.0f);
     const float focal = params.focal_length * zoom;
     const float scale = focal > 0.0f ? kLookFocal / focal : 1.0f;
     const float step = std::min(dt, kLookFrame);
@@ -332,8 +397,8 @@ void Player::UpdateLook(float dt, const InputState& input, const PlayerFrameCont
     for (int i = 0; i < count; ++i) {
         look_velocity_.y = LookVelocity(look_velocity_.y, -x, glm::radians(params.rot_vel_max_y) * scale, step);
         look_velocity_.x = LookVelocity(look_velocity_.x, y, glm::radians(params.rot_vel_max_x) * scale, step);
-        target_yaw += look_velocity_.y * step;
-        const float next_pitch = target_pitch - look_velocity_.x * step;
+        target_yaw += look_velocity_.y * step * gamepad_sensitivity;
+        const float next_pitch = target_pitch - look_velocity_.x * step * gamepad_sensitivity;
         target_pitch = ClampPitch(next_pitch);
         if (target_pitch != next_pitch) {
             look_velocity_.x = 0.0f;
@@ -358,6 +423,13 @@ void Player::UpdateLook(float dt, const InputState& input, const PlayerFrameCont
         target_pitch = ClampPitch(target_pitch - mouse.y);
         yaw -= mouse.x;
         pitch = ClampPitch(pitch - mouse.y);
+        if (input.gyro_turn != glm::vec2(0.0f)) {
+            const glm::vec2 gyro = input.gyro_turn * glm::vec2(sx, sy) / std::max(zoom, 1.0f);
+            target_yaw += gyro.x;
+            target_pitch = ClampPitch(target_pitch + gyro.y);
+            yaw += gyro.x;
+            pitch = ClampPitch(pitch + gyro.y);
+        }
     }
     if (dt > 0.0f) {
         pc_turns_[pc_turn_next_] = glm::vec4(Wrap(pc_yaw_from - target_yaw), target_pitch - pc_pitch_from, dt, 0.0f);
@@ -375,6 +447,9 @@ void Player::UpdateLook(float dt, const InputState& input, const PlayerFrameCont
         if (m > 0.00083f) {
             light += u * (std::min(std::cbrt(m), 1.0f) / m);
         }
+    }
+    if (!(lock_b & 2)) {
+        light += input.gyro_light;
     }
     light_stick_ = light_stick_override_ ? *light_stick_override_ : glm::clamp(light, glm::vec2(-1.0f), glm::vec2(1.0f));
     if (peephole_look_active_) {
@@ -448,7 +523,7 @@ void Player::UpdateZoom(float dt, const PlayerFrameContext& context) {
         }
     }
     zoom_falling_ = zoom_out;
-    zoom_target_ = 1.35f;
+    zoom_target_ = kZoomHeld;
 }
 
 void Player::UpdateBody(float dt, const CollisionWorld& world) {

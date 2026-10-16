@@ -7,6 +7,7 @@
 #include <string_view>
 #include <vector>
 
+#include "engine/platform/input.h"
 #include "engine/ui/text_layout.h"
 #include "engine/ui/ui_batch.h"
 #include "game/ui/pc_settings.h"
@@ -20,7 +21,8 @@ struct UiCanvas;
 class ArchiveView {
 public:
     void DrawPanel(ui::UiBatch& batch, const UiCanvas& canvas, UiAssets& assets, const PcPanel& panel, glm::vec2 lo, glm::vec2 hi, int language);
-    void DrawFullScreen(ui::UiBatch& batch, const UiCanvas& canvas, UiAssets& assets, const PcPanel& panel, std::string_view hint, int language);
+    void DrawFullScreen(ui::UiBatch& batch, const UiCanvas& canvas, UiAssets& assets, const PcPanel& panel, std::string_view hint, const PromptStyle& prompts,
+                        int language);
     void DrawMuseum(ui::UiBatch& batch, const UiCanvas& canvas, UiAssets& assets, const PcSettingsPage& page, int language);
 
 private:
@@ -45,8 +47,10 @@ private:
                    glm::vec2 hi, float inset, bool selected, bool locked, int language);
     void DrawLine(ui::UiBatch& batch, const UiCanvas& canvas, UiAssets& assets, std::string_view text, float size, glm::vec2 lo, glm::vec2 hi,
                   ui::TextAlign align, float alpha, int language);
-    void DrawLines(ui::UiBatch& batch, const UiCanvas& canvas, UiAssets& assets, const PcPanel& panel, glm::vec2 lo, glm::vec2 hi, int language);
+    void DrawLines(ui::UiBatch& batch, const UiCanvas& canvas, UiAssets& assets, const PcPanel& panel, glm::vec2 lo, glm::vec2 hi, int language, bool complete = false);
     glm::vec2 TextureSize(UiAssets& assets, const std::string& path);
+    void DrawNote(ui::UiBatch& batch, const UiCanvas& canvas, glm::vec2 center, float size, glm::vec4 color);
+    void DrawMusicPlayer(ui::UiBatch& batch, const UiCanvas& canvas, UiAssets& assets, const PcPanel& panel, int language);
 
     std::map<std::string, Photo> photos_;
     std::map<std::string, glm::vec2> sizes_;

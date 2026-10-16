@@ -27,11 +27,17 @@ public:
     void Update(Game& game, float dt, bool paused);
     void Draw(ui::UiBatch& batch, const UiCanvas& canvas, int language);
     bool Active() const { return !instances_.empty(); }
-    void Clear() { instances_.clear(); }
+    void Clear() {
+        instances_.clear();
+        bug_graph_ = 0;
+    }
+    bool BugScreenStill() const;
+    glm::vec4 BugPillarColor() const;
 
     bool Create(std::string_view demo_id, uint64_t graph, std::string_view path);
     bool Start(uint64_t graph);
     bool Text(uint64_t graph, uint64_t text, int bug_screen = -1);
+    static std::string_view BugPictureTexture(uint32_t pick);
 
 private:
     struct ModelView {
@@ -67,6 +73,10 @@ private:
 
     UiAssets* assets_ = nullptr;
     std::vector<std::unique_ptr<Instance>> instances_;
+    uint64_t bug_graph_ = 0;
+    float bug_shown_ = 0.0f;
+    uint32_t bug_pick_ = 0;
+    int bug_unnoted_ = -1;
     std::map<std::string, std::unique_ptr<ui::UiaAnimation>> animations_;
     std::map<std::string, std::shared_ptr<const ui::UilbLayout>> layouts_;
     std::map<std::string, std::shared_ptr<const ui::UigbGraph>> graphs_;

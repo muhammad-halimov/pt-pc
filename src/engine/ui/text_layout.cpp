@@ -36,6 +36,8 @@ struct Pending {
     const FfntGlyph* glyph = nullptr;
     float pen = 0.0f;
     float advance = 0.0f;
+    int picture = -1;
+    float picture_advance = 0.0f;
 };
 
 void Emit(TextLayout& layout, std::vector<Pending>& line, const TextStyle& style, bool keep_trailing_spaces, float max_width = 0.0f) {
@@ -49,10 +51,15 @@ void Emit(TextLayout& layout, std::vector<Pending>& line, const TextStyle& style
     const float start = line.empty() ? 0.0f : line.front().pen;
     if (style.font->Unicode()) {
         std::vector<uint32_t> codes;
-        for (const auto& p : line) codes.push_back(p.code);
+        std::vector<float> picture_advances;
         const float sx = style.font_width / em, sy = style.font_height / em;
+        for (const auto& p : line) {
+            codes.push_back(p.code);
+            picture_advances.push_back(p.picture >= 0 ? p.picture_advance / sx : 0.0f);
+        }
         auto measure = [&](size_t count) {
-            auto shaped = style.font->ShapeLine(std::span<const uint32_t>(codes.data(), count), style.inline_advance / sx);
+            auto shaped = style.font->ShapeLine(std::span<const uint32_t>(codes.data(), count), style.inline_advance / sx,
+                                                std::span<const float>(picture_advances.data(), count));
             return shaped.empty() ? 0.0f : sx * (shaped.back().pen + shaped.back().advance) + float(shaped.size()) * style.text_space;
         };
         if (max_width > 0 && codes.size() > 1 && measure(codes.size()) > max_width) {
@@ -65,12 +72,13 @@ void Emit(TextLayout& layout, std::vector<Pending>& line, const TextStyle& style
             while(!rest.empty() && rest.front().code==' ') rest.erase(rest.begin());
             line=std::move(rest); Emit(layout,line,style,keep_trailing_spaces,max_width); return;
         }
-        const auto shaped = style.font->ShapeLine(codes, style.inline_advance / sx);
+        const auto shaped = style.font->ShapeLine(codes, style.inline_advance / sx, picture_advances);
         float tracking=0;
         for (const auto& p : shaped) {
             out.width = sx * (p.pen + p.advance) + tracking + style.text_space;
             if (!p.glyph) {
-                out.glyphs.push_back({nullptr, {sx*p.pen + tracking, top}, {sx*p.advance, layout.line_height}});
+                const int picture = p.code >= 0 && static_cast<size_t>(p.code) < line.size() ? line[static_cast<size_t>(p.code)].picture : -1;
+                out.glyphs.push_back({nullptr, {sx*p.pen + tracking, top}, {sx*p.advance, layout.line_height}, picture});
             } else if (p.glyph->width && p.glyph->height) {
                 out.glyphs.push_back({p.glyph,
                     {sx*(p.pen + p.x + p.glyph->bearing) + tracking, top + sy*(p.y + p.glyph->top)},
@@ -84,7 +92,7 @@ void Emit(TextLayout& layout, std::vector<Pending>& line, const TextStyle& style
     for (const Pending& p : line) {
         out.width = p.pen - start + p.advance;
         if (p.code == kInlinePicture && !p.glyph) {
-            out.glyphs.push_back({nullptr, {p.pen - start, top}, {p.advance, layout.line_height}});
+            out.glyphs.push_back({nullptr, {p.pen - start, top}, {p.advance, layout.line_height}, p.picture});
             continue;
         }
         if (!p.glyph || p.glyph->width <= 1 || p.code == ' ') {
@@ -120,6 +128,7 @@ TextLayout LayoutText(std::string_view utf8, const TextStyle& style, float max_w
     std::vector<Pending> line;
     float pen = 0.0f;
     const std::vector<uint32_t> codes = DecodeUtf8(utf8);
+    int pictures = 0;
     layout.rtl = style.font->Unicode() && std::any_of(codes.begin(), codes.end(), StrongRtl);
     for (size_t i = 0; i < codes.size(); ++i) {
         const uint32_t code = codes[i];
@@ -134,7 +143,9 @@ TextLayout LayoutText(std::string_view utf8, const TextStyle& style, float max_w
         Pending p;
         p.code = code;
         if (code == kInlinePicture && style.inline_advance > 0.0f) {
-            p.advance = style.inline_advance + style.text_space;
+            p.picture = pictures++;
+            p.picture_advance = static_cast<size_t>(p.picture) < style.inline_advances.size() ? style.inline_advances[static_cast<size_t>(p.picture)] : style.inline_advance;
+            p.advance = p.picture_advance + style.text_space;
         } else {
             p.glyph = style.font->FindOrFallback(code);
             p.advance = (p.glyph ? style.font_width * style.font->Advance(*p.glyph) : 0.0f) + style.text_space;
@@ -192,6 +203,7 @@ TextLayout LayoutTextInBox(std::string_view utf8, TextStyle style, glm::vec2 box
         style.text_space *= factor;
         style.line_space *= factor;
         style.inline_advance *= factor;
+        for (float& advance : style.inline_advances) advance *= factor;
     }
     for (auto& line : layout.lines) {
         const float shift = layout.rtl && mirror_rtl ? std::max(0.0f, room.x - (line.width - lo.x)) : 0.0f;

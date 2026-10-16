@@ -39,6 +39,8 @@ struct FrameGenPrepare {
     bool reset = false;
 };
 
+enum class FrameStartAction { Continue, RecreateSwapchain, KeepCurrentSwapchain };
+
 class FrameGeneration {
 public:
     virtual ~FrameGeneration() = default;
@@ -47,10 +49,30 @@ public:
     virtual bool Generating() const = 0;
     virtual void Prepare(const FrameGenPrepare& prepare) = 0;
     virtual const vk::Image* Present(uint32_t image_index) = 0;
+    virtual const vk::Image* UiLayer(uint32_t image_index) {
+        (void)image_index;
+        return nullptr;
+    }
+    virtual bool UiLayerOverRendered() const { return false; }
     virtual void Shutdown() = 0;
+    virtual FrameStartAction FrameStart(bool swapchain_recreation_pending) {
+        (void)swapchain_recreation_pending;
+        return FrameStartAction::Continue;
+    }
+    virtual bool SwapchainFailed() { return false; }
+    virtual bool OwnsGeneratedFrame() const { return false; }
+    virtual const vk::Image* GeneratedImage() { return nullptr; }
+    virtual bool ExternalSync(VkSemaphore& signal_semaphore, uint64_t& signal_value, VkSemaphore& wait_semaphore, uint64_t& wait_value) {
+        signal_semaphore = VK_NULL_HANDLE;
+        signal_value = 0;
+        wait_semaphore = VK_NULL_HANDLE;
+        wait_value = 0;
+        return false;
+    }
 };
 
 std::unique_ptr<FrameGeneration> CreateFrameGeneration(vk::Context& ctx, const FrameGenQueues& queues);
 std::unique_ptr<FrameGeneration> CreateDlssFrameGeneration(vk::Context& ctx);
+std::unique_ptr<FrameGeneration> CreateMetalfxFrameGeneration(vk::Context& ctx);
 
 }

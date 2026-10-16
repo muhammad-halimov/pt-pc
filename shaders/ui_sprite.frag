@@ -20,7 +20,8 @@ layout(push_constant) uniform UiPush {
     uint draw;
 } push;
 
-layout(set = 0, binding = 0) uniform sampler2D textures[];
+#include "bindless.glsl"
+layout(set = 0, binding = 0) uniform PT_TEXTURE2D_ARRAY textures[];
 layout(std430, set = 1, binding = 0) readonly buffer UiDraws {
     UiDraw draws[];
 };
@@ -28,10 +29,10 @@ layout(set = 1, binding = 1) uniform sampler2D scene_color;
 
 vec4 Sample(uint packed, vec2 uv) {
     uint index = packed & 0x3FFFFFFFu;
-    vec2 size = vec2(textureSize(textures[nonuniformEXT(index)], 0));
+    vec2 size = vec2(textureSize(PT_TEX2D(index), 0));
     float lod = log2(max(max(length(dFdx(uv) * size), length(dFdy(uv) * size)), 1e-6));
     if ((packed & 0xC0000000u) != 0u) {
-        vec2 half_texel = 0.5 / vec2(textureSize(textures[nonuniformEXT(index)], 0));
+        vec2 half_texel = 0.5 / vec2(textureSize(PT_TEX2D(index), 0));
         if ((packed & 0x80000000u) != 0u) {
             uv.x = clamp(uv.x, half_texel.x, 1.0 - half_texel.x);
         }
@@ -39,7 +40,7 @@ vec4 Sample(uint packed, vec2 uv) {
             uv.y = clamp(uv.y, half_texel.y, 1.0 - half_texel.y);
         }
     }
-    return textureLod(textures[nonuniformEXT(index)], uv, lod);
+    return textureLod(PT_TEX2D(index), uv, lod);
 }
 
 vec4 ShadeMaterial(UiDraw d) {
@@ -102,7 +103,9 @@ vec4 ShadeNoise(UiDraw d) {
 
 vec4 ShadeString(UiDraw d) {
     vec4 t = Sample(d.textures.x, d.extra.xy + in_uv);
-    return vec4(clamp(0.1 * in_color.rgb, 0.0, 1.0), clamp(d.extra.w * t.a * in_color.a, 0.0, 1.0));
+    vec3 c = clamp(0.1 * in_color.rgb, 0.0, 1.0);
+    vec3 encoded = mix(1.055 * pow(c, vec3(1.0 / 2.4)) - 0.055, 12.92 * c, lessThanEqual(c, vec3(0.0031308)));
+    return vec4(encoded, clamp(d.extra.w * t.a * in_color.a, 0.0, 1.0));
 }
 
 void main() {

@@ -39,6 +39,14 @@ void ScreenEffects::CallFadeOut(float seconds) {
         const glm::vec4 target = fade_ignore ? glm::vec4(0.0f) : fade_color;
         fade_current = glm::vec4(glm::vec3(target), fade_current.a);
     }
+    if (seconds <= 0.0f) {
+        fade_current = fade_ignore ? glm::vec4(0.0f) : fade_color;
+        fade_shown = fade_current;
+        fade_shown_hold = 0.0f;
+        fade_shown_called = false;
+        fade_remaining = 0.0f;
+        fade_state = 3;
+    }
     LogDebug("fade: out {:.2f} s", fade_remaining);
 }
 

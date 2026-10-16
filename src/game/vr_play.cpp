@@ -22,6 +22,7 @@ constexpr float kHeadRise = 0.4f;
 constexpr float kHeadDrop = 0.8f;
 constexpr float kWallMargin = 0.12f;
 constexpr float kNearPlane = 0.05f;
+constexpr int kScaleFrames = 45;
 
 }
 
@@ -50,7 +51,7 @@ bool VrPlay::ScreenMode(Game& game) {
     glm::vec3 position;
     glm::quat rotation;
     float fov = 0.0f;
-    const bool screen = game.Demos().CameraWorld(position, rotation, fov) || game.Nazo().IsPeepholeTheaterActive();
+    const bool screen = game.Demos().CameraWorld(position, rotation, fov) || game.Nazo().IsPeepholeTheaterActive() || game.LisaDateActive();
     if (screen != screen_) {
         LogInfo("vr: {}", screen ? "virtual screen (a camera the game frames)" : "stereo view");
     }
@@ -138,7 +139,7 @@ void VrPlay::ApplyControls(Game& game, InputState& state, bool menu_open, bool s
     std::optional<std::pair<glm::vec3, glm::vec3>> light;
     const int hand = std::clamp(settings_.flashlight_hand, 0, 1);
     if (settings_.flashlight == 1 && !screen && centered_ && eye_height_ >= 0.0f && c.aim[hand].valid) {
-        const glm::vec3 position = last_anchor_ + rig_.Offset(c.aim[hand].position) + last_correction_;
+        const glm::vec3 position = last_anchor_ + ScaleVrTrackedOffset(rig_.Offset(c.aim[hand].position), units_per_metre_) + last_correction_;
         const glm::vec3 direction = glm::normalize(rig_.ToWorld(c.aim[hand].orientation) * glm::vec3(0.0f, 0.0f, -1.0f));
         light = std::make_pair(position, direction);
     }
@@ -165,9 +166,25 @@ bool VrPlay::PrepareStereo(Game& game, const Camera& logic, float dt, bool menu_
     const glm::vec3 eye = player.Eye();
     const float height = eye.y - feet.y;
     eye_height_ = eye_height_ < 0.0f ? height : eye_height_ + (height - eye_height_) * (1.0f - std::exp(-std::max(dt, 0.0f) / 0.6f));
-    const glm::vec3 anchor = logic.position + (feet - eye) + glm::vec3(0.0f, eye_height_, 0.0f);
+    const float height_offset = ClampVrHeightOffset(settings_.height_offset);
+    UpdateScale();
+    const glm::vec3 anchor = VrEyeAnchor(logic.position, feet, eye, eye_height_, height_offset);
     const xr::ViewPose& head = host_.Head();
-    const glm::vec3 offset = rig_.Offset(head.position);
+    glm::vec3 anchor_now = anchor;
+    {
+        Player& body = game.GetPlayer();
+        const glm::vec3 walked = ScaleVrTrackedOffset(rig_.Offset(head.position), units_per_metre_);
+        const glm::vec2 flat(walked.x, walked.z);
+        const bool free = !menu_open && body.spawned && !game.Demos().ControlsPlayer() && !(body.locks.Mask('B') & 1) &&
+                          !game.Nazo().IsPeepholeTheaterActive();
+        if (free && glm::length(flat) > 0.02f) {
+            const glm::vec3 moved = body.FollowHead(game.Collision(), glm::vec3(flat.x, 0.0f, flat.y));
+            rig_.Shift(moved / units_per_metre_);
+            anchor_now += moved;
+        }
+    }
+    const glm::vec3 head_offset = rig_.Offset(head.position);
+    const glm::vec3 offset = ScaleVrTrackedOffset(head_offset, units_per_metre_);
     glm::vec3 kept = offset;
     const float reach = glm::length(glm::vec2(kept.x, kept.z));
     if (reach > kHeadReach) {
@@ -178,25 +195,31 @@ bool VrPlay::PrepareStereo(Game& game, const Camera& logic, float dt, bool menu_
     if (const float length = glm::length(kept); length > 1.0e-3f) {
         const glm::vec3 direction = kept / length;
         RayHit hit;
-        if (game.Collision().Raycast(anchor, direction, length + kWallMargin, hit)) {
+        if (game.Collision().Raycast(anchor_now, direction, length + kWallMargin, hit)) {
             kept = direction * std::max(0.0f, hit.distance - kWallMargin);
         }
     }
     const glm::vec3 correction = kept - offset;
-    last_anchor_ = anchor;
+    last_anchor_ = anchor_now;
     last_correction_ = correction;
-    out.head = xr::EyeCamera(anchor + kept, rig_.ToWorld(head.orientation), frusta_[0], kNearPlane);
+    out.head = xr::EyeCamera(anchor_now + kept, rig_.ToWorld(head.orientation), frusta_[0], kNearPlane);
     for (int i = 0; i < 2; ++i) {
         const xr::ViewPose& pose = host_.Eye(i);
         out.poses[i] = pose;
-        out.eyes[i] = xr::EyeCamera(anchor + rig_.Offset(pose.position) + correction, rig_.ToWorld(pose.orientation), frusta_[i], kNearPlane);
+        const glm::vec3 eye_relative_offset = rig_.Offset(pose.position) - head_offset;
+        const glm::vec3 eye_offset = MapVrEyeOffset(head_offset, eye_relative_offset, units_per_metre_);
+        out.eyes[i] = xr::EyeCamera(anchor_now + eye_offset + correction, rig_.ToWorld(pose.orientation), frusta_[i], kNearPlane);
     }
     out.render = {render_size_.x, render_size_.y};
-    Place(head.position, xr::AnglesOf(head.orientation).yaw, menu_open, dt);
+    Place(head.position + glm::vec3(0.0f, height_offset, 0.0f), xr::AnglesOf(head.orientation).yaw, menu_open, dt);
     auto target = [&](xr::Swapchain& sc, const glm::vec4& rect, XrTarget& t) {
         if (!host_.Acquire(sc)) return false;
-        t.image = sc.images[sc.index];
-        t.view = sc.views[sc.index];
+        if (!sc.d3d12_images.empty()) {
+            t.d3d12_image = sc.d3d12_images[sc.index];
+        } else {
+            t.image = sc.images[sc.index];
+            t.view = sc.views[sc.index];
+        }
         t.format = sc.format;
         t.extent = sc.extent;
         t.rect = rect;
@@ -236,15 +259,20 @@ bool VrPlay::PrepareScreen(XrTarget& out) {
     if (!screen_placed_) {
         const float yaw = host_.ViewsValid() ? xr::AnglesOf(head.orientation).yaw : 0.0f;
         screen_orientation_ = xr::YawRotation(yaw);
-        screen_position_ = head.position + screen_orientation_ * glm::vec3(0.0f, 0.0f, -kScreenDistance);
+        screen_position_ = head.position + glm::vec3(0.0f, ClampVrHeightOffset(settings_.height_offset), 0.0f) +
+                           screen_orientation_ * glm::vec3(0.0f, 0.0f, -kScreenDistance);
         screen_placed_ = true;
     }
     xr::Swapchain& sc = host_.ScreenSwapchain();
     if (!host_.Acquire(sc)) {
         return false;
     }
-    out.image = sc.images[sc.index];
-    out.view = sc.views[sc.index];
+    if (!sc.d3d12_images.empty()) {
+        out.d3d12_image = sc.d3d12_images[sc.index];
+    } else {
+        out.image = sc.images[sc.index];
+        out.view = sc.views[sc.index];
+    }
     out.format = sc.format;
     out.extent = sc.extent;
     out.rect = glm::vec4(0.0f, 0.0f, 1.0f, 1.0f);
@@ -275,6 +303,36 @@ void VrPlay::Rumble(uint8_t large_motor, uint8_t small_motor) {
     const float amplitude = static_cast<float>(strongest) / 255.0f;
     host_.Haptic(0, amplitude, 0.05f);
     host_.Haptic(1, amplitude, 0.05f);
+}
+
+void VrPlay::UpdateScale() {
+    if (host_.Recentres() != recentres_seen_) {
+        recentres_seen_ = host_.Recentres();
+        scale_locked_ = false;
+        floor_eye_sum_ = 0.0f;
+        floor_eye_samples_ = 0;
+        scale_frames_ = 0;
+    }
+    if (!scale_locked_) {
+        if (host_.FloorEyeHeightValid()) {
+            floor_eye_sum_ += host_.FloorEyeHeight();
+            ++floor_eye_samples_;
+        }
+        floor_eye_ = floor_eye_samples_ > 0 ? floor_eye_sum_ / static_cast<float>(floor_eye_samples_) : -1.0f;
+        if (++scale_frames_ >= kScaleFrames) {
+            scale_locked_ = true;
+            const float units = VrUnitsPerMetre(floor_eye_, 1.0f);
+            if (floor_eye_ < 0.0f) {
+                LogInfo("vr: world at real size, {:.3f} units per metre (the runtime reports no floor)", units);
+            } else if (floor_eye_ < kVrStandingEyeMin) {
+                LogInfo("vr: eye {:.2f} m above the floor, seated: world at real size, {:.3f} units per metre", floor_eye_, units);
+            } else {
+                LogInfo("vr: eye {:.2f} m above the floor: the protagonist's {:.3f} m eye there, {:.3f} units per metre", floor_eye_,
+                        kPs4EyeHeight, units);
+            }
+        }
+    }
+    units_per_metre_ = VrUnitsPerMetre(floor_eye_, settings_.world_size);
 }
 
 void VrPlay::Place(const glm::vec3& head_local, float head_yaw_local, bool menu_open, float dt) {

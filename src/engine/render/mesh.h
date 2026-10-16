@@ -40,6 +40,7 @@ struct SubMesh {
     bool shadow = true;
     bool shadow_double_sided = false;
     uint16_t group = 0;
+    uint8_t layer = 0;
 };
 
 struct MeshGroup {
@@ -62,8 +63,8 @@ struct MeshData {
 
 struct GpuMesh {
     std::string name;
-    vk::Buffer vertices;
-    vk::Buffer indices;
+    gpu::BufferResource vertices;
+    gpu::BufferResource indices;
     std::vector<SubMesh> submeshes;
     std::vector<MeshGroup> groups;
     glm::vec3 bounds_min{0.0f};

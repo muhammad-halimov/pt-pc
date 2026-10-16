@@ -1,7 +1,11 @@
+#include "engine/assets/gltf_model.h"
 #include "game/ui/archive_view.h"
 
 #include <algorithm>
+#include <cmath>
 #include <cstring>
+#include <format>
+#include <initializer_list>
 
 #include "engine/assets/fmdl.h"
 #include "engine/assets/ftex.h"
@@ -10,9 +14,11 @@
 #include "engine/fs/vfs.h"
 #include "engine/render/texture_manager.h"
 #include "engine/ui/text_layout.h"
+#include "game/archive.h"
 #include "game/stage_data.h"
 #include "game/ui/museum_layout.h"
 #include "game/ui/pc_settings_page.h"
+#include "game/ui/prompt_hint.h"
 #include "game/ui/ui_assets.h"
 #include "game/ui/uif_view.h"
 
@@ -57,9 +63,8 @@ glm::vec2 ArchiveView::TextureSize(UiAssets& assets, const std::string& path) {
 }
 
 bool ArchiveView::LoadPiece(UiAssets& assets, const std::string& model, const glm::mat4& to_plane, Piece& out) {
-    const auto bytes = assets.Files().ReadFile(model);
     FmdlModel fmdl;
-    if (!bytes || !LoadFmdl(*bytes, model, fmdl) || fmdl.mesh.vertices.empty()) {
+    if (!LoadModelFile(assets.Files(), model, fmdl) || fmdl.mesh.vertices.empty()) {
         LogWarn("archive: photo piece {} unreadable", model);
         return false;
     }
@@ -146,7 +151,7 @@ bool ArchiveView::DrawPicture(ui::UiBatch& batch, UiAssets& assets, const PcPane
     glm::vec2 size(16.0f, 9.0f);
     if (!panel.texture.empty()) {
         texture = assets.Texture(panel.texture);
-        size = TextureSize(assets, panel.texture);
+        size = panel.aspect > 0.0f ? glm::vec2(panel.aspect, 1.0f) : TextureSize(assets, panel.texture);
     } else if (!panel.file.empty()) {
         texture = assets.LocalPreview(panel.file);
     } else if (!panel.thumbnail.empty()) {
@@ -175,7 +180,7 @@ bool ArchiveView::FitPicture(UiAssets& assets, const PcPanel& panel, glm::vec2 l
         if (photo.pieces.empty()) return false;
         size = photo.hi - photo.lo;
     } else if (!panel.texture.empty()) {
-        size = TextureSize(assets, panel.texture);
+        size = panel.aspect > 0.0f ? glm::vec2(panel.aspect, 1.0f) : TextureSize(assets, panel.texture);
     } else if (panel.file.empty() && panel.thumbnail.empty()) {
         return false;
     }
@@ -206,7 +211,7 @@ void ArchiveView::DrawFrame(ui::UiBatch& batch, const UiCanvas& canvas, UiAssets
     glm::vec2 b = canvas.ToTarget(hi - glm::vec2(inset));
     glm::vec2 pa = a;
     glm::vec2 pb = b;
-    const bool picture = !locked && FitPicture(assets, panel, a, b, pa, pb);
+    const bool picture = !locked && !panel.audio && FitPicture(assets, panel, a, b, pa, pb);
     if (picture) {
         a = pa - glm::vec2(inset * canvas.scale);
         b = pb + glm::vec2(inset * canvas.scale);
@@ -218,10 +223,42 @@ void ArchiveView::DrawFrame(ui::UiBatch& batch, const UiCanvas& canvas, UiAssets
     solid({a.x - line, b.y}, {b.x + line, b.y + line}, glm::vec4(1.0f, 1.0f, 1.0f, edge));
     solid({a.x - line, a.y}, {a.x, b.y}, glm::vec4(1.0f, 1.0f, 1.0f, edge));
     solid({b.x, a.y}, {b.x + line, b.y}, glm::vec4(1.0f, 1.0f, 1.0f, edge));
+    if (panel.music && !locked) {
+        const glm::vec2 center((lo.x + hi.x) * 0.5f, lo.y + (hi.y - lo.y) * 0.2f);
+        DrawNote(batch, canvas, center, 10.0f, glm::vec4(1.0f, 1.0f, 1.0f, selected ? 0.95f : 0.6f));
+        DrawLine(batch, canvas, assets, name, 13.0f, {lo.x + 5.0f, lo.y + (hi.y - lo.y) * 0.46f},
+                 {hi.x - 5.0f, hi.y - 3.0f}, ui::TextAlign::Center, selected ? 0.95f : 0.6f, language);
+        return;
+    }
+    if (panel.audio && !locked) {
+        const glm::vec2 center((lo.x + hi.x) * 0.5f, lo.y + (hi.y - lo.y) * 0.38f);
+        const glm::vec4 color(1.0f, 1.0f, 1.0f, selected ? 0.95f : 0.6f);
+        const auto rectangle = [&](glm::vec2 lo, glm::vec2 hi) { solid(canvas.ToTarget(lo), canvas.ToTarget(hi), color); };
+        rectangle(center + glm::vec2(-18.0f, -5.0f), center + glm::vec2(-10.0f, 5.0f));
+        const glm::vec2 cone[] = {center + glm::vec2(-10.0f, -5.0f), center + glm::vec2(0.0f, -13.0f),
+                                 center + glm::vec2(0.0f, 13.0f), center + glm::vec2(-10.0f, 5.0f)};
+        const ui::UiVertex vertices[] = {{canvas.ToTarget(cone[0]), {}, color}, {canvas.ToTarget(cone[1]), {}, color},
+            {canvas.ToTarget(cone[2]), {}, color}, {canvas.ToTarget(cone[0]), {}, color},
+            {canvas.ToTarget(cone[2]), {}, color}, {canvas.ToTarget(cone[3]), {}, color}};
+        batch.Draw(vertices, ui::UiDrawParams::Plain(TextureManager::kWhite), ui::UiShade::Solid, ui::UiBlend::Alpha);
+        for (const float radius : {10.0f, 17.0f}) {
+            for (int i = 0; i < 9; ++i) {
+                const float angle = -0.8f + static_cast<float>(i) * 0.2f;
+                const glm::vec2 p = center + glm::vec2(std::cos(angle), std::sin(angle)) * radius;
+                rectangle(p - glm::vec2(1.2f), p + glm::vec2(1.2f));
+            }
+        }
+        DrawLine(batch, canvas, assets, name, 13.0f, {lo.x + 5.0f, lo.y + (hi.y - lo.y) * 0.66f},
+                 {hi.x - 5.0f, hi.y - 4.0f}, ui::TextAlign::Center, selected ? 0.95f : 0.6f, language);
+        return;
+    }
     const bool drawn = picture && DrawPicture(batch, assets, panel, pa, pb, panel.lift);
     if (drawn) {
         if (!selected) solid(pa, pb, glm::vec4(0.0f, 0.0f, 0.0f, 0.22f));
-    } else if (!locked && !name.empty()) {
+    } else if (locked && name == kArchiveLockedLabel) {
+        DrawLine(batch, canvas, assets, name, 15.0f, lo + glm::vec2(inset + 8.0f), hi - glm::vec2(inset + 8.0f), ui::TextAlign::Center,
+                 selected ? 0.7f : 0.3f, language);
+    } else if (!locked && !picture && !name.empty()) {
         DrawLine(batch, canvas, assets, name, 15.0f, lo + glm::vec2(inset + 8.0f), hi - glm::vec2(inset + 8.0f), ui::TextAlign::Center,
                  selected ? 0.8f : 0.45f, language);
     }
@@ -238,23 +275,22 @@ void ArchiveView::DrawMuseum(ui::UiBatch& batch, const UiCanvas& canvas, UiAsset
             if (!row) continue;
             const bool selected = i == cursor;
             if (i < cells) {
-                const L::Cell picture = L::HallPicture(i);
+                const L::Cell picture = L::HallPicture(i, cells);
                 const PcPanel panel = page.PanelOf(i);
                 DrawFrame(batch, canvas, assets, panel, PcText(row->label, language), picture.lo, picture.hi, 4.0f, selected, !row->enabled || panel.locked,
                           language);
-                const L::Cell cell = L::HallCell(i);
+                const L::Cell cell = L::HallCell(i, cells);
                 const float alpha = row->enabled ? (selected ? 1.0f : 0.7f) : 0.35f;
-                DrawLine(batch, canvas, assets, PcText(row->label, language), 17.0f, {cell.lo.x + 4.0f, picture.hi.y + 4.0f},
-                         {cell.hi.x - 4.0f, picture.hi.y + 26.0f}, ui::TextAlign::Center, alpha, language);
+                const float name_size = L::HallColumns(cells) > L::kHallColumns ? 15.0f : 17.0f;
+                DrawLine(batch, canvas, assets, PcText(row->label, language), name_size, {cell.lo.x + 2.0f, picture.hi.y + 4.0f},
+                         {cell.hi.x - 2.0f, picture.hi.y + 26.0f}, ui::TextAlign::Center, alpha, language);
                 if (!row->values.empty()) {
                     DrawLine(batch, canvas, assets, row->values.front(), 13.0f, {cell.lo.x + 4.0f, picture.hi.y + 26.0f},
                              {cell.hi.x - 4.0f, picture.hi.y + 42.0f}, ui::TextAlign::Center, alpha * 0.55f, language);
                 }
             } else {
                 const L::Cell cell = L::HallText(i - cells);
-                std::string_view label = row->label;
-                if (row->action && selected && page.Confirming()) label = "pc_reset_confirm";
-                DrawLine(batch, canvas, assets, PcText(label, language), 17.0f, cell.lo, cell.hi, ui::TextAlign::Center,
+                DrawLine(batch, canvas, assets, PcText(row->label, language), 17.0f, cell.lo, cell.hi, ui::TextAlign::Center,
                          row->enabled ? (selected ? 1.0f : 0.55f) : 0.3f, language);
             }
         }
@@ -275,19 +311,27 @@ void ArchiveView::DrawMuseum(ui::UiBatch& batch, const UiCanvas& canvas, UiAsset
         const PcPanel panel = page.PanelOf(index);
         DrawFrame(batch, canvas, assets, panel, row->label, cell.lo, cell.hi, 3.0f, selected, !row->enabled || panel.locked, language);
     }
+    for (const bool right : {false, true}) {
+        const L::Cell arrow = L::WallArrow(right, slots);
+        const bool enabled = right ? cursor < n - 1 : cursor > 0;
+        DrawLine(batch, canvas, assets, right ? ">" : "<", 30.0f, arrow.lo, arrow.hi, ui::TextAlign::Center,
+                 enabled ? 0.95f : 0.22f, language);
+    }
     const int shown = std::min(cursor, n - 1);
     const PcSettingRow* current = page.RowAtIndex(shown);
     if (!current) return;
     const PcPanel panel = page.PanelOf(shown);
     const bool locked = !current->enabled || panel.locked;
-    if (!panel.lines.empty() && !locked) {
-        const glm::vec2 a = canvas.ToTarget(L::kSpotlight.lo);
-        const glm::vec2 b = canvas.ToTarget(L::kSpotlight.hi);
+    if (panel.music && !locked) {
+        DrawMusicPlayer(batch, canvas, assets, panel, language);
+    } else if (!panel.lines.empty() && !locked) {
+        const glm::vec2 a = canvas.ToTarget(L::kTranscript.lo);
+        const glm::vec2 b = canvas.ToTarget(L::kTranscript.hi);
         PcPanel sheet;
-        DrawFrame(batch, canvas, assets, sheet, {}, L::kSpotlight.lo, L::kSpotlight.hi, 0.0f, true, false, language);
+        DrawFrame(batch, canvas, assets, sheet, {}, L::kTranscript.lo, L::kTranscript.hi, 0.0f, true, false, language);
         batch.Quad(a, b, glm::vec2(0.0f), glm::vec2(1.0f), glm::vec4(0.0f, 0.0f, 0.0f, 0.5f), ui::UiDrawParams::Plain(TextureManager::kWhite),
                    ui::UiShade::Solid, ui::UiBlend::Alpha);
-        DrawLines(batch, canvas, assets, panel, L::kSpotlight.lo + glm::vec2(22.0f, 18.0f), L::kSpotlight.hi - glm::vec2(22.0f, 14.0f), language);
+        DrawLines(batch, canvas, assets, panel, L::kTranscript.lo + glm::vec2(22.0f, 18.0f), L::kTranscript.hi - glm::vec2(22.0f, 14.0f), language, true);
     } else {
         DrawFrame(batch, canvas, assets, panel, current->label, L::kSpotlight.lo, L::kSpotlight.hi, 8.0f, true, locked, language);
     }
@@ -299,10 +343,148 @@ void ArchiveView::DrawMuseum(ui::UiBatch& batch, const UiCanvas& canvas, UiAsset
     }
 }
 
+namespace {
+
+void Solid(ui::UiBatch& batch, const UiCanvas& canvas, glm::vec2 lo, glm::vec2 hi, glm::vec4 color) {
+    batch.Quad(canvas.ToTarget(lo), canvas.ToTarget(hi), glm::vec2(0.0f), glm::vec2(1.0f), color, ui::UiDrawParams::Plain(TextureManager::kWhite),
+               ui::UiShade::Solid, ui::UiBlend::Alpha);
+}
+
+void Triangles(ui::UiBatch& batch, const UiCanvas& canvas, std::initializer_list<glm::vec2> points, glm::vec4 color) {
+    std::vector<ui::UiVertex> vertices;
+    for (const glm::vec2& p : points) vertices.push_back({canvas.ToTarget(p), {}, color});
+    batch.Draw(vertices, ui::UiDrawParams::Plain(TextureManager::kWhite), ui::UiShade::Solid, ui::UiBlend::Alpha);
+}
+
+void Arc(ui::UiBatch& batch, const UiCanvas& canvas, glm::vec2 center, float radius, float a0, float a1, bool head, glm::vec4 color) {
+    constexpr int kSteps = 14;
+    for (int i = 0; i <= kSteps; ++i) {
+        const float a = a0 + (a1 - a0) * static_cast<float>(i) / kSteps;
+        const glm::vec2 p = center + glm::vec2(std::cos(a), std::sin(a)) * radius;
+        Solid(batch, canvas, p - glm::vec2(1.3f), p + glm::vec2(1.3f), color);
+    }
+    if (head) {
+        const glm::vec2 out(std::cos(a1), std::sin(a1));
+        const glm::vec2 tip = center + out * radius;
+        const glm::vec2 along = glm::vec2(-out.y, out.x) * (a1 > a0 ? 1.0f : -1.0f);
+        Triangles(batch, canvas, {tip + along * 5.0f, tip - out * 5.0f, tip + out * 5.0f}, color);
+    }
+}
+
+std::string Clock(float seconds) {
+    const int s = std::max(0, static_cast<int>(std::floor(seconds)));
+    return std::format("{}:{:02}", s / 60, s % 60);
+}
+
+}
+
+void ArchiveView::DrawNote(ui::UiBatch& batch, const UiCanvas& canvas, glm::vec2 center, float size, glm::vec4 color) {
+    const glm::vec2 head = center + glm::vec2(-size * 0.3f, size * 0.9f);
+    constexpr int kSides = 18;
+    constexpr float kTilt = -0.35f;
+    const auto at = [&](int i) {
+        const float a = 6.2831853f * static_cast<float>(i) / kSides;
+        const glm::vec2 e(std::cos(a) * size * 0.62f, std::sin(a) * size * 0.42f);
+        return head + glm::vec2(e.x * std::cos(kTilt) - e.y * std::sin(kTilt), e.x * std::sin(kTilt) + e.y * std::cos(kTilt));
+    };
+    std::vector<ui::UiVertex> vertices;
+    for (int i = 0; i < kSides; ++i) {
+        for (const glm::vec2& p : {head, at(i), at(i + 1)}) vertices.push_back({canvas.ToTarget(p), {}, color});
+    }
+    batch.Draw(vertices, ui::UiDrawParams::Plain(TextureManager::kWhite), ui::UiShade::Solid, ui::UiBlend::Alpha);
+    const float x = head.x + size * 0.52f;
+    const float top = head.y - size * 2.4f;
+    Solid(batch, canvas, {x - size * 0.08f, top}, {x + size * 0.08f, head.y - size * 0.1f}, color);
+    Triangles(batch, canvas, {{x, top}, {x + size * 0.75f, top + size * 0.95f}, {x, top + size * 0.55f}}, color);
+}
+
+void ArchiveView::DrawMusicPlayer(ui::UiBatch& batch, const UiCanvas& canvas, UiAssets& assets, const PcPanel& panel, int language) {
+    using L = MuseumLayout;
+    PcPanel sheet;
+    DrawFrame(batch, canvas, assets, sheet, {}, L::kMusicSheet.lo, L::kMusicSheet.hi, 0.0f, true, false, language);
+    Solid(batch, canvas, L::kMusicSheet.lo, L::kMusicSheet.hi, glm::vec4(0.0f, 0.0f, 0.0f, 0.5f));
+    const glm::vec4 ink(1.0f, 1.0f, 1.0f, 0.92f);
+    const glm::vec4 dim(1.0f, 1.0f, 1.0f, 0.35f);
+    DrawNote(batch, canvas, L::kMusicNote, 22.0f, panel.music_playing ? ink : glm::vec4(1.0f, 1.0f, 1.0f, 0.6f));
+    const std::string time = panel.music_length > 0.0f ? std::format("{} / {}", Clock(panel.music_position), Clock(panel.music_length))
+                                                       : Clock(panel.music_position);
+    DrawLine(batch, canvas, assets, time, 17.0f, {L::kMusicBar.lo.x, L::kMusicTimeY - 12.0f}, {L::kMusicBar.hi.x, L::kMusicTimeY + 12.0f},
+             ui::TextAlign::Center, 0.85f, language);
+    const L::Cell bar = L::kMusicBar;
+    const float mid = (bar.lo.y + bar.hi.y) * 0.5f;
+    const float fraction = panel.music_length > 0.0f ? std::clamp(panel.music_position / panel.music_length, 0.0f, 1.0f) : 0.0f;
+    const float x = bar.lo.x + (bar.hi.x - bar.lo.x) * fraction;
+    Solid(batch, canvas, {bar.lo.x, mid - 2.0f}, {bar.hi.x, mid + 2.0f}, glm::vec4(1.0f, 1.0f, 1.0f, 0.22f));
+    Solid(batch, canvas, {bar.lo.x, mid - 2.0f}, {x, mid + 2.0f}, ink);
+    Solid(batch, canvas, {x - 4.0f, mid - 7.0f}, {x + 4.0f, mid + 7.0f}, ink);
+    for (int b = 0; b < L::kMusicButtons; ++b) {
+        const L::Cell cell = L::MusicButton(b);
+        const glm::vec2 c = (cell.lo + cell.hi) * 0.5f;
+        const glm::vec4 color = b == L::kMusicLoop && !panel.music_loop ? dim : ink;
+        const bool strong = b == L::kMusicPlay || (b == L::kMusicLoop && panel.music_loop);
+        const glm::vec4 edge(1.0f, 1.0f, 1.0f, strong ? 0.7f : 0.25f);
+        Solid(batch, canvas, cell.lo, {cell.hi.x, cell.lo.y + 1.0f}, edge);
+        Solid(batch, canvas, {cell.lo.x, cell.hi.y - 1.0f}, cell.hi, edge);
+        Solid(batch, canvas, cell.lo, {cell.lo.x + 1.0f, cell.hi.y}, edge);
+        Solid(batch, canvas, {cell.hi.x - 1.0f, cell.lo.y}, cell.hi, edge);
+        const auto right = [&](glm::vec2 at, float h) {
+            Triangles(batch, canvas, {at + glm::vec2(-h * 0.8f, -h), at + glm::vec2(h * 0.8f, 0.0f), at + glm::vec2(-h * 0.8f, h)}, color);
+        };
+        const auto left = [&](glm::vec2 at, float h) {
+            Triangles(batch, canvas, {at + glm::vec2(h * 0.8f, -h), at + glm::vec2(-h * 0.8f, 0.0f), at + glm::vec2(h * 0.8f, h)}, color);
+        };
+        switch (b) {
+        case L::kMusicPrevious:
+            Solid(batch, canvas, c + glm::vec2(-9.0f, -8.0f), c + glm::vec2(-6.0f, 8.0f), color);
+            left(c + glm::vec2(2.0f, 0.0f), 8.0f);
+            break;
+        case L::kMusicNext:
+            right(c + glm::vec2(-2.0f, 0.0f), 8.0f);
+            Solid(batch, canvas, c + glm::vec2(6.0f, -8.0f), c + glm::vec2(9.0f, 8.0f), color);
+            break;
+        case L::kMusicBack:
+            left(c + glm::vec2(-5.0f, 0.0f), 7.0f);
+            left(c + glm::vec2(6.0f, 0.0f), 7.0f);
+            break;
+        case L::kMusicForward:
+            right(c + glm::vec2(-6.0f, 0.0f), 7.0f);
+            right(c + glm::vec2(5.0f, 0.0f), 7.0f);
+            break;
+        case L::kMusicPlay:
+            if (panel.music_playing) {
+                Solid(batch, canvas, c + glm::vec2(-7.0f, -9.0f), c + glm::vec2(-2.0f, 9.0f), color);
+                Solid(batch, canvas, c + glm::vec2(2.0f, -9.0f), c + glm::vec2(7.0f, 9.0f), color);
+            } else {
+                right(c + glm::vec2(1.0f, 0.0f), 10.0f);
+            }
+            break;
+        case L::kMusicRestart:
+            Arc(batch, canvas, c, 9.0f, 0.6f, 5.6f, true, color);
+            break;
+        case L::kMusicLoop:
+            Arc(batch, canvas, c, 9.0f, 3.5f, 6.0f, true, color);
+            Arc(batch, canvas, c, 9.0f, 0.35f, 2.85f, true, color);
+            break;
+        default:
+            break;
+        }
+    }
+}
+
 void ArchiveView::DrawLines(ui::UiBatch& batch, const UiCanvas& canvas, UiAssets& assets, const PcPanel& panel, glm::vec2 lo, glm::vec2 hi,
-                            int language) {
+                            int language, bool complete) {
     UiFont* font = assets.Font(UiFontType::PcSystem, language);
     if (!font || panel.lines.empty()) return;
+    if (complete) {
+        std::string text;
+        for (const std::string& line : panel.lines) {
+            if (!text.empty()) text += "\n";
+            text += line;
+        }
+        const ui::TextLayout layout = ui::LayoutTextInBox(text, PanelStyle(*font, 19.0f), lo, hi, true);
+        DrawText(batch, canvas, *font, layout, glm::vec4(1.0f), ui::UiBlend::Alpha);
+        return;
+    }
     const ui::TextStyle style = PanelStyle(*font, 19.0f);
     const float width = hi.x - lo.x;
     std::vector<ui::TextLayout> layouts;
@@ -351,7 +533,7 @@ void ArchiveView::DrawPanel(ui::UiBatch& batch, const UiCanvas& canvas, UiAssets
 }
 
 void ArchiveView::DrawFullScreen(ui::UiBatch& batch, const UiCanvas& canvas, UiAssets& assets, const PcPanel& panel, std::string_view hint,
-                                 int language) {
+                                 const PromptStyle& prompts, int language) {
     const glm::vec2 full(static_cast<float>(batch.Extent().width), static_cast<float>(batch.Extent().height));
     const glm::vec4 ground = panel.string ? glm::vec4(0.0f, 0.0f, 0.0f, 1.0f) : glm::vec4(0.08f, 0.08f, 0.08f, 1.0f);
     batch.Quad(glm::vec2(0.0f), full, glm::vec2(0.0f), glm::vec2(1.0f), ground,
@@ -368,10 +550,8 @@ void ArchiveView::DrawFullScreen(ui::UiBatch& batch, const UiCanvas& canvas, UiA
         DrawText(batch, canvas, *font, layout, glm::vec4(1.0f, 1.0f, 1.0f, 0.85f), ui::UiBlend::Alpha);
     }
     if (!hint.empty()) {
-        ui::TextLayout layout = ui::LayoutText(hint, PanelStyle(*font, 18.0f), UiCanvas::kWidth - 80.0f);
-        ui::PlaceText(layout, {40.0f, UiCanvas::kHeight - 50.0f}, {UiCanvas::kWidth - 40.0f, UiCanvas::kHeight - 16.0f}, ui::TextAlign::Center,
-                      ui::TextAlign::Center, ui::TextAlign::Center, true);
-        DrawText(batch, canvas, *font, layout, glm::vec4(1.0f, 1.0f, 1.0f, 0.6f), ui::UiBlend::Alpha);
+        DrawPromptText(batch, canvas, assets, *font, hint, prompts, 18.0f, {40.0f, UiCanvas::kHeight - 50.0f}, {UiCanvas::kWidth - 40.0f, UiCanvas::kHeight - 16.0f},
+                       ui::TextAlign::Center, ui::TextAlign::Center, glm::vec4(1.0f, 1.0f, 1.0f, 0.6f), false, 18.0f * 0.25f);
     }
 }
 

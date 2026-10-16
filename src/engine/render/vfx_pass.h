@@ -2,6 +2,7 @@
 
 #include <cstdint>
 #include <functional>
+#include <mutex>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -26,50 +27,60 @@ public:
     void Submit(vfx::RenderList& list);
     void RecordForward(const SceneVfxContext& context);
     void RecordFilter(const SceneFilterContext& context);
+    bool HasOpaqueLiquids() const;
+    void RecordLiquidDepth(const SceneVfxContext& context);
     const vfx::RenderList& List() const { return list_; }
+    void AddPipelineWarmup(vk::PipelineWarmup& warmup, gpu::Format color, gpu::Format depth, gpu::Format filter_color);
 
 private:
     struct PipelineKey {
-        VkFormat color = VK_FORMAT_UNDEFINED;
-        VkFormat depth = VK_FORMAT_UNDEFINED;
+        gpu::Format color = gpu::Format::Undefined;
+        gpu::Format depth = gpu::Format::Undefined;
         uint8_t blend = 0;
         bool depth_test = false;
         bool cull = false;
         bool offscreen = false;
+        bool depth_write = false;
         bool operator==(const PipelineKey&) const = default;
     };
 
     struct FrameSlot {
-        vk::Buffer quads;
-        vk::Buffer fog;
-        VkDescriptorSet forward = VK_NULL_HANDLE;
-        VkDescriptorSet filter = VK_NULL_HANDLE;
-        VkImageView forward_view = VK_NULL_HANDLE;
-        VkImageView filter_view = VK_NULL_HANDLE;
-        VkImageView forward_scene = VK_NULL_HANDLE;
-        VkImageView filter_scene = VK_NULL_HANDLE;
+        gpu::BufferResource quads;
+        gpu::BufferResource fog;
+        gpu::BindingSetHandle forward;
+        gpu::BindingSetHandle filter;
+        gpu::BindingSetHandle effects;
+        gpu::BindingSetHandle depth_only;
+        gpu::ImageViewHandle depth_only_scene;
+        gpu::ImageViewHandle forward_view;
+        gpu::ImageViewHandle filter_view;
+        gpu::ImageViewHandle effects_depth_view;
+        gpu::ImageViewHandle forward_scene;
+        gpu::ImageViewHandle filter_scene;
+        gpu::ImageViewHandle effects_scene;
         uint64_t uploaded = 0;
     };
 
-    VkPipeline Pipeline(const PipelineKey& key);
+    gpu::PipelineHandle Pipeline(const PipelineKey& key);
     bool Upload(uint32_t frame_index);
-    void WriteSet(FrameSlot& slot, VkDescriptorSet set, VkImageView view, VkImageView scene);
-    uint32_t DrawLayer(VkCommandBuffer cmd, VkDescriptorSet set, vfx::Layer layer, VkFormat color, VkFormat depth, bool depth_test, uint32_t mode,
-                       const glm::mat4& view_projection, const glm::vec3& eye, float exposure, float near_plane, VkExtent2D extent,
-                       const std::function<void()>* copy_scene, uint32_t subset = kVfxAll, uint32_t* recorded = nullptr);
+    void WriteSet(FrameSlot& slot, gpu::BindingSetHandle set, gpu::ImageViewHandle view, gpu::Layout depth_layout, gpu::ImageViewHandle scene,
+                  uint64_t fog_offset);
+    uint32_t DrawLayer(gpu::CommandList& cmd, gpu::BindingSetHandle set, vfx::Layer layer, gpu::Format color, gpu::Format depth, bool depth_test,
+                       uint32_t mode, const glm::mat4& view_projection, const glm::vec3& eye, float exposure, float near_plane,
+                       gpu::Extent2D extent, const std::function<void()>* copy_scene, uint32_t subset = kVfxAll, uint32_t* recorded = nullptr);
 
     Renderer* renderer_ = nullptr;
     TextureManager* textures_ = nullptr;
     Vfs* vfs_ = nullptr;
-    VkDevice device_ = VK_NULL_HANDLE;
-    VkDescriptorSetLayout set_layout_ = VK_NULL_HANDLE;
-    VkDescriptorPool pool_ = VK_NULL_HANDLE;
-    VkPipelineLayout layout_ = VK_NULL_HANDLE;
-    VkSampler sampler_ = VK_NULL_HANDLE;
-    VkSampler scene_sampler_ = VK_NULL_HANDLE;
-    VkShaderModule vertex_ = VK_NULL_HANDLE;
-    VkShaderModule fragment_ = VK_NULL_HANDLE;
-    std::vector<std::pair<PipelineKey, VkPipeline>> pipelines_;
+    gpu::Device* gpu_ = nullptr;
+    gpu::BindingLayoutHandle set_layout_;
+    gpu::BindingPoolHandle pool_;
+    gpu::PipelineLayoutHandle layout_;
+    gpu::SamplerHandle sampler_;
+    gpu::SamplerHandle scene_sampler_;
+    bool shaders_ = false;
+    std::vector<std::pair<PipelineKey, gpu::PipelineHandle>> pipelines_;
+    std::mutex pipelines_mutex_;
     FrameSlot slots_[Renderer::kFramesInFlight];
     std::unordered_map<std::string, uint32_t> texture_cache_;
     std::unordered_map<std::string, uint32_t> cube_cache_;

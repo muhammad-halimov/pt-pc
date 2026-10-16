@@ -43,6 +43,8 @@ public:
     State GetState() const { return state_; }
     bool FullRun() const { return full_; }
     double Real() const;
+    void PauseReal();
+    void ResumeReal();
     double Game() const { return game_; }
     double SegmentReal() const { return Real() - segment_real_start_; }
     double SegmentGame() const { return game_ - segment_game_start_; }
@@ -80,6 +82,8 @@ private:
     bool full_ = false;
     std::chrono::steady_clock::time_point start_{};
     std::chrono::steady_clock::time_point last_split_at_{};
+    std::chrono::steady_clock::time_point paused_at_{};
+    bool real_paused_ = false;
     double real_final_ = 0.0;
     double game_ = 0.0;
     double segment_real_start_ = 0.0;

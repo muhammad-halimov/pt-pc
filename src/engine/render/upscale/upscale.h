@@ -9,15 +9,22 @@
 #include <string>
 #include <vector>
 
+#include "engine/render/gpu/gpu_resources.h"
+#include "engine/render/upscale/neural_rendering.h"
 #include "engine/render/vk_context.h"
 
 namespace pt {
 
+namespace gpu {
+class CommandList;
+class Device;
+}
+
 class FrameGeneration;
 
-enum class UpscalerKind : int { Off = 0, Fsr = 1, Dlss = 2, Xess = 3, Spatial = 4, Fsr4 = 5, Count = 6 };
+enum class UpscalerKind : int { Off = 0, Fsr = 1, Dlss = 2, Xess = 3, Spatial = 4, Fsr4 = 5, MetalFx = 6, Count = 7 };
 enum class DlssModel : int { Auto = 0, K = 1, L = 2, M = 3, Count = 4 };
-enum class FrameGenKind : int { Off = 0, Fsr = 1, Dlss = 2, Count = 3 };
+enum class FrameGenKind : int { Off = 0, Fsr = 1, Dlss = 2, Metalfx = 3, Xess = 4, Count = 5 };
 enum class UpscaleQuality : int { NativeAA = 0, Quality = 1, Balanced = 2, Performance = 3, UltraPerformance = 4, Custom = 5, Count = 6 };
 
 struct UpscaleSettings {
@@ -27,6 +34,7 @@ struct UpscaleSettings {
     float sharpness = 0.0f;
     DlssModel dlss_model = DlssModel::Auto;
     FrameGenKind frame_generation = FrameGenKind::Off;
+    bool ray_reconstruction = true;
     bool operator==(const UpscaleSettings&) const = default;
 };
 
@@ -64,11 +72,13 @@ struct UpscaleImage {
     VkImageUsageFlags usage = 0;
     VkExtent2D extent{};
     VkImageLayout layout = VK_IMAGE_LAYOUT_UNDEFINED;
-    bool Valid() const { return image != VK_NULL_HANDLE; }
+    gpu::ImageHandle handle;
+    bool Valid() const { return image != VK_NULL_HANDLE || static_cast<bool>(handle); }
 };
 
 struct UpscaleDispatch {
     VkCommandBuffer cmd = VK_NULL_HANDLE;
+    gpu::CommandList* list = nullptr;
     UpscaleImage color;
     UpscaleImage depth;
     UpscaleImage motion;
@@ -87,6 +97,13 @@ struct UpscaleDispatch {
     float fov_y = 1.0f;
     bool reset = false;
     uint32_t frame_index = 0;
+    UpscaleImage diffuse_albedo;
+    UpscaleImage specular_albedo;
+    UpscaleImage normal_roughness;
+    UpscaleImage specular_hit_distance;
+    UpscaleImage color_before_transparency;
+    glm::mat4 world_to_view{1.0f};
+    glm::mat4 view_to_clip{1.0f};
 };
 
 struct DeviceFeatureSet {
@@ -105,7 +122,11 @@ struct UpscaleCreate {
     UpscaleQuality quality = UpscaleQuality::Quality;
     DlssModel dlss_model = DlssModel::Auto;
     VkFormat color_format = VK_FORMAT_UNDEFINED;
+    bool ray_reconstruction = false;
+    gpu::CommandList* list = nullptr;
 };
+
+using D3D12UpscaleFactory = std::unique_ptr<class UpscaleBackend> (*)(UpscalerKind kind, gpu::Device& device);
 
 class UpscaleBackend {
 public:
@@ -117,6 +138,22 @@ public:
     virtual bool Dispatch(const UpscaleDispatch& dispatch) = 0;
     virtual void Release() = 0;
     virtual float MipBias(float render_over_display) const;
+    virtual bool RayReconstructionAvailable(std::string& reason) {
+        reason = "only with DLSS";
+        return false;
+    }
+    virtual bool ExternalSubmit() const { return false; }
+    virtual bool ExternalSync(VkSemaphore& signal_semaphore, uint64_t& signal_value, VkSemaphore& wait_semaphore, uint64_t& wait_value) {
+        signal_semaphore = VK_NULL_HANDLE;
+        signal_value = 0;
+        wait_semaphore = VK_NULL_HANDLE;
+        wait_value = 0;
+        return false;
+    }
+    virtual bool ExternalRun(const UpscaleDispatch& dispatch) {
+        (void)dispatch;
+        return false;
+    }
 };
 
 class UpscaleHost : public vk::ContextHooks {
@@ -129,13 +166,27 @@ public:
     void DeviceQueues(VkPhysicalDevice physical, VkSurfaceKHR surface, uint32_t family, std::vector<VkDeviceQueueCreateInfo>& queues) override;
     void DeviceCreated(vk::Context& ctx) override;
     FrameGeneration* FrameGen();
+    FrameGeneration* MetalFxFrameGen();
     FrameGeneration* DlssFrameGenImpl();
+    FrameGeneration* XefgFrameGen();
+    NeuralBackend* Neural();
     const DlssFrameGenSupport& DlssFrameGen() const { return dlss_fg_; }
     void SetMenuOpen(bool open) { menu_open_ = open; }
     bool MenuOpen() const { return menu_open_; }
-    void SetDlssFrameGenFailed(bool failed) { dlss_fg_failed_ = failed; }
+    void SetDlssFrameGenFailed(bool failed) {
+        dlss_fg_failed_ = failed;
+        if (ctx_) {
+            CheckDlssFrameGen();
+        } else if (d3d12_checked_) {
+            CheckDlssFrameGenD3D12(d3d12_vendor_, d3d12_device_id_, d3d12_luid_);
+        }
+    }
+    void CheckDlssFrameGenD3D12(uint32_t vendor_id, uint32_t device_id, const uint8_t (&luid)[8]);
     void FrameTick();
     void Shutdown();
+    void SetD3D12Factory(D3D12UpscaleFactory factory) { d3d12_factory_ = factory; }
+    void SetD3D12Device(gpu::Device* device) { d3d12_device_ = device; }
+    bool D3D12() const { return d3d12_device_ != nullptr; }
     UpscaleBackend* Backend(UpscalerKind kind);
     bool Available(UpscalerKind kind, std::string& reason, bool probe = true);
     bool Enabled(const char* name, bool device) const;
@@ -143,11 +194,17 @@ public:
 
 private:
     void CheckDlssFrameGen();
+    bool d3d12_checked_ = false;
+    uint32_t d3d12_vendor_ = 0;
+    uint32_t d3d12_device_id_ = 0;
+    uint8_t d3d12_luid_[8] = {};
     bool InstanceHas(const char* name) const;
     bool DeviceHas(const char* name) const;
     bool AddExtension(std::vector<const char*>& extensions, const char* name, bool device);
 
     vk::Context* ctx_ = nullptr;
+    gpu::Device* d3d12_device_ = nullptr;
+    D3D12UpscaleFactory d3d12_factory_ = nullptr;
     std::unique_ptr<UpscaleBackend> backends_[static_cast<int>(UpscalerKind::Count)];
     bool probed_[static_cast<int>(UpscalerKind::Count)] = {};
     bool available_[static_cast<int>(UpscalerKind::Count)] = {};
@@ -163,8 +220,14 @@ private:
     uint32_t fg_index_[3] = {};
     VkQueue fg_queue_[3] = {};
     std::unique_ptr<FrameGeneration> frame_gen_;
+    std::unique_ptr<NeuralBackend> neural_;
+    bool neural_created_ = false;
+    std::unique_ptr<FrameGeneration> metalfx_frame_gen_;
+    bool metalfx_frame_gen_created_ = false;
     std::unique_ptr<FrameGeneration> dlss_frame_gen_;
     bool dlss_frame_gen_created_ = false;
+    std::unique_ptr<FrameGeneration> xefg_frame_gen_;
+    bool xefg_frame_gen_created_ = false;
     DlssFrameGenSupport dlss_fg_;
     bool dlss_fg_failed_ = false;
     bool menu_open_ = false;
@@ -180,6 +243,7 @@ private:
 
 std::unique_ptr<UpscaleBackend> CreateFsrBackend(vk::Context& ctx, int generation);
 std::unique_ptr<UpscaleBackend> CreateDlssBackend(vk::Context& ctx);
+std::unique_ptr<UpscaleBackend> CreateMetalfxBackend(vk::Context& ctx);
 std::unique_ptr<UpscaleBackend> CreateStreamlineDlssBackend(vk::Context& ctx);
 uint32_t DlssPresetHint(DlssModel model);
 bool DlssAutoExposure();

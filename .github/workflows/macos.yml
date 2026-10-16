@@ -1,0 +1,102 @@
+# The macOS apps (docs/macos.md): one per CPU architecture, built natively on GitHub's runners, Apple silicon on macos-26 and
+# Intel on macos-15-intel. A published release gets P.T.PC.Port-macOS-arm64.zip and P.T.PC.Port-macOS-x64.zip;
+# the updater discovers these assets directly through the GitHub Releases API (docs/updates.md),
+# so nothing in tools/ci/release.py needs a Mac; run by hand (Actions > macOS > Run workflow) the zips are workflow artifacts.
+name: macOS
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  app:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: arm64
+            cmake_arch: arm64
+            runner: macos-26
+          - arch: x64
+            cmake_arch: x86_64
+            runner: macos-15-intel
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Tools
+        run: brew install ninja shaderc vulkan-headers vulkan-loader
+
+      - name: Version
+        id: version
+        run: |
+          if [ "$GITHUB_EVENT_NAME" = release ]; then
+            version="${GITHUB_REF_NAME#v}"
+          else
+            version="$(sed -n 's/^set(PT_VERSION "\(.*\)")$/\1/p' CMakeLists.txt)"
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      # pt brings the shaders, fonts, MoltenVK and the texture tools into the build folder; pt_release is the shipped game
+      - name: Build
+        env:
+          PT_VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          test "$(uname -m)" = "${{ matrix.cmake_arch }}"
+          cmake -G Ninja -B build/macos -DCMAKE_BUILD_TYPE=RelWithDebInfo -DCMAKE_OSX_ARCHITECTURES=${{ matrix.cmake_arch }}
+          cmake --build build/macos --target pt pt_release
+
+      # the setups' PKG extraction helper (installer/Extractor on the LGPL LibOrbisPkg, unchanged upstream since 2020), for the
+      # game's first-run screen: one signed executable per architecture (tools/ci/publish_extractor.py)
+      - uses: actions/checkout@v7
+        with:
+          repository: maxton/LibOrbisPkg
+          ref: 643477263b2644e0803e0f58b8726ea4e3f3b7d4
+          path: liborbis
+
+      - uses: actions/setup-dotnet@v5
+        with:
+          dotnet-version: 10.0.x
+
+      - name: Extractor
+        run: python3 tools/ci/publish_extractor.py --liborbis liborbis --rid osx-${{ matrix.arch }} --single-file --out build/extractor
+
+      - name: App
+        run: |
+          python3 tools/macos/make_app.py --build build/macos --exe build/macos/pt_release --extractor build/extractor
+          mv dist/pt-port-*-macos-${{ matrix.arch }}.zip dist/P.T.PC.Port-macOS-${{ matrix.arch }}.zip
+          lipo -archs "dist/P.T. PC Port.app/Contents/MacOS/pt"
+
+      # the installer: a disk image with the app and a link to Applications to drag it onto (the zip is the portable app)
+      - name: Disk image
+        run: |
+          mkdir -p dmg && cp -R "dist/P.T. PC Port.app" dmg/ && ln -s /Applications dmg/Applications
+          hdiutil create -volname "P.T. PC Port" -srcfolder dmg -fs HFS+ -format UDZO "dist/P.T.PC.Port-macOS-${{ matrix.arch }}.dmg"
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: P.T.PC.Port-macOS-${{ matrix.arch }}-${{ steps.version.outputs.version }}
+          path: |
+            dist/P.T.PC.Port-macOS-${{ matrix.arch }}.zip
+            dist/P.T.PC.Port-macOS-${{ matrix.arch }}.dmg
+
+  release:
+    if: github.event_name == 'release'
+    needs: app
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v7
+        with:
+          path: zips
+          merge-multiple: true
+
+      - name: Release app assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release upload "$GITHUB_REF_NAME" zips/P.T.PC.Port-macOS-arm64.zip zips/P.T.PC.Port-macOS-x64.zip zips/P.T.PC.Port-macOS-arm64.dmg zips/P.T.PC.Port-macOS-x64.dmg --clobber --repo "$GITHUB_REPOSITORY"

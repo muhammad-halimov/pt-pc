@@ -12,7 +12,7 @@ namespace pt::game {
 constexpr const char* kPcIconAtlas = "ui:pc:button_icons";
 constexpr const char* kPcIconGlow = "ui:pc:button_glow";
 
-enum class PromptButton : uint8_t { Cross, Circle, Square, Triangle, Options, DpadUpDown, DpadLeftRight, L1, R1 };
+enum class PromptButton : uint8_t { Cross, Circle, Square, Triangle, Options, DpadUpDown, DpadLeftRight, L1, R1, Select };
 
 struct Prompt {
     PromptButton button = PromptButton::Cross;
@@ -30,5 +30,7 @@ struct PromptGlyph {
     float body_height = 0.4f;
     bool original = false;
 };
+
+std::string SteamPromptGlyphName(const Prompt& prompt, const PromptStyle& style);
 
 }

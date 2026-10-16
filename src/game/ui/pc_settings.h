@@ -16,7 +16,10 @@ struct PcSettingRow {
     bool wrap = true;
     bool action = false;
     bool link = false;
+    int label_lines = 1;
     std::string note;
+    std::string confirm_note;
+    bool confirm_default_yes = false;
     std::vector<std::string> value_notes;
     bool ValueDisabled(int v) const { return v >= 0 && v < static_cast<int>(value_notes.size()) && !value_notes[v].empty(); }
 };
@@ -30,6 +33,7 @@ struct PcSettingSection {
 struct PcPanel {
     std::string texture;
     bool string = false;
+    float aspect = 0.0f;
     std::string photo;
     std::string file;
     std::vector<std::string> lines;
@@ -38,12 +42,20 @@ struct PcPanel {
     std::string thumbnail;
     std::string caption;
     bool locked = false;
+    bool audio = false;
+    bool music = false;
+    float music_position = 0.0f;
+    float music_length = 0.0f;
+    bool music_playing = false;
+    bool music_loop = false;
     float lift = 1.0f;
     bool Empty() const { return texture.empty() && photo.empty() && file.empty() && lines.empty() && thumbnail.empty(); }
     bool HasPicture() const { return !texture.empty() || !photo.empty() || !file.empty() || !thumbnail.empty(); }
 };
 
 enum class PcGallery : uint8_t { None, Halls, Wall };
+
+enum class PcMusicCommand : uint8_t { PlayPause, SeekBy, SeekTo, Restart, Loop };
 
 class PcSettingsSource {
 public:
@@ -74,10 +86,21 @@ public:
     virtual bool FullScreen() const { return false; }
     virtual std::string_view FullScreenHint() const { return {}; }
     virtual void CursorMoved() {}
+    virtual void Music(int, PcMusicCommand, float) {}
     virtual int TakeCursor() { return -1; }
     virtual bool KeepsCursor() const { return false; }
     virtual std::vector<std::string> PreviewFiles(int) const { return {}; }
     virtual std::string_view Credit() const { return {}; }
+    virtual std::string_view Question() const { return {}; }
+    virtual bool FindSettingRow(std::string_view, PcSettingRow&) { return false; }
+    virtual int TabCount() const { return 0; }
+    virtual int Tab() const { return 0; }
+    virtual std::string_view TabLabel(int) const { return {}; }
+    virtual std::string_view TabNote(int) const { return {}; }
+    virtual void SelectTab(int) {}
+    virtual void Donate() {}
+    virtual void MenuShown() {}
+    virtual bool ShowSettingPage(std::string_view) { return false; }
 };
 
 std::vector<std::string_view> PcDescriptionKeys();

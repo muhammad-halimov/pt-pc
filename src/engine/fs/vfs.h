@@ -17,6 +17,7 @@ namespace pt {
 
 class Vfs {
 public:
+    int MissingCorePackages() const;
     bool Mount(const std::filesystem::path& game_dir);
 
     const std::filesystem::path& GameDir() const { return game_dir_; }
@@ -30,6 +31,7 @@ public:
     void UnloadPackage(std::string_view path);
 
     std::optional<std::vector<uint8_t>> ReadFile(std::string_view path) const;
+    std::optional<std::vector<uint8_t>> ReadFileUntraced(std::string_view path) const;
 
 private:
     void ReportDataDifferences() const;

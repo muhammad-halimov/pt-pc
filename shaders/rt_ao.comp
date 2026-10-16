@@ -1,7 +1,9 @@
 #version 460
 #extension GL_EXT_ray_query : require
+#ifndef PT_D3D12
 #extension GL_EXT_buffer_reference : require
 #extension GL_EXT_buffer_reference_uvec2 : require
+#endif
 #include "common.glsl"
 #include "rt_shadow.glsl"
 
@@ -79,6 +81,9 @@ void main() {
         float below = dot(dir, ng);
         if (below < 0.0) {
             dir -= 2.0 * below * ng;
+        }
+        if (!RtRayValid(origin, dir, reach)) {
+            continue;
         }
         rayQueryEXT rq;
         rayQueryInitializeEXT(rq, rt_casters, gl_RayFlagsNoneEXT, 8u, origin, 0.0, dir, reach);

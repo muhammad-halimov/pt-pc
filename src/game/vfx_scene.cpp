@@ -312,7 +312,9 @@ void VfxScene::SyncStages(Game& game) {
                     loc.entity = &e;
                     loc.file = &f;
                     loc.file_transform = f.WorldTransform(e);
-                    loc.seed = static_cast<uint32_t>(StrCode64(f.EntityName(e))) | 1u;
+                    if (f.GetBool(e, "enableUserRandomSeed")) {
+                        loc.seed = f.GetUInt(e, "userRandomSeed");
+                    }
                     preload_.push_back(loc.path);
                     entry.locators.push_back(std::move(loc));
                 }
@@ -562,7 +564,10 @@ void VfxScene::SyncGimmicks(Game& game) {
                     continue;
                 }
                 if (spawn) {
-                    const uint32_t seed = part.seed ? part.seed + static_cast<uint32_t>(c) : static_cast<uint32_t>(game.Frame() * 2654435761u) | 1u;
+                    std::optional<uint32_t> seed;
+                    if (part.seed) {
+                        seed = part.seed + static_cast<uint32_t>(c);
+                    }
                     system_.Spawn(key, part.file, world, seed);
                     if (c == 0 && part.sound) {
                         part.sound_at = glm::vec3(world[3]);
@@ -716,6 +721,7 @@ void VfxScene::Prepare(Game& game, const Camera& camera, float aspect, SceneLigh
 
 void VfxScene::PrepareList(Game& game, const Camera& camera, float aspect, SceneLighting& lighting, VfxPass& pass, float blend) {
     (void)game;
+    static const bool trace_log = std::getenv("PT_VFX_TRACE_LOG") != nullptr;
     static const bool disabled = [] {
         const char* v = std::getenv("PT_VFX");
         return v && v[0] == '0';
@@ -766,26 +772,30 @@ void VfxScene::PrepareList(Game& game, const Camera& camera, float aspect, Scene
         preload_.clear();
         pass.DecodeAhead(ahead);
     }
+    system_.SetLightsReady([&lighting](const std::vector<vfx::LightOut>& built) {
+        for (const vfx::LightOut& l : built) {
+            lighting.lights.push_back(ToSceneLight(l));
+        }
+    });
     const auto build_started = std::chrono::steady_clock::now();
     system_.Build(view, textures, cubes, probe, list, lights, blend);
+    system_.SetLightsReady({});
     const auto build_done = std::chrono::steady_clock::now();
     preload_ms_ = std::chrono::duration<double, std::milli>(build_started - preload_started).count();
     build_ms_ = std::chrono::duration<double, std::milli>(build_done - build_started).count();
-    for (const vfx::LightOut& l : lights) {
-        lighting.lights.push_back(ToSceneLight(l));
-    }
-    if (++prepared_ % 300 == 1) {
+    const bool periodic_log = ++prepared_ % 300 == 1;
+    if (trace_log || periodic_log) {
         size_t layers[3] = {0, 0, 0};
         for (const vfx::Draw& d : list.draws) {
             layers[static_cast<int>(d.layer)] += d.count;
         }
         LogDebug("vfx: frame quads world {} flare {} screen {}, {} lights", layers[0], layers[1], layers[2], lights.size());
-        if (std::getenv("PT_VFX_DEBUG")) {
+        if (trace_log || std::getenv("PT_VFX_DEBUG")) {
             static const size_t shown = std::getenv("PT_VFX_DEBUG_QUADS") ? std::strtoul(std::getenv("PT_VFX_DEBUG_QUADS"), nullptr, 10) : 8;
             for (size_t i = 0; i < std::min<size_t>(list.quads.size(), shown); ++i) {
                 const vfx::Quad& q = list.quads[i];
-                LogDebug("vfx: quad {} ({:.2f} {:.2f} {:.2f}) ({:.2f} {:.2f} {:.2f}) color ({:.3f} {:.3f} {:.3f} {:.3f}) tex {} flags {:#x} "
-                         "corners 1 2 ({:.2f} {:.2f} {:.2f}) ({:.2f} {:.2f} {:.2f}) uv ({:.4f} {:.4f} {:.4f} {:.4f}) params ({:.3f} {:.3f} {:.3f} {:.3f})",
+                LogDebug("vfx: quad {} ({:.6f} {:.6f} {:.6f}) ({:.6f} {:.6f} {:.6f}) color ({:.3f} {:.3f} {:.3f} {:.3f}) tex {} flags {:#x} "
+                         "corners 1 2 ({:.6f} {:.6f} {:.6f}) ({:.6f} {:.6f} {:.6f}) uv ({:.4f} {:.4f} {:.4f} {:.4f}) params ({:.3f} {:.3f} {:.3f} {:.3f})",
                          i, q.corner[0].x, q.corner[0].y, q.corner[0].z, q.corner[3].x, q.corner[3].y, q.corner[3].z, q.color.r, q.color.g,
                          q.color.b, q.color.a, q.info.x, q.info.y, q.corner[1].x, q.corner[1].y, q.corner[1].z, q.corner[2].x, q.corner[2].y,
                          q.corner[2].z, q.uv.x, q.uv.y, q.uv.z, q.uv.w, q.params.x, q.params.y, q.params.z, q.params.w);

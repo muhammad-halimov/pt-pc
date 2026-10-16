@@ -20,10 +20,14 @@ struct StaticModelPlacement {
     glm::vec4 color{1.0f};
     bool visible_geom = false;
     int draw_rejection_level = 0;
+    std::string mod_collision;
 };
 
 struct LightPlacement {
     std::string name;
+    bool mod_off = false;
+    glm::vec3 mod_tint{1.0f};
+    float mod_brightness = 1.0f;
     const fox2::Entity* entity = nullptr;
     std::string class_name;
     glm::mat4 world{1.0f};

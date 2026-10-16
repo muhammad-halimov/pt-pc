@@ -1,6 +1,24 @@
+#ifdef PT_SHADOW_GATHER
+/* macOS (docs/macos.md): a comparison sampler on images[] makes SPIRV-Cross declare the whole array depth2d, and Metal then reads the
+   G-buffer through it as one channel (normal (r, r, r)); the sampler's bilinear 2x2 LESS comparison from a gather instead */
 float ShadowTap(vec2 uv, float zref) {
-    return texture(sampler2DShadow(images[IMG_SHADOW], samplers[SMP_SHADOW]), vec3(uv, zref));
+    vec4 d = textureGather(sampler2D(images[IMG_SHADOW], samplers[SMP_POINT_CLAMP]), uv, 0);
+    vec2 f = fract(uv * ImgSize(IMG_SHADOW) - 0.5);
+    vec4 lit = vec4(lessThan(vec4(zref), d));
+    return mix(mix(lit.w, lit.z, f.x), mix(lit.x, lit.y, f.x), f.y);
 }
+#else
+#ifdef PT_D3D12
+/* D3D12: the comparison sampler is not one of samplers[] (common.glsl); the host binds a SamplerComparisonState here (LESS, linear) */
+layout(set = 1, binding = 6) uniform samplerShadow shadow_sampler;
+#define PT_SHADOW_SAMPLER shadow_sampler
+#else
+#define PT_SHADOW_SAMPLER samplers[SMP_SHADOW]
+#endif
+float ShadowTap(vec2 uv, float zref) {
+    return texture(sampler2DShadow(images[IMG_SHADOW], PT_SHADOW_SAMPLER), vec3(uv, zref));
+}
+#endif
 
 vec2 Dither2x2(vec3 frag) {
     return vec2(fract(0.5 * (frag.x - 0.5)) >= 0.3 ? 1.0 : -1.0, fract(0.5 * (frag.y - 0.5)) >= 0.3 ? 1.0 : -1.0);
@@ -76,18 +94,33 @@ struct Surface {
     float translucency;
 };
 
+#ifdef PT_RT_FULL
+vec3 g_full_n = vec3(0.0);
+float g_full_shadow_cone = 1.0;
+bool g_full_lit = false;
+#endif
 #if defined(PT_RT_SHADOWS) || defined(PT_RT_CONTACT)
 float g_contact_reach = 0.0;
 bool g_contact_legacy = false;
+uint g_contact_samples = 0u;
 #endif
 
 bool EvaluateLight(Light l, View v, Surface s, bool shadows, vec2 frag, out vec3 diffuse, out vec3 specular) {
     const vec3 dither_frag = vec3(frag, v.exposure.w);
     diffuse = vec3(0.0);
     specular = vec3(0.0);
-    if (l.info.z != 0) {
+    if (l.info.z == 1) {
         vec3 q = (l.area * vec4(s.world, 1.0)).xyz;
         if (1.0 - max(abs(q.z), max(abs(q.x), abs(q.y))) < 0.0) {
+            return false;
+        }
+    } else if (l.info.z == 2) {
+        vec4 q = l.area * vec4(s.world, 1.0);
+        if (q.w <= 0.0) {
+            return false;
+        }
+        vec3 aperture = q.xyz / q.w;
+        if (0.5 - max(abs(aperture.z), max(abs(aperture.x), abs(aperture.y))) < 0.0) {
             return false;
         }
     }
@@ -112,7 +145,24 @@ bool EvaluateLight(Light l, View v, Surface s, bool shadows, vec2 frag, out vec3
     if (length(radiance) <= 1.0e-4) {
         return false;
     }
+#ifdef PT_LIGHT_GBUFFER_LATE
+    {
+        ivec2 pixel = ivec2(frag);
+        vec4 g_normal = ImgFetch(IMG_NORMAL, pixel);
+        vec4 g_material = ImgFetch(IMG_MATERIAL, pixel);
+        s.N = DecodeNormal(g_normal.xyz);
+        s.roughness = g_material.x;
+        s.specular = g_material.y;
+        s.material_u = g_material.z;
+        s.translucency = g_material.w;
+    }
+#endif
     float shadow = 1.0;
+#ifdef PT_RT_FULL
+    g_full_n = s.translucency > 0.0 ? vec3(0.0) : normalize(mat3(v.inv_view) * s.N);
+    g_full_shadow_cone = shadow_cone;
+    g_full_lit = dot(s.N, L) > 0.0 || s.translucency > 0.0;
+#else
     if (l.info.x >= 0 && shadows) {
 #ifdef PT_RT_SHADOWS
         if (dot(s.N, L) > 0.0 || s.translucency > 0.0) {
@@ -123,16 +173,26 @@ bool EvaluateLight(Light l, View v, Surface s, bool shadows, vec2 frag, out vec3
         shadow = spot ? SpotShadow(l, v, s.world, shadow_cone, dither_frag) : PointShadow(l, v, s.P, dither_frag);
 #endif
     }
+#endif
     float vis = 1.0 + l.scales.z * (shadow - 1.0);
 #if defined(PT_RT_SHADOWS) || defined(PT_RT_CONTACT)
     if (g_contact_reach > 0.0 && l.scales.w > 0.0 && (g_contact_legacy || l.scales.z > 0.0) && (dot(s.N, L) > 0.0 || s.translucency > 0.0)) {
-        float t = RtContactDistance(l, s.world, normalize(mat3(v.inv_view) * s.N), g_contact_reach);
-        if (t >= 0.0) {
-            if (g_contact_legacy) {
-                vis *= 1.0 - Saturate(2.0 * (1.0 - t / g_contact_reach));
-            } else {
-                float contact = 1.0 - shadow_cone * (1.0 - smoothstep(0.0, g_contact_reach, t));
+        vec3 n_world = normalize(mat3(v.inv_view) * s.N);
+        if (g_contact_samples > 0u && !g_contact_legacy) {
+            float contact = RtContactSoft(l, s.world, n_world, s.translucency > 0.0, g_contact_reach, shadow_cone, g_contact_samples, frag,
+                                          v.exposure.w);
+            if (contact < 1.0) {
                 vis = 1.0 + l.scales.z * (min(shadow, contact * contact) - 1.0);
+            }
+        } else {
+            float t = RtContactDistance(l, s.world, n_world, g_contact_reach);
+            if (t >= 0.0) {
+                if (g_contact_legacy) {
+                    vis *= 1.0 - Saturate(2.0 * (1.0 - t / g_contact_reach));
+                } else {
+                    float contact = 1.0 - shadow_cone * (1.0 - smoothstep(0.0, g_contact_reach, t));
+                    vis = 1.0 + l.scales.z * (min(shadow, contact * contact) - 1.0);
+                }
             }
         }
     }
@@ -143,7 +203,7 @@ bool EvaluateLight(Light l, View v, Surface s, bool shadows, vec2 frag, out vec3
         if (c.w > 0.0) {
             vec2 uv = vec2(0.5 * c.x / c.w + 0.5, 1.0 - (0.5 * c.y / c.w + 0.5));
             if (l.info.w > 0) {
-                mask = textureLod(textures[nonuniformEXT(uint(l.info.w - 1))], uv, 0.0).rgb;
+                mask = textureLod(PT_TEX2D(uint(l.info.w - 1)), uv, 0.0).rgb;
             } else {
                 mask = ImgLod(uint(l.info.y), SMP_LINEAR_WRAP, uv, 0.0).rgb;
             }

@@ -27,6 +27,7 @@ constexpr uint32_t kHashCorrectionType = 0xE210591C;
 constexpr uint32_t kHashCorrectionOffset = 0xBA7C713E;
 constexpr uint32_t kHashFollowOffset = 0x73D22AD2;
 constexpr uint32_t kHashFollowYaw = 0x849D3E0C;
+constexpr uint32_t kHashFollowRotation = 0x1ACEBD89;
 constexpr uint32_t kHashLumAtMin = 0xAB96FA51;
 constexpr uint32_t kHashLumAtMax = 0xFC08FF2F;
 constexpr uint32_t kHashLiquidCube = 0x23E90E5F;
@@ -120,6 +121,9 @@ private:
         f.angle = n.Float(kHashFlareAngle, 360.0f);
         f.shape_limit = n.Bool(kHashFlareShapeLimit);
         f.depth_tolerance = n.Float(kHashFlareTolerance);
+        if (f.lens_flare == "fx_sh_lfrlgt02") {
+            f.depth_tolerance = 1.0f;
+        }
         def_.flares.push_back(std::move(f));
     }
 
@@ -408,6 +412,7 @@ private:
             m.ambient_rate = n.Float("ambientRate", 1.0f);
             m.directional_rate = n.Float("directionalLightRate");
             m.point_rate = n.Float("pointLightRate");
+            m.point_lights = std::clamp(n.UInt("shaderType") + 1u, 1u, 3u);
         } else if (cls == "TppLiquidMaterial2Node" || cls == "TppLiquidMaterial2HNMNode") {
             m.kind = MaterialKind::Liquid;
             m.blend = BlendMode::Alpha;
@@ -500,7 +505,7 @@ private:
         if (cls == "FxConstVectorNode") {
             e.op = ExprOp::Const;
             e.v0 = Degrees(n.Vec4("vector"), n.UInt("vectorType") == 1) * n.Float("force", 1.0f);
-            e.flags = n.Bool("global") ? 1u : 0u;
+            e.flags = (n.Bool("global") ? 1u : 0u) | (n.UInt("vectorType") == 1 ? 8u : 0u);
         } else if (cls == "FxColorVectorNode") {
             e.op = ExprOp::Const;
             e.v0 = n.Vec4("color");
@@ -510,7 +515,7 @@ private:
             const float force = n.Float("force", 1.0f);
             e.v0 = Degrees(n.Vec4("randomMin"), rot) * force;
             e.v1 = Degrees(n.Vec4("randomMax"), rot) * force;
-            e.flags = (n.Bool("xySquere") ? 2u : 0u) | (n.Bool("global") ? 1u : 0u);
+            e.flags = (n.Bool("xySquere") ? 2u : 0u) | (n.Bool("global") ? 1u : 0u) | (rot ? 8u : 0u);
             e.seed = n.UInt("randomGatherSeedValue");
             e.seed_type = static_cast<uint8_t>(n.UInt("randomGatherType"));
             e.slot = static_cast<int32_t>(NewSlot());
@@ -599,12 +604,13 @@ private:
             e.in[0] = Input(n, 0);
             e.v0 = n.Vec4(kHashFollowOffset);
             e.v0.w = 0.0f;
-            e.flags = n.Bool(kHashFollowYaw) ? 1u : 0u;
+            e.flags = (n.Bool(kHashFollowYaw) ? 1u : 0u) | (n.Bool(kHashFollowRotation) ? 2u : 0u);
             e.world = true;
         } else if (cls == "FxCenterScrollVectorNode") {
             e.op = ExprOp::CenterScroll;
             e.in[0] = Input(n, 0);
             e.v0 = n.Vec4("range", glm::vec4(1.0f));
+            e.flags = n.Bool(0xAA90B6B2) ? 1u : 0u;
             e.world = e.in[0] >= 0 && def_.exprs[e.in[0]].world;
             if (e.in[0] >= 0 && def_.exprs[e.in[0]].op == ExprOp::CameraFollow) {
                 e.v1 = def_.exprs[e.in[0]].v0;
@@ -645,6 +651,7 @@ private:
                              random_force ? force - range : force, random_force ? force + range : force);
             e.v1 = n.Vec4(kHashSpreadRotation, glm::vec4(0.0f, 0.0f, 0.0f, 1.0f));
             e.mode = (n.Bool(kHashSpreadFixedElevation) ? 1u : 0u) | (n.Bool(kHashSpreadEvenAngles) ? 2u : 0u);
+            e.flags = n.Bool("global") ? 1u : 0u;
             e.seed = n.UInt("randomGatherSeedValue");
             e.seed_type = static_cast<uint8_t>(n.UInt("randomGatherType"));
             e.slot = static_cast<int32_t>(NewSlot());

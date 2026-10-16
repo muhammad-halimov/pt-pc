@@ -28,6 +28,7 @@ struct SaveProgress {
     uint32_t photo_word = 0;
     bool game_plus = false;
     uint32_t finishes = 0;
+    uint32_t gameplus_announced = 0;
 };
 
 struct SaveFile {

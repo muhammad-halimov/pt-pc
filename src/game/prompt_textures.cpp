@@ -1,3 +1,4 @@
+#include "engine/platform/os.h"
 #include "game/prompt_textures.h"
 
 #include <glm/glm.hpp>
@@ -280,9 +281,9 @@ void Dump(const char* path, const std::string& variant, const FtexTexture& ftex,
     const int width = static_cast<int>(ftex.width);
     std::string stem = FtexStem(path);
     stem = stem.substr(stem.find_last_of('/') + 1);
-    const std::filesystem::path whole = std::filesystem::path(dump) / std::format("{}_level0.png", stem);
+    const std::filesystem::path whole = pt::os::PathFromUtf8(pt::os::GetEnv("PT_PROMPT_TEXTURE_DUMP")) / std::format("{}_level0.png", stem);
     if (!std::filesystem::exists(whole)) {
-        stbi_write_png(whole.string().c_str(), width, static_cast<int>(ftex.height), 4, before.data(), width * 4);
+        stbi_write_png(pt::os::PathToUtf8(whole).c_str(), width, static_cast<int>(ftex.height), 4, before.data(), width * 4);
     }
     for (size_t b = 0; b < boxes.size(); ++b) {
         const Box& box = boxes[b];
@@ -290,8 +291,8 @@ void Dump(const char* path, const std::string& variant, const FtexTexture& ftex,
         for (int y = 0; y < box.Height(); ++y) {
             std::copy_n(&after[(static_cast<size_t>(box.y0 + y) * width + box.x0) * 4], box.Width() * 4, &crop[static_cast<size_t>(y) * box.Width() * 4]);
         }
-        const std::filesystem::path file = std::filesystem::path(dump) / std::format("{}_{}_{}.png", stem, variant, b);
-        stbi_write_png(file.string().c_str(), box.Width(), box.Height(), 4, crop.data(), box.Width() * 4);
+        const std::filesystem::path file = pt::os::PathFromUtf8(pt::os::GetEnv("PT_PROMPT_TEXTURE_DUMP")) / std::format("{}_{}_{}.png", stem, variant, b);
+        stbi_write_png(pt::os::PathToUtf8(file).c_str(), box.Width(), box.Height(), 4, crop.data(), box.Width() * 4);
     }
 }
 
@@ -321,7 +322,7 @@ void PromptTextures::Init(Vfs& vfs, TextureManager& textures, bool background) {
 }
 
 std::string PromptTextures::VariantFor(const PromptStyle& style) const {
-    if (style.device == PromptDevice::PlayStation) {
+    if (style.device == PromptDevice::PlayStation || style.device == PromptDevice::Steam) {
         return {};
     }
     if (style.device == PromptDevice::Keyboard) {

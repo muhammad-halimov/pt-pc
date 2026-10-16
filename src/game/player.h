@@ -30,6 +30,8 @@ struct PlayerFrameContext {
     bool invert_x = false;
     bool invert_y = false;
     bool peephole_theater = false;
+    bool peephole_center_valid = false;
+    float peephole_center_yaw = 0.0f;
 };
 
 class PadLocks {
@@ -37,6 +39,7 @@ public:
     void Add(char set, const std::string& key, uint32_t mask);
     void Remove(char set, const std::string& key);
     uint32_t Mask(char set) const;
+    uint32_t MaskExcept(char set, const std::string& key) const;
     bool Any() const { return !a_.empty() || !b_.empty() || !c_.empty(); }
     std::string Describe() const;
 
@@ -50,6 +53,7 @@ private:
 class Player {
 public:
     static constexpr float kFilmHeightMm = 13.5f;
+    static constexpr float kZoomHeld = 1.35f;
     /* 0x98726E: the walk ends on the second frame after the stick drops under 0.1, which the stop timing in the captures confirms. */
     static constexpr float kStandDebounce = 0.06673333f;
     static constexpr float kPitchUp = 1.2217305f;
@@ -92,6 +96,7 @@ public:
     }
     std::string DescribeDrawPose() const;
     glm::vec2 LightStick() const { return light_stick_; }
+    glm::vec2 DemoLightStick(const InputState& input, bool invert_x, bool invert_y) const;
     float TakeVrTurn() { return std::exchange(vr_turn_, 0.0f); }
     void SetScriptPitch(float value) {
         pitch = target_pitch = ClampPitch(value);
@@ -125,6 +130,9 @@ public:
 
     void SetDisableLeftStick(bool disable);
     void Warp(const glm::vec3& position, float fox_yaw);
+    void DemoWarp(const glm::vec3& position, float fox_yaw);
+    void DemoHeldFrame(const InputState& input);
+    glm::vec3 FollowHead(const CollisionWorld& world, const glm::vec3& displacement);
     void HandCameraBack(const glm::vec3& position, float yaw_value, float pitch_value);
     void FollowCamera(float yaw_value, float pitch_value);
 
@@ -150,6 +158,7 @@ private:
     void UpdateLook(float dt, const InputState& input, const PlayerFrameContext& context);
     void UpdateZoom(float dt, const PlayerFrameContext& context);
     void LocomotionFrame(const PlayerFrameContext& context);
+    void StepStandWalk(float magnitude, bool left_locked);
     void UpdateBody(float dt, const CollisionWorld& world);
     void UpdateEye(float dt);
     void ResetLocomotion();
@@ -234,7 +243,7 @@ private:
     bool standing_ = true;
     float idle_timer_ = 0.0f;
     float left_lock_timer_ = 0.0f;
-    float zoom_target_ = 1.35f;
+    float zoom_target_ = kZoomHeld;
     float zoom_velocity_ = 1.0f;
     bool zoom_active_ = false;
     bool zoom_falling_ = false;

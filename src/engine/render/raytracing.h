@@ -2,6 +2,8 @@
 
 #include <glm/glm.hpp>
 
+#include <chrono>
+#include <memory>
 #include <cstdint>
 #include <span>
 #include <unordered_map>
@@ -9,7 +11,9 @@
 
 #include "engine/render/gpu_types.h"
 #include "engine/render/mesh.h"
+#include "engine/render/gpu/gpu_device.h"
 #include "engine/render/renderer.h"
+#include "engine/render/vk/vk_device.h"
 #include "engine/render/vk_context.h"
 
 namespace pt {
@@ -20,6 +24,11 @@ struct RayTracingSettings {
     bool ambient_occlusion = false;
     bool contact_shadows = false;
     bool reflections = false;
+    bool full = false;
+    bool full_shadows = true;
+    bool bounce_light = true;
+    bool glossy_reflections = true;
+    bool path_traced = false;
     bool operator==(const RayTracingSettings&) const = default;
 };
 
@@ -32,6 +41,7 @@ struct RtCaster {
     uint8_t mask = 3;
     bool alpha_test = false;
     bool double_sided = false;
+    bool fitting = false;
 };
 
 struct RtStats {
@@ -46,16 +56,52 @@ struct RtStats {
 
 class RayTracing {
 public:
-    bool Init(vk::Context& ctx, VkDescriptorSetLayout textures_layout, VkDescriptorSetLayout frame_layout);
-    void Shutdown();
-    void Forget(const GpuMesh& mesh);
-    void Build(VkCommandBuffer cmd, uint32_t slot, std::span<const RtCaster> casters);
-    void SetReflectionImage(VkImageView view, VkSampler sampler);
+    virtual ~RayTracing() = default;
+    virtual bool Init(gpu::Device& device, gpu::BindingLayoutHandle textures_layout, gpu::BindingLayoutHandle frame_layout) = 0;
+    virtual void Shutdown() = 0;
+    virtual void Forget(const GpuMesh& mesh) = 0;
+    virtual bool Build(gpu::CommandList& cmd, uint32_t slot, std::span<const RtCaster> casters) = 0;
+    virtual bool Valid(uint32_t slot) const = 0;
+    virtual bool Ready(uint32_t slot) const = 0;
+    virtual void SetReflectionImage(gpu::ImageViewHandle view, gpu::SamplerHandle sampler) = 0;
     static constexpr uint32_t kAoImages = 5;
-    void SetAoImages(std::span<const VkImageView> views);
-    VkPipelineLayout Layout() const { return layout_; }
-    VkDescriptorSet Set(uint32_t slot) const { return slots_[slot].set; }
-    const RtStats& Stats() const { return stats_; }
+    virtual void SetAoImages(std::span<const gpu::ImageViewHandle> views) = 0;
+    static constexpr uint32_t kFullImages = 17;
+    static constexpr uint32_t kFullDepthFirst = 4;
+    static constexpr uint32_t kFullDepthImages = 2;
+    virtual void SetFullImages(std::span<const gpu::ImageViewHandle> views) = 0;
+    static constexpr uint32_t kPathImages32 = 4;
+    static constexpr uint32_t kPathImages16 = 11;
+    virtual void SetPathImages(std::span<const gpu::ImageViewHandle> views32, std::span<const gpu::ImageViewHandle> views16) = 0;
+    virtual gpu::BufferResource PathRemap(uint32_t slot) const = 0;
+    virtual gpu::PipelineLayoutHandle Layout() const = 0;
+    virtual gpu::BufferResource LightState(uint32_t slot) const = 0;
+    virtual gpu::BindingSetHandle Set(uint32_t slot) const = 0;
+    virtual const RtStats& Stats() const = 0;
+};
+
+using RayTracingFactory = std::unique_ptr<RayTracing> (*)(gpu::Device& device);
+void SetD3D12RayTracingFactory(RayTracingFactory factory);
+bool D3D12RayTracingAvailable();
+std::unique_ptr<RayTracing> CreateRayTracing(gpu::Device& device);
+
+class VkRayTracing final : public RayTracing {
+public:
+    bool Init(gpu::Device& device, gpu::BindingLayoutHandle textures_layout, gpu::BindingLayoutHandle frame_layout) override;
+    void Shutdown() override;
+    void Forget(const GpuMesh& mesh) override;
+    bool Build(gpu::CommandList& cmd, uint32_t slot, std::span<const RtCaster> casters) override;
+    bool Valid(uint32_t slot) const override { return slots_[slot].valid; }
+    bool Ready(uint32_t slot) const override;
+    void SetReflectionImage(gpu::ImageViewHandle view, gpu::SamplerHandle sampler) override;
+    void SetAoImages(std::span<const gpu::ImageViewHandle> views) override;
+    void SetFullImages(std::span<const gpu::ImageViewHandle> views) override;
+    void SetPathImages(std::span<const gpu::ImageViewHandle> views32, std::span<const gpu::ImageViewHandle> views16) override;
+    gpu::BufferResource PathRemap(uint32_t slot) const override { return gpu::vk::ToGpu(slots_[slot].path_remap); }
+    gpu::PipelineLayoutHandle Layout() const override { return gpu::vk::Wrap<gpu::PipelineLayoutTag>(layout_); }
+    gpu::BufferResource LightState(uint32_t slot) const override { return gpu::vk::ToGpu(slots_[slot].light_state); }
+    gpu::BindingSetHandle Set(uint32_t slot) const override { return gpu::vk::Wrap<gpu::BindingSetTag>(slots_[slot].set); }
+    const RtStats& Stats() const override { return stats_; }
 
 private:
     struct Blas {
@@ -78,7 +124,10 @@ private:
         std::vector<VkAccelerationStructureKHR> dynamic;
         std::vector<vk::Buffer> retired;
         VkDescriptorSet set = VK_NULL_HANDLE;
+        vk::Buffer light_state;
+        vk::Buffer path_remap;
         bool written = false;
+        bool valid = false;
     };
 
     struct BuildJob {
@@ -86,12 +135,15 @@ private:
         VkAccelerationStructureBuildRangeInfoKHR range{};
         VkAccelerationStructureBuildGeometryInfoKHR info{VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_BUILD_GEOMETRY_INFO_KHR};
         VkDeviceSize scratch = 0;
+        Blas* owner = nullptr;
     };
 
     bool EnsureBuffer(Slot& slot, vk::Buffer& buffer, VkDeviceSize size, VkBufferUsageFlags usage, bool host_visible);
     VkDeviceAddress Address(const vk::Buffer& buffer) const;
+    VkDeviceAddress Address(const gpu::BufferResource& buffer) const { return Address(gpu::vk::FromGpu(buffer)); }
     VkAccelerationStructureGeometryKHR Triangles(VkDeviceAddress vertices, VkDeviceSize stride, uint32_t vertex_count, VkDeviceAddress indices) const;
-    void RunJobs(VkCommandBuffer cmd, Slot& slot, std::vector<BuildJob>& jobs);
+    bool RunJobs(VkCommandBuffer cmd, Slot& slot, std::vector<BuildJob>& jobs);
+    void BackOff(const char* what);
     const Blas* StaticBlas(const GpuMesh& mesh, uint32_t submesh, std::vector<BuildJob>& jobs);
     void WriteSet(Slot& slot);
 
@@ -104,6 +156,7 @@ private:
     Slot slots_[Renderer::kFramesInFlight];
     std::unordered_map<const GpuMesh*, std::vector<Blas>> static_;
     RtStats stats_;
+    std::chrono::steady_clock::time_point retry_after_{};
 };
 
 }

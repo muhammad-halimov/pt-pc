@@ -1,5 +1,6 @@
 #pragma once
 
+#include <array>
 #include <cstdint>
 #include <filesystem>
 #include <map>
@@ -57,9 +58,43 @@ private:
     std::unordered_map<std::string, Hit> files_;
 };
 
+struct LevelEdit {
+    std::string mod;
+    std::string stage;
+    std::string model;
+    std::string light;
+    bool hide = false;
+    bool collision = true;
+    std::array<float, 3> move{0.0f, 0.0f, 0.0f};
+    std::array<float, 3> turn{0.0f, 0.0f, 0.0f};
+    std::array<float, 3> scale{1.0f, 1.0f, 1.0f};
+    std::string replace;
+    bool off = false;
+    std::array<float, 3> tint{1.0f, 1.0f, 1.0f};
+    float brightness = 1.0f;
+};
+
+struct LevelAdd {
+    std::string mod;
+    std::string stage;
+    std::string model;
+    std::string name;
+    std::array<float, 3> at{0.0f, 0.0f, 0.0f};
+    std::array<float, 3> turn{0.0f, 0.0f, 0.0f};
+    std::array<float, 3> scale{1.0f, 1.0f, 1.0f};
+    std::string collision = "box";
+};
+
+bool ParseLevel(std::string_view json, const std::string& mod, std::vector<LevelEdit>& edits, std::vector<LevelAdd>& adds,
+                std::vector<std::string>* warnings, std::string* error = nullptr);
+bool LevelStageMatches(std::string_view pattern, std::string_view package_path);
+bool LevelNameMatches(std::string_view pattern, std::string_view name);
+
 struct ModSet {
     std::vector<Mod> mods;
     OverrideIndex index;
+    std::vector<LevelEdit> level_edits;
+    std::vector<LevelAdd> level_adds;
 };
 
 std::unique_ptr<ModSet> Load(const std::filesystem::path& dir, const std::map<std::string, bool>& overrides,
@@ -69,6 +104,7 @@ void SetActive(const ModSet* set);
 const ModSet* Active();
 
 std::optional<std::vector<uint8_t>> ReadOverride(std::string_view asset_path);
+void RegisterGenerated(std::string asset_path, std::vector<uint8_t> bytes);
 std::optional<std::vector<uint8_t>> ReadDiskFile(const std::filesystem::path& path);
 
 }

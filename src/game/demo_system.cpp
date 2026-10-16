@@ -6,6 +6,7 @@
 #include <cmath>
 #include <cstring>
 #include <format>
+#include <optional>
 
 #include "engine/audio/dsp.h"
 #include "engine/core/log.h"
@@ -700,6 +701,43 @@ void DemoSystem::Skip(std::string_view demo_id) {
     }
 }
 
+bool DemoSystem::SkipToEnd(std::string_view demo_id, float fade_seconds) {
+    for (PlayingDemo& demo : playing_) {
+        if (demo.demo_id != demo_id || demo.finished || demo.skip_requested) continue;
+        std::optional<glm::vec4> color;
+        uint64_t fade = 0;
+        if (demo.stream) {
+            const auto& events = demo.stream->events;
+            for (size_t i = demo.next_event; i < events.size(); ++i) {
+                const anim::StreamEvent& e = *events[i];
+                if (e.type != anim::kEventExecCommand) continue;
+                if (e.functor == kFunctorFadeColor) {
+                    color = glm::clamp(ParamVector(e, kKeyColor, glm::vec4(0.0f, 0.0f, 0.0f, 1.0f), 1.0f), 0.0f, 1.0f) * 255.0f;
+                } else if (e.functor == kFunctorFadeIn || e.functor == kFunctorFadeOut) {
+                    fade = e.functor;
+                }
+            }
+        }
+        if (color) {
+            game_.Effects().SetFadeColor(static_cast<int>(color->r + 0.5f), static_cast<int>(color->g + 0.5f), static_cast<int>(color->b + 0.5f),
+                                         static_cast<int>(color->a + 0.5f));
+        }
+        if (fade == kFunctorFadeOut) {
+            game_.Effects().CallFadeOut(fade_seconds);
+        } else if (fade == kFunctorFadeIn) {
+            game_.Effects().CallFadeIn(fade_seconds);
+        }
+        if (demo.demo_id == "gc_p06_010_final" && game_.Effects().caption_id == kEndingCaption) {
+            game_.Effects().caption_time = static_cast<float>(static_cast<double>(demo.length_frames) / kDemoFramesPerSecond);
+        }
+        LogInfo("demo: {} skipped to its end at frame {:.1f} of {} (fade {}{})", demo.demo_id, demo.frame, demo.length_frames,
+                fade == kFunctorFadeOut ? "out" : fade == kFunctorFadeIn ? "in" : "kept", color ? ", colour of its end" : "");
+        Skip(demo_id);
+        return true;
+    }
+    return false;
+}
+
 bool DemoSystem::IsPlaying(std::string_view demo_id) const {
     for (const PlayingDemo& demo : playing_) {
         if (demo.demo_id == demo_id && !demo.finished) {
@@ -1273,7 +1311,14 @@ void DemoSystem::RunFunctor(PlayingDemo& demo, const anim::StreamEvent& e, float
     if (f == kFunctorTakePlayer) {
         if (first && !demo.player_model.empty() && !demo.player_taken && !demo.player_released) {
             demo.player_taken = true;
-            LogInfo("demo: {} takes the player ({}) at frame {:.1f}", demo.demo_id, demo.player_model, demo.frame);
+            const Player& player = game_.GetPlayer();
+            const glm::vec3 local = glm::inverse(demo.rotation) * (player.Feet() - demo.translation);
+            glm::vec3 root(0.0f);
+            glm::quat root_rotation(1.0f, 0.0f, 0.0f, 0.0f);
+            const bool has_root = PlayerRootWorld(demo, root, root_rotation);
+            LogInfo("demo: {} takes the player ({}) at frame {:.1f}: feet in demo space ({:.4f} {:.4f} {:.4f}) fox yaw {:.2f}, jump to the root {:.4f} m",
+                    demo.demo_id, demo.player_model, demo.frame, local.x, local.y, local.z,
+                    glm::degrees(std::remainder(player.BodyFoxYaw() - FoxYawOf(demo.rotation), 2.0f * glm::pi<float>())), has_root ? glm::length(root - player.Feet()) : -1.0f);
         }
         return;
     }
@@ -1793,7 +1838,7 @@ void DemoSystem::UpdateCamera(PlayingDemo& demo) {
     const DemoStreamData& stream = *demo.stream;
     if (demo.frame <= 0.0 && !demo.camera_seen) {
         demo.camera_valid = false;
-        demo.blend_from = game_.GetPlayer().MakeCamera();
+        demo.blend_from = game_.PlayerViewCamera();
         demo.blend_from_set = true;
         return;
     }
@@ -1811,7 +1856,7 @@ void DemoSystem::UpdateCamera(PlayingDemo& demo) {
     const glm::quat world_rotation = glm::normalize(demo.rotation * rotation);
     const glm::vec3 world_position = demo.translation + demo.rotation * translation;
     if (!demo.camera_valid && demo.info->camera_interp_type != 0 && demo.info->camera_interp_frames > 0) {
-        const Camera game_camera = !demo.camera_seen && demo.blend_from_set ? demo.blend_from : game_.GetPlayer().MakeCamera();
+        const Camera game_camera = !demo.camera_seen && demo.blend_from_set ? demo.blend_from : game_.PlayerViewCamera();
         demo.blend_active = true;
         demo.blend_start = static_cast<int32_t>(demo.frame);
         demo.blend_frames = demo.info->camera_interp_frames;
@@ -1878,7 +1923,7 @@ void DemoSystem::UpdatePlayer(PlayingDemo& demo) {
     glm::vec3 position;
     glm::quat rotation;
     if (PlayerRootWorld(demo, position, rotation)) {
-        game_.GetPlayer().Warp(position, FoxYawOf(rotation));
+        game_.GetPlayer().DemoWarp(position, FoxYawOf(rotation));
     }
 }
 
@@ -1901,7 +1946,7 @@ void DemoSystem::ReleasePlayer(PlayingDemo& demo, const char* reason, double fun
         placed = PlayerRootWorld(demo, position, rotation);
     }
     if (placed) {
-        game_.GetPlayer().Warp(position, FoxYawOf(rotation));
+        game_.GetPlayer().DemoWarp(position, FoxYawOf(rotation));
         LogInfo("demo: {} releases the player ({}) at frame {:.1f}: ({:.3f} {:.3f} {:.3f}) fox yaw {:.1f}", demo.demo_id, reason, demo.frame,
                 position.x, position.y, position.z, glm::degrees(FoxYawOf(rotation)));
     } else {

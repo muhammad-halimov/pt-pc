@@ -1,3 +1,5 @@
+#include "engine/core/ascii.h"
+#include "engine/platform/os.h"
 #include "game/save_data.h"
 
 #include <algorithm>
@@ -43,7 +45,7 @@ GameOptions DefaultOptionsForLocale(std::string_view locale) {
     options.subtitle_language = 0;
     std::string tag(locale);
     for (char& ch : tag) {
-        ch = ch == '_' ? '-' : static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+        ch = ch == '_' ? '-' : static_cast<char>(pt::AsciiLower(ch));
     }
     const std::string primary = tag.substr(0, tag.find('-'));
     if (primary == "en") {
@@ -74,6 +76,10 @@ GameOptions DefaultOptionsForLocale(std::string_view locale) {
         options.subtitle_language = 10;
     } else if (primary == "uk") {
         options.subtitle_language = 11;
+    } else if (primary == "cs") {
+        options.subtitle_language = 12;
+    } else if (primary == "pl") {
+        options.subtitle_language = 13;
     }
     return options;
 }
@@ -102,7 +108,7 @@ bool SaveStore::Reset() {
         const auto path=Slot(i);
         std::filesystem::remove(path,error);
         if(error) {
-            LogWarn("save: cannot reset {}: {}",path.string(),error.message());
+            LogWarn("save: cannot reset {}: {}",pt::os::PathToUtf8(path),error.message());
             return false;
         }
     }
@@ -129,18 +135,18 @@ SaveStore::SlotRead SaveStore::Read(const std::filesystem::path& path) const {
     }
     /* No checksum in the PC file; the PS4 savedata layer did that job, so a short read is the only corruption we can detect. */
     if (!in || in.gcount() != static_cast<std::streamsize>(buffer.size())) {
-        LogWarn("save: {} is broken (cannot read {} bytes)", path.string(), buffer.size());
+        LogWarn("save: {} is broken (cannot read {} bytes)", pt::os::PathToUtf8(path), buffer.size());
         slot.status = SaveLoadStatus::Broken;
         return slot;
     }
     const uint32_t version = Get<uint32_t>(buffer, 0x08);
     if (Get<uint64_t>(buffer, 0x00) != kMagic || version > kVersion) {
-        LogWarn("save: {} has a bad header (magic {:#x}, version {})", path.string(), Get<uint64_t>(buffer, 0x00), version);
+        LogWarn("save: {} has a bad header (magic {:#x}, version {})", pt::os::PathToUtf8(path), Get<uint64_t>(buffer, 0x00), version);
         slot.status = SaveLoadStatus::Unreadable;
         return slot;
     }
     if (version < kVersion) {
-        LogWarn("save: {} has the old version {}", path.string(), version);
+        LogWarn("save: {} has the old version {}", pt::os::PathToUtf8(path), version);
         slot.status = SaveLoadStatus::Old;
         return slot;
     }
@@ -157,7 +163,9 @@ SaveStore::SlotRead SaveStore::Read(const std::filesystem::path& path) const {
     file.progress.photo_word = Get<uint32_t>(buffer, 0x5C);
     /* 'NGP1' at 0x70, bytes the original always leaves zero, so a save from the PS4 never reads as finished. */
     file.progress.game_plus = Get<uint32_t>(buffer, 0x70) == 0x3150474E;
-    file.progress.finishes = file.progress.game_plus ? std::max<uint32_t>(1, Get<uint32_t>(buffer, 0x74)) : 0;
+    const uint32_t finish_word = Get<uint32_t>(buffer, 0x74);
+    file.progress.finishes = file.progress.game_plus ? std::max<uint32_t>(1, finish_word & 0xFFFFu) : 0;
+    file.progress.gameplus_announced = file.progress.game_plus ? (finish_word >> 16) & 0xFFu : 0;
     for (size_t i = 0; i < 5; ++i) {
         file.progress.cleared[i] = buffer[0x68 + i];
     }
@@ -231,7 +239,7 @@ bool SaveStore::Save(const SaveFile& file) {
     std::memcpy(buffer.data() + 0x40, file.progress.floor.data(), std::min<size_t>(file.progress.floor.size(), 7));
     Put<uint32_t>(buffer, 0x5C, file.progress.photo_word);
     Put<uint32_t>(buffer, 0x70, file.progress.game_plus ? 0x3150474E : 0);
-    Put<uint32_t>(buffer, 0x74, file.progress.game_plus ? file.progress.finishes : 0);
+    Put<uint32_t>(buffer, 0x74, file.progress.game_plus ? (std::min<uint32_t>(file.progress.finishes, 0xFFFFu) | (std::min<uint32_t>(file.progress.gameplus_announced, 0xFFu) << 16)) : 0);
     for (size_t i = 0; i < 5; ++i) {
         buffer[0x68 + i] = file.progress.cleared[i];
     }

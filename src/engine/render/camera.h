@@ -1,5 +1,7 @@
 #pragma once
 
+#include <cmath>
+
 #include <glm/glm.hpp>
 #include <glm/gtc/matrix_transform.hpp>
 #include <glm/gtc/quaternion.hpp>
@@ -43,6 +45,38 @@ struct Camera {
         return p;
     }
 };
+
+inline Camera BlendCameras(const Camera& from, const Camera& to, float t, bool* cut = nullptr) {
+    constexpr float kPi = 3.14159265f;
+    const auto wrap = [](float a) {
+        float d = std::fmod(a + kPi, 2.0f * kPi);
+        if (d < 0.0f) {
+            d += 2.0f * kPi;
+        }
+        return d - kPi;
+    };
+    if (cut) {
+        *cut = true;
+    }
+    if (glm::length(to.position - from.position) > 1.0f) {
+        return to;
+    }
+    const float yaw_delta = wrap(to.yaw - from.yaw);
+    const float roll_delta = wrap(to.roll - from.roll);
+    if (std::abs(yaw_delta) > 0.5f || std::abs(to.pitch - from.pitch) > 0.5f || std::abs(roll_delta) > 0.5f) {
+        return to;
+    }
+    if (cut) {
+        *cut = false;
+    }
+    Camera camera = to;
+    camera.position = glm::mix(from.position, to.position, t);
+    camera.yaw = to.yaw - yaw_delta * (1.0f - t);
+    camera.pitch = glm::mix(from.pitch, to.pitch, t);
+    camera.roll = to.roll - roll_delta * (1.0f - t);
+    camera.fov_y = glm::mix(from.fov_y, to.fov_y, t);
+    return camera;
+}
 
 inline glm::mat4 BlendTransform(const glm::mat4& from, const glm::mat4& to, float t) {
     if (t >= 1.0f || from == to || glm::distance(glm::vec3(from[3]), glm::vec3(to[3])) > 1.0f) {

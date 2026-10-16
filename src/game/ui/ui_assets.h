@@ -1,5 +1,6 @@
 #pragma once
 
+#include <chrono>
 #include <glm/glm.hpp>
 
 #include <array>
@@ -58,8 +59,8 @@ struct UiFont {
 
 class UiAssets {
 public:
-    static constexpr int kLanguageCount = 12;
-    static constexpr const char* kLanguageCodes[kLanguageCount] = {"eng", "fra", "deu", "spa", "jpn", "ita", "por", "tur", "zhs", "ara", "rus", "ukr"};
+    static constexpr int kLanguageCount = 14;
+    static constexpr const char* kLanguageCodes[kLanguageCount] = {"eng", "fra", "deu", "spa", "jpn", "ita", "por", "tur", "zhs", "ara", "rus", "ukr", "ces", "pol"};
 
     UiAssets() = default;
     UiAssets(const UiAssets&) = delete;
@@ -69,6 +70,7 @@ public:
     bool Init(Vfs& vfs, TextureManager& textures);
 
     UiFont* Font(UiFontType type, int language);
+    UiFont* FontCovering(UiFontType type, int language, std::string_view text);
     const UiFontStyle* FontStyle(std::string_view name, int language) const;
     const UiFontStyle* FontStyleByHash(uint64_t hash, int language) const;
     const ui::LangFile* Options(int language);
@@ -93,7 +95,9 @@ private:
 
     Vfs* vfs_ = nullptr;
     TextureManager* textures_ = nullptr;
-    std::array<std::unique_ptr<UiFont>, 21> fonts_;
+    std::array<std::unique_ptr<UiFont>, 6 + (kLanguageCount - 7) * 3> fonts_;
+    std::array<std::chrono::steady_clock::time_point, 6 + (kLanguageCount - 7) * 3> font_retry_{};
+    std::map<std::pair<int, int>, std::unique_ptr<UiFont>> covering_fonts_;
     std::vector<UiFontStyle> styles_;
     std::array<std::unique_ptr<ui::LangFile>, kLanguageCount> options_;
     std::array<std::unique_ptr<ui::LangFile>, kLanguageCount> system_;

@@ -10,6 +10,9 @@ struct Quad {
     vec4 extra;
     uvec4 info;
     vec4 rain_rotation;
+    vec4 light_position[3];
+    vec4 light_color[3];
+    vec4 light_factors;
 };
 
 layout(std430, set = 1, binding = 0) readonly buffer Quads {
@@ -35,6 +38,13 @@ layout(location = 8) flat out vec3 out_tangent;
 layout(location = 9) flat out vec3 out_bitangent;
 layout(location = 10) flat out vec3 out_normal;
 layout(location = 11) flat out vec4 out_rain_rotation;
+layout(location = 12) flat out vec4 out_light_position0;
+layout(location = 13) flat out vec4 out_light_position1;
+layout(location = 14) flat out vec4 out_light_position2;
+layout(location = 15) flat out vec4 out_light_color0;
+layout(location = 16) flat out vec4 out_light_color1;
+layout(location = 17) flat out vec4 out_light_color2;
+layout(location = 18) flat out vec4 out_light_factors;
 
 const uint kCorners[6] = uint[6](0u, 2u, 1u, 1u, 2u, 3u);
 const uint kLiquid = 8u;
@@ -56,6 +66,13 @@ void main() {
     out_info = q.info;
     out_extra = q.extra;
     out_rain_rotation = q.rain_rotation;
+    out_light_position0 = q.light_position[0];
+    out_light_position1 = q.light_position[1];
+    out_light_position2 = q.light_position[2];
+    out_light_color0 = q.light_color[0];
+    out_light_color1 = q.light_color[1];
+    out_light_color2 = q.light_color[2];
+    out_light_factors = q.light_factors;
     vec4 p = q.corner[corner];
     out_world = p.xyz;
     out_tangent = vec3(1.0, 0.0, 0.0);

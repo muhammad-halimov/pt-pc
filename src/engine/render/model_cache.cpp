@@ -1,5 +1,8 @@
 #include "engine/render/model_cache.h"
 
+#include "engine/assets/gltf_model.h"
+
+#include <algorithm>
 #include <bit>
 #include <cmath>
 #include <cstdlib>
@@ -125,6 +128,10 @@ uint32_t ModelCache::LoadTexture(const std::string& path, uint32_t fallback, boo
         ++missing_textures_;
         return fallback;
     }
+    if (loading_textures_ && std::find(loading_textures_->begin(), loading_textures_->end(), index) == loading_textures_->end()) {
+        loading_textures_->push_back(index);
+        textures_.AddModelRef(index);
+    }
     return index;
 }
 
@@ -195,7 +202,7 @@ MaterialGpu ModelCache::BuildMaterial(const FmdlMaterial& m, uint32_t alpha_flag
     }
     if (m.shader.starts_with("fox_3ddf_tempolary")) {
         gpu.albedo = texture("Base_Tex", TextureManager::kWhite);
-        if (m.shader == "fox_3ddf_tempolary_albedoview" && !MaterialLegacy()) {
+        if ((m.shader == "fox_3ddf_tempolary_albedoview" || m.shader == "fox_3ddf_tempolary_view") && !MaterialLegacy()) {
             gpu.flags |= gpu::kMatAlbedoView;
         }
         if (HasVector(m, "TempolaryBaseColor")) {
@@ -324,14 +331,22 @@ const ModelEntry* ModelCache::Load(const std::string& path, const std::string& k
                                    FmdlModel* parsed, const std::function<void(Vertex&)>* transform) {
     auto it = entries_.find(key);
     if (it != entries_.end()) {
+        if (stage_scope_ == 0) it->second.pinned = true;
         return it->second.mesh ? &it->second : nullptr;
     }
     ModelEntry entry;
+    entry.pinned = stage_scope_ == 0 || keep || transform;
+    const TextureManager::ModelScope texture_scope(textures_);
+    struct LoadingTextures {
+        ModelCache& cache;
+        std::vector<uint32_t>* previous;
+        LoadingTextures(ModelCache& c, std::vector<uint32_t>* list) : cache(c), previous(c.loading_textures_) { cache.loading_textures_ = list; }
+        ~LoadingTextures() { cache.loading_textures_ = previous; }
+    } loading(*this, &entry.textures);
     FmdlModel read;
     FmdlModel& model = parsed ? *parsed : read;
     if (!parsed) {
-        auto bytes = vfs_.ReadFile(path);
-        if (!bytes || !LoadFmdl(*bytes, path, read)) {
+        if (!LoadModelFile(vfs_, path, read)) {
             ++failed_;
             entries_.emplace(key, std::move(entry));
             return nullptr;
@@ -368,6 +383,10 @@ const ModelEntry* ModelCache::Load(const std::string& path, const std::string& k
         entry.material_indices.push_back(textures_.AddMaterial(BuildMaterial(m, 0)));
     }
     bool skinned = false;
+    std::vector<uint32_t> local_materials;
+    for (const SubMesh& s : model.mesh.submeshes) {
+        local_materials.push_back(s.material);
+    }
     for (size_t i = 0; i < model.mesh.submeshes.size(); ++i) {
         SubMesh& sub = model.mesh.submeshes[i];
         const uint32_t local = sub.material;
@@ -388,11 +407,33 @@ const ModelEntry* ModelCache::Load(const std::string& path, const std::string& k
             }
             const uint32_t kind = MaterialKindOf(m);
             sub.kind = static_cast<uint8_t>(kind);
+            sub.layer = static_cast<uint8_t>((info.render_flags >> 20) & 0xF);
             const uint32_t f = info.render_flags;
             sub.shadow = (f & 0x140) == 0 && ((f & 0x10) == 0 || (f & 0xF) == 0);
             if (LisaHairShadow(path, m)) {
                 sub.shadow = true;
                 sub.material = textures_.AddMaterial(BuildMaterial(m, gpu::kMatAlphaTest | gpu::kMatAlphaDither | gpu::kMatLisaHairShadow));
+            }
+            if (path.find("shsb_bath001") != std::string_view::npos && m.name == "basic1" && i > 0 &&
+                local_materials[i - 1] < model.materials.size()) {
+                const FmdlMaterial& prev = model.materials[local_materials[i - 1]];
+                const std::string* nrm = FindTexture(prev, "NormalMap_Tex");
+                const std::string* srm = FindTexture(prev, "SpecularMap_Tex");
+                const std::string* mask = FindTexture(m, "Mask_Tex");
+                if (nrm && srm && mask) {
+                    MaterialGpu gpu;
+                    gpu.kind = gpu::kKindDeferred;
+                    gpu.albedo = LoadTexture(*mask, TextureManager::kWhite, true);
+                    gpu.normal = LoadTexture(*nrm, TextureManager::kFlatNormal);
+                    gpu.specular = LoadTexture(*srm, TextureManager::kBlack);
+                    gpu.flags = gpu::kMatNormalMap | gpu::kMatGBufferBase2;
+                    sub.material = textures_.AddMaterial(gpu);
+                    sub.pass = RenderPass::Opaque;
+                    sub.kind = static_cast<uint8_t>(gpu::kKindDeferred);
+                    LogInfo("model cache: basic1 GBuffersBase2 ({}, {})", *nrm, *srm);
+                } else {
+                    LogWarn("model cache: basic1 GBuffersBase2 sources missing");
+                }
             }
         } else {
             sub.material = 0;
@@ -420,11 +461,57 @@ const ModelEntry* ModelCache::Load(const std::string& path, const std::string& k
 }
 
 bool ModelCache::ReadMesh(const std::string& path, MeshData& out) {
-    auto bytes = vfs_.ReadFile(path);
     FmdlModel model;
-    if (!bytes || !LoadFmdl(*bytes, path, model)) return false;
+    if (!LoadModelFile(vfs_, path, model)) return false;
     out = std::move(model.mesh);
     return true;
+}
+
+void ModelCache::AddStageRef(const std::string& path) {
+    if (auto it = entries_.find(path); it != entries_.end()) ++it->second.stage_refs;
+}
+
+void ModelCache::ReleaseStageRef(const std::string& path) {
+    if (auto it = entries_.find(path); it != entries_.end() && it->second.stage_refs > 0) --it->second.stage_refs;
+}
+
+bool ModelCache::Holds(const GpuMesh* mesh) const {
+    if (!mesh) return false;
+    for (const auto& [path, entry] : entries_) {
+        if (entry.mesh.get() == mesh) return true;
+    }
+    return false;
+}
+
+ModelCache::Released ModelCache::ReleaseUnused() {
+    Released released;
+    bool waited = false;
+    for (auto it = entries_.begin(); it != entries_.end();) {
+        ModelEntry& entry = it->second;
+        const bool failed = !entry.mesh;
+        if ((entry.pinned || entry.stage_refs > 0) && !failed) {
+            ++it;
+            continue;
+        }
+        if (!waited) {
+            scene_.WaitIdle();
+            waited = true;
+        }
+        if (entry.mesh) {
+            released.mesh_bytes += entry.mesh->vertices.size + entry.mesh->indices.size;
+            scene_.Destroy(*entry.mesh);
+        }
+        for (const uint32_t texture : entry.textures) {
+            if (const uint64_t bytes = textures_.ReleaseModelRef(texture)) {
+                released.texture_bytes += bytes;
+                ++released.textures;
+            }
+        }
+        ++released.models;
+        it = entries_.erase(it);
+    }
+    if (released.textures) textures_.FlushMaterials();
+    return released;
 }
 
 void ModelCache::Clear() {

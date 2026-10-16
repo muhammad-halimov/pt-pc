@@ -9,10 +9,12 @@
 #include <cstdlib>
 #include <cstring>
 #include <format>
+#include <limits>
 #include <string>
 
 #include "engine/core/log.h"
 #include "engine/fs/vfs.h"
+#include "engine/render/pipeline_cache_store.h"
 #include "engine/render/scene_renderer.h"
 
 namespace pt {
@@ -41,6 +43,23 @@ glm::mat4 SpotShadowProjection(float fov_y, float near_plane, float far_plane) {
 
 glm::mat4 FoxView(const glm::mat4& gl_view) {
     return glm::scale(glm::mat4(1.0f), glm::vec3(1.0f, 1.0f, -1.0f)) * gl_view;
+}
+
+bool MirrorLightSkips(const GpuMesh& mesh, int sub) {
+    static const bool all_casters = std::getenv("PT_MIRROR_CASTERS_ALL") != nullptr;
+    for (const char* name : {"coc0_main0_def", "bab0_main0_def", "shsb_clck001.fmdl", "shsb_lght005.fmdl", "handy_lens"}) {
+        if (!all_casters && mesh.name.find(name) != std::string::npos) {
+            return true;
+        }
+    }
+    if (mesh.name.find("shsb_bath001.fmdl") == std::string::npos) {
+        return false;
+    }
+    static const std::string list = [] {
+        const char* v = std::getenv("PT_MIRROR_SKIP_SUB");
+        return "," + std::string(v ? v : "2,10") + ",";
+    }();
+    return list.find("," + std::to_string(sub) + ",") != std::string::npos;
 }
 
 /* The original uses no polygon offset; its spot shadows move the receiver along the view's z by viewBias instead (0xDC07F0). */
@@ -206,6 +225,10 @@ bool BoxInPlanes(const glm::vec3& c, const glm::vec3& h, const glm::vec4* planes
     return true;
 }
 
+constexpr float kPtFittingReach = 0.3f;
+
+constexpr float kReflectionLightReach = 40.0f;
+
 LightBox LightGridBox(const SceneLight& l) {
     LightBox box{l.position - glm::vec3(l.outer_range), l.position + glm::vec3(l.outer_range)};
     if (l.type != LightType::Spot) {
@@ -252,11 +275,11 @@ float LightScore(const SceneLight& l, const glm::vec3& center, float radius, flo
 
 }
 
-static uint32_t TargetTexelBytes(VkFormat format) {
+static uint32_t TargetTexelBytes(gpu::Format format) {
     switch (format) {
-    case VK_FORMAT_R16G16B16A16_SFLOAT:
+    case gpu::Format::R16G16B16A16Sfloat:
         return 8;
-    case VK_FORMAT_R32G32B32A32_SFLOAT:
+    case gpu::Format::R32G32B32A32Sfloat:
         return 16;
     default:
         return 4;
@@ -313,6 +336,28 @@ void SceneRenderer::PrepareFrame(const Camera& camera, const std::vector<DrawIte
         projection[2][0] -= up_.jitter_ndc.x;
         projection[2][1] -= up_.jitter_ndc.y;
     }
+    static const bool date_resolve_off = [] {
+        const char* v = std::getenv("PT_DATE_RESOLVE");
+        return v && std::string_view(v) == "0";
+    }();
+    const bool date_was_active = date_active_;
+    date_active_ = date_resolve_on_ && !date_resolve_off && vr_eye_ < 0 && date_resolve_ && date_resolve_out_ &&
+                   mb_blur_[0].Valid() && mb_blur_[1].Valid() && !(toggles.motion_blur && lighting.screen.motion_blur && lighting.valid);
+    if (!date_active_ || !date_was_active) {
+        date_history_valid_ = false;
+    }
+    date_jitter_ndc_ = glm::vec2(0.0f);
+    if (date_active_) {
+        if (!up_.enabled) {
+            const glm::vec2 pixels = JitterOffset(static_cast<int32_t>(frame_counter_ % 16u), 16);
+            date_jitter_ndc_ = 2.0f * pixels / glm::vec2(static_cast<float>(extent_.width), static_cast<float>(extent_.height));
+            projection[2][0] -= date_jitter_ndc_.x;
+            projection[2][1] -= date_jitter_ndc_.y;
+        }
+        const glm::mat4 view_projection = unjittered * camera.View();
+        date_still_now_ = date_still_ && date_history_valid_ && view_projection == date_previous_view_projection_;
+        date_previous_view_projection_ = view_projection;
+    }
     const glm::mat4 gl_view = camera.View();
     const float time = static_cast<float>(frame_counter_) / 60.0f;
 
@@ -329,6 +374,9 @@ void SceneRenderer::PrepareFrame(const Camera& camera, const std::vector<DrawIte
         v.shadow = glm::vec4(0.0f);
         static const float shadow_rotate = std::getenv("PT_SHADOW_ROTATE") ? 1.0f : 0.0f;
         v.jitter = up_.enabled ? glm::vec4(up_.jitter_ndc, up_.mip_bias, shadow_rotate) : glm::vec4(0.0f);
+        if (date_active_ && !up_.enabled) {
+            v.jitter = glm::vec4(date_jitter_ndc_, 0.0f, 0.0f);
+        }
         v.jitter.z += graphics.texture_detail==0?1.0f:graphics.texture_detail==2?-.5f:0.0f;
         v.temporal = glm::vec4(0.0f);
         v.dominant_light = glm::vec4(glm::mat3(v.view) * glm::vec3(0.0f, 1.0f, 0.0f), 1.0f);
@@ -346,7 +394,7 @@ void SceneRenderer::PrepareFrame(const Camera& camera, const std::vector<DrawIte
         LogInfo("dominant light: view space ({:.4f} {:.4f} {:.4f} {:.4f})", dominant_light.x, dominant_light.y, dominant_light.z, dominant_light.w);
     }
     static const bool fixed_dither = std::getenv("PT_UPSCALE_FIXED_DITHER") != nullptr;
-    if (up_.enabled && !fixed_dither) {
+    if ((up_.enabled || date_active_) && !fixed_dither) {
         static constexpr glm::vec2 kTaps[4] = {{1.0f, 1.0f}, {-1.0f, -1.0f}, {1.0f, -1.0f}, {-1.0f, 1.0f}};
         frame_->views[main_view_.index].temporal =
             glm::vec4(static_cast<float>((frame_counter_ * 39u) & 63u), kTaps[frame_counter_ & 3u], 1.0f);
@@ -472,6 +520,8 @@ void SceneRenderer::PrepareFrame(const Camera& camera, const std::vector<DrawIte
         }
     }
 
+    mirror_cache_index_ = lighting.mirror_high ? 1u : 0u;
+    mirror_stale_ = mirror_stale_cache_[mirror_cache_index_];
     mirror_active_ = false;
     mirror_stale_active_ = false;
     mirror_temporal_enabled_ = up_.enabled && !std::getenv("PT_MIRROR_TEMPORAL_OFF");
@@ -487,7 +537,7 @@ void SceneRenderer::PrepareFrame(const Camera& camera, const std::vector<DrawIte
                     lighting.mirrors.size(), toggles.mirrors, camera.position.x, camera.position.y, camera.position.z);
         }
     }
-    if (toggles.mirrors && lighting.mirror_capture) {
+    if (toggles.mirrors && lighting.mirror_capture && !rt_path_) {
         const SceneMirror* nearest = nullptr;
         float nearest_distance = 0.0f;
         for (const SceneMirror& mirror : lighting.mirrors) {
@@ -561,6 +611,7 @@ void SceneRenderer::PrepareFrame(const Camera& camera, const std::vector<DrawIte
             const uint32_t size = std::min({lighting.mirror_high ? 512u : 128u, extent_.width, extent_.height});
             mirror_current_view_projection_ = capture_projection * capture_view;
             mirror_stale_ = MirrorStale{true, mirror.mesh, mirror.transform, capture_projection, capture_view, eye, eye_distance, size};
+            mirror_stale_cache_[mirror_cache_index_] = mirror_stale_;
             glm::vec2 capture_jitter(0.0f);
             if (mirror_temporal_enabled_) {
                 capture_jitter = 2.0f * up_.jitter_pixels / static_cast<float>(size);
@@ -576,7 +627,7 @@ void SceneRenderer::PrepareFrame(const Camera& camera, const std::vector<DrawIte
                 capture.temporal = frame_->views[main_view_.index].temporal;
             }
             capture.projection_param.z = eye_distance;
-            mirror_view_.area = VkExtent2D{size, size};
+            mirror_view_.area = gpu::Extent2D{size, size};
             mirror_view_.view_bit = 2;
             mirror_view_.view = capture_view;
             mirror_view_.projection = capture_projection;
@@ -676,6 +727,11 @@ void SceneRenderer::PrepareFrame(const Camera& camera, const std::vector<DrawIte
         } else {
             const auto view_drop = [&](const ViewSetup& view, const lightcull::OccluderSet& occluders, const char* name) -> std::string {
                 if (!BoxInCullView(view, box)) {
+                    if (explain) {
+                        return std::format("{} ({:.2f} {:.2f} {:.2f})-({:.2f} {:.2f} {:.2f}) outside the {} view (type {} range {:.2f} dimmer {:.2f} cos {:.3f} dir ({:.2f} {:.2f} {:.2f}) up ({:.2f} {:.2f} {:.2f}) area {})",
+                                           lightcull::GridFromEnv().valid ? "grid box" : "box", box.lo.x, box.lo.y, box.lo.z, box.hi.x, box.hi.y, box.hi.z, name,
+                                           static_cast<int>(l.type), l.outer_range, l.dimmer, l.cos_outer, l.direction.x, l.direction.y, l.direction.z, l.up.x, l.up.y, l.up.z, l.has_area);
+                    }
                     return std::format("{} outside the {} view", lightcull::GridFromEnv().valid ? "grid box" : "box", name);
                 }
                 const int hider = lightcull::FindOccludingVolume(box.lo, box.hi, occluders);
@@ -692,6 +748,11 @@ void SceneRenderer::PrepareFrame(const Camera& camera, const std::vector<DrawIte
                                    name, v.source, q.x, q.y, q.z, v.area, v.distance, box.lo.x, box.lo.y, box.lo.z, box.hi.x, box.hi.y, box.hi.z);
             };
             drop = view_drop(main_view_, main_occluders_, "camera");
+            static const bool no_cull = std::getenv("PT_LIGHT_NO_VIEW_CULL") != nullptr;
+            if (!drop.empty() && (no_cull || rt_reflections_)) {
+                const glm::vec3 nearest = glm::clamp(camera.position, box.lo, box.hi);
+                if (no_cull || glm::distance(nearest, camera.position) < kReflectionLightReach) drop.clear();
+            }
             if (!drop.empty() && mirror_active_) {
                 const std::string mirror_drop = view_drop(mirror_view_, mirror_occluders_, "mirror");
                 drop = mirror_drop.empty() ? std::string() : drop + "; " + mirror_drop;
@@ -743,7 +804,8 @@ void SceneRenderer::PrepareFrame(const Camera& camera, const std::vector<DrawIte
         g.shadow_cone = glm::vec4(l.shadow_cos_outer, l.shadow_inv_cone_range, 0.0f, 0.0f);
         g.scales = glm::vec4(l.specular_scale * lod.x, l.diffuse_scale * lod.y, l.shadow_strength * lod.z, l.cast_shadow ? 1.0f : 0.0f);
         const bool own_mask = l.masked && l.mask_texture >= 0;
-        g.info = glm::ivec4(-1, l.masked && !own_mask ? static_cast<int>(gpu::kResMask) : -1, l.has_area ? 1 : 0, own_mask ? l.mask_texture + 1 : 0);
+        g.info = glm::ivec4(-1, l.masked && !own_mask ? static_cast<int>(gpu::kResMask) : -1,
+                            l.has_area ? static_cast<int>(l.area_clip_mode) : 0, own_mask ? l.mask_texture + 1 : 0);
         g.area = l.has_area ? l.area_to_box : glm::mat4(0.0f);
         if (l.masked) {
             const glm::vec3 dir = glm::normalize(l.direction);
@@ -797,6 +859,7 @@ void SceneRenderer::PrepareFrame(const Camera& camera, const std::vector<DrawIte
         LogInfo("probe at: blend ({:.4f} {:.4f} {:.4f})", blend.x, blend.y, blend.z);
     }
     BuildShadowViews(lighting, camera.position);
+    SetupFullLights();
     if (static const bool light_changes = std::getenv("PT_LIGHT_CHANGES") != nullptr; light_changes) {
         std::map<std::string, std::pair<bool, float>> now;
         for (uint32_t i = 0; i < light_count_; ++i) {
@@ -889,7 +952,7 @@ void SceneRenderer::BuildShadowViews(const SceneLighting& lighting, const glm::v
             if (legacy_light_cull_ && view.view_bit == 1 && previous_shadowed_.contains(src.name)) {
                 score *= 1.25f;
             }
-            order.push_back({i, score, src.priority, view.view_bit});
+            order.push_back({i, score, src.priority, src.id == kMirrorLightId ? uint8_t{2} : view.view_bit});
         }
         std::stable_sort(order.begin(), order.end(), [](const Candidate& a, const Candidate& b) { return a.score > b.score; });
         std::stable_sort(order.begin(), order.end(), [](const Candidate& a, const Candidate& b) { return a.priority < b.priority; });
@@ -940,7 +1003,8 @@ void SceneRenderer::BuildShadowViews(const SceneLighting& lighting, const glm::v
     }
     if (static const bool trace_selection = std::getenv("PT_SHADOW_SELECTION") != nullptr; trace_selection) {
         static uint32_t trace_frame = 0;
-        if (++trace_frame % 120 == 0) {
+        static const int trace_every = std::max(1, std::atoi(std::getenv("PT_SHADOW_SELECTION")));
+        if (++trace_frame % (trace_every > 1 ? trace_every : 120) == 0) {
             LogInfo("shadow selection: eye ({:.3f} {:.3f} {:.3f}) RT {}", eye.x, eye.y, eye.z, rt_active_);
             for (const Candidate& c : ranked) {
                 const bool selected = std::any_of(candidates.begin(), candidates.end(), [&](const Candidate& s) { return s.light == c.light; });
@@ -952,7 +1016,7 @@ void SceneRenderer::BuildShadowViews(const SceneLighting& lighting, const glm::v
     if (rt_active_) {
         const uint32_t samples = raytracing.soft_shadows ? (2u << std::clamp(graphics.ray_quality,0,2)) : 1u;
         for (const Candidate& c : candidates) {
-            const uint32_t casters = c.view_bit;
+            const uint32_t casters = light_sources_[c.light]->id == kMirrorLightId ? 32u : c.view_bit;
             frame_->lights[c.light].info.x = static_cast<int>(casters | (rt_cull_ << 8) | (samples << 16));
         }
         return;
@@ -1024,7 +1088,7 @@ void SceneRenderer::BuildShadowViews(const SceneLighting& lighting, const glm::v
             sv.frustum = true;
             sv.bias_constant = ShadowLegacy() ? -1.5f : 0.0f;
             sv.bias_slope = ShadowLegacy() ? -2.0f : 0.0f;
-            sv.cull = VK_CULL_MODE_FRONT_BIT;
+            sv.cull = gpu::CullMode::Front;
             shadow_views_.push_back(sv);
             const float half_texel = ShadowLegacy() ? 0.0f : 1.0f / static_cast<float>(shadow_tile);
             g.shadow = glm::translate(glm::mat4(1.0f), glm::vec3(half_texel, half_texel, 0.0f)) * v.view_projection;
@@ -1052,7 +1116,7 @@ void SceneRenderer::BuildShadowViews(const SceneLighting& lighting, const glm::v
                 sv.frustum = false;
                 sv.bias_constant = ShadowLegacy() ? -1.5f : 0.0f;
                 sv.bias_slope = ShadowLegacy() ? -2.0f : 0.0f;
-                sv.cull = side == 0 ? VK_CULL_MODE_FRONT_BIT : VK_CULL_MODE_BACK_BIT;
+                sv.cull = side == 0 ? gpu::CullMode::Front : gpu::CullMode::Back;
                 shadow_views_.push_back(sv);
             }
             g.shadow = light_space;
@@ -1095,28 +1159,27 @@ void SceneRenderer::UploadFrame(FrameSlot& slot) {
     std::memcpy(base + offsetof(gpu::FrameData, views), frame_->views, sizeof(gpu::View) * view_count_);
     std::memcpy(base + offsetof(gpu::FrameData, lights), frame_->lights, sizeof(gpu::Light) * light_upload_count_);
     std::memcpy(base + offsetof(gpu::FrameData, probes), frame_->probes, sizeof(gpu::Probe) * probe_count_);
-    vmaFlushAllocation(renderer_->Context().allocator, slot.frame_data.allocation, 0, VK_WHOLE_SIZE);
+    gpu_->FlushMapped(slot.frame_data, 0, ~0ull);
     if (!skin_matrices_.empty()) {
         std::memcpy(slot.skin.mapped, skin_matrices_.data(), sizeof(glm::mat4) * skin_matrices_.size());
-        vmaFlushAllocation(renderer_->Context().allocator, slot.skin.allocation, 0, sizeof(glm::mat4) * skin_matrices_.size());
+        gpu_->FlushMapped(slot.skin, 0, sizeof(glm::mat4) * skin_matrices_.size());
     }
 }
 
-void SceneRenderer::BindSets(VkCommandBuffer cmd, VkPipelineBindPoint point) {
+void SceneRenderer::BindSets(gpu::CommandList& cmd, gpu::BindPoint point) {
     const FrameSlot& slot = slots_[renderer_->FrameIndex()];
-    VkDescriptorSet sets[2] = {textures_->Set(), post_bindings_ ? slot.post_set : slot.set};
-    vkCmdBindDescriptorSets(cmd, point, layout_, 0, 2, sets, 0, nullptr);
+    gpu::BindingSetHandle sets[2] = {textures_->BindingSet(), post_bindings_ ? slot.post_set : slot.set};
+    cmd.BindSets(point, layout_, 0, sets);
 }
 
-void SceneRenderer::DrawMesh(VkCommandBuffer cmd, const Draw& draw, uint32_t view, uint32_t flags, bool mirrored, bool no_cull,
-                             const glm::vec4* aux, VkCullModeFlags cull, bool shadow_pass) {
+void SceneRenderer::DrawMesh(gpu::CommandList& cmd, const Draw& draw, uint32_t view, uint32_t flags, bool mirrored, bool no_cull,
+                             const glm::vec4* aux, gpu::CullMode cull, bool shadow_pass) {
     const SubMesh& sub = *draw.sub;
     const bool double_sided = shadow_pass ? sub.shadow_double_sided : sub.double_sided;
-    vkCmdSetCullMode(cmd, double_sided || no_cull ? VK_CULL_MODE_NONE : cull);
-    vkCmdSetFrontFace(cmd, mirrored ? VK_FRONT_FACE_CLOCKWISE : VK_FRONT_FACE_COUNTER_CLOCKWISE);
-    VkDeviceSize offset = 0;
-    vkCmdBindVertexBuffers(cmd, 0, 1, &draw.mesh->vertices.buffer, &offset);
-    vkCmdBindIndexBuffer(cmd, draw.mesh->indices.buffer, 0, VK_INDEX_TYPE_UINT32);
+    cmd.SetCullMode(double_sided || no_cull ? gpu::CullMode::None : cull);
+    cmd.SetFrontFace(mirrored ? gpu::FrontFace::Clockwise : gpu::FrontFace::CounterClockwise);
+    cmd.BindVertexBuffer(draw.mesh->vertices.buffer, 0);
+    cmd.BindIndexBuffer(draw.mesh->indices.buffer, 0, gpu::IndexType::Uint32);
     gpu::DrawPush push;
     push.model = draw.transform;
     push.ids = glm::uvec4(view, draw.material, flags, sub.skinned ? draw.skin_base : gpu::kInvalid);
@@ -1126,24 +1189,31 @@ void SceneRenderer::DrawMesh(VkCommandBuffer cmd, const Draw& draw, uint32_t vie
         push.aux[1] = aux[1];
     }
     PushConstants(cmd, &push, sizeof(push));
-    vkCmdDrawIndexed(cmd, sub.index_count, 1, sub.first_index, sub.vertex_offset, 0);
+    cmd.DrawIndexed(sub.index_count, 1, sub.first_index, sub.vertex_offset, 0);
 }
 
-void SceneRenderer::PushConstants(VkCommandBuffer cmd, const void* data, uint32_t size) {
-    vkCmdPushConstants(cmd, layout_, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT | VK_SHADER_STAGE_COMPUTE_BIT, 0, size, data);
+void SceneRenderer::PushConstants(gpu::CommandList& cmd, const void* data, uint32_t size) {
+    cmd.PushConstants(layout_, gpu::ShaderStage::Vertex | gpu::ShaderStage::Fragment | gpu::ShaderStage::Compute, 0, size, data);
 }
 
-void SceneRenderer::Fullscreen(VkCommandBuffer cmd, VkPipeline pipeline, const gpu::PassPush& push) {
-    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
+void SceneRenderer::Fullscreen(gpu::CommandList& cmd, gpu::PipelineHandle pipeline, const gpu::PassPush& push) {
+    cmd.BindPipeline(gpu::BindPoint::Graphics, pipeline);
     PushConstants(cmd, &push, sizeof(push));
-    vkCmdDraw(cmd, 3, 1, 0, 0);
+    cmd.Draw(3, 1, 0, 0);
 }
 
-void SceneRenderer::RecordRayTracing(VkCommandBuffer cmd) {
-    if (rt_built_frame_ == frame_counter_) {
+void SceneRenderer::RecordRayTracing(gpu::CommandList& cmd) {
+    uint64_t& built = rt_built_frame_[renderer_->FrameIndex() % Renderer::kFramesInFlight];
+    auto untraced = [&] {
+        if (rt_->Valid(renderer_->FrameIndex())) return;
+        rt_active_ = rt_reflections_ = rt_ao_active_ = rt_contact_active_ = false;
+        rt_full_shadows_ = rt_gi_active_ = rt_glossy_active_ = rt_path_ = false;
+    };
+    if (built == frame_counter_) {
+        untraced();
         return;
     }
-    rt_built_frame_ = frame_counter_;
+    built = frame_counter_;
     static const bool skinned = [] {
         const char* env = std::getenv("PT_RT_SKINNED");
         return !env || std::atoi(env) != 0;
@@ -1154,8 +1224,16 @@ void SceneRenderer::RecordRayTracing(VkCommandBuffer cmd) {
             continue;
         }
         uint32_t mask = 0;
+        if (rt_path_ && (d.hidden_views & 3u) == 1u && d.sub->kind != gpu::kKindShadowOnly &&
+            ((d.sub->pass == RenderPass::Opaque && d.sub->kind == gpu::kKindDeferred) || d.sub->pass == RenderPass::Unlit ||
+             d.sub->pass == RenderPass::Transparent)) {
+            mask |= 2u;
+        }
         if (d.sub->shadow) {
             mask |= ((d.hidden_views & 1u) == 0 ? 1u : 0u) | ((d.hidden_views & 2u) == 0 ? 2u : 0u);
+            if ((d.hidden_views & 2u) == 0 && !MirrorLightSkips(*d.mesh, static_cast<int>(d.sub - d.mesh->submeshes.data()))) {
+                mask |= 32u;
+            }
         }
         if (static const char* exclude = std::getenv("PT_SHADOW_EXCLUDE"); exclude && d.mesh->name.find(exclude) != std::string::npos) {
             mask &= ~3u;
@@ -1169,27 +1247,50 @@ void SceneRenderer::RecordRayTracing(VkCommandBuffer cmd) {
         const bool deferred = d.sub->pass == RenderPass::Opaque && d.sub->kind == gpu::kKindDeferred;
         const bool forward = (d.sub->pass == RenderPass::Unlit || d.sub->pass == RenderPass::Transparent) && d.sub->kind != gpu::kKindShadowOnly;
         const bool surface = (deferred || forward) && (d.hidden_views & 1u) == 0;
-        if (rt_reflections_ && surface) {
+        static const bool layers_opaque = std::getenv("PT_RT_REFLECT_LAYERS_OPAQUE") != nullptr;
+        const bool layer = forward && (d.sub->kind == gpu::kKindConstant || d.sub->kind == gpu::kKindGlass);
+        const bool reflected = rt_reflections_ || rt_glossy_active_ || rt_path_;
+        if (reflected && surface && layer && !layers_opaque) {
+            mask |= 64u;
+        } else if (reflected && surface) {
             mask |= 4u;
         }
-        if (deferred && (d.hidden_views & 1u) == 0) {
-            if (rt_ao_active_) {
-                mask |= 8u;
-            }
-            if (rt_contact_active_) {
-                bool fitting = false;
-                if (d.radius < 0.5f) {
-                    for (const SceneLight* l : light_sources_) {
-                        if (glm::distance(l->position, d.center) < d.radius + 0.02f) {
-                            fitting = true;
-                            break;
-                        }
+        const bool see_through = d.sub->kind == gpu::kKindConstant || d.sub->kind == gpu::kKindGlass || d.sub->kind == gpu::kKindSky;
+        const bool full_occluder = RtFullAny() && (deferred || (d.sub->shadow && !see_through)) && (d.hidden_views & 1u) == 0;
+        if (deferred && (d.hidden_views & 1u) == 0 && (rt_ao_active_ || rt_gi_active_ || rt_path_)) {
+            mask |= 8u;
+        }
+        bool path_fitting = false;
+        if ((deferred && (d.hidden_views & 1u) == 0 && rt_contact_active_) || full_occluder) {
+            bool fitting = false;
+            if (d.radius < 0.5f) {
+                for (const SceneLight* l : light_sources_) {
+                    if (glm::distance(l->position, d.center) < d.radius + 0.02f) {
+                        fitting = true;
+                        break;
                     }
                 }
-                if (!fitting) {
-                    mask |= 16u;
+            }
+            static const bool path_fittings = [] {
+                const char* value = std::getenv("PT_PATH_FITTING");
+                return !value || std::atoi(value) != 0;
+            }();
+            if (rt_path_ && path_fittings && full_occluder && d.radius < 0.5f) {
+                for (const SceneLight* l : light_sources_) {
+                    if (glm::distance(l->position, d.center) < d.radius + kPtFittingReach) {
+                        path_fitting = true;
+                        break;
+                    }
                 }
             }
+            const bool path_layer = rt_path_ && d.sub->kind == gpu::kKindParallax;
+            if ((!fitting || path_fitting) && !path_layer) {
+                mask |= (deferred && (d.hidden_views & 1u) == 0 && rt_contact_active_) ? 16u : 0u;
+                mask |= full_occluder ? 128u : 0u;
+            }
+        }
+        if (static const char* exclude = std::getenv("PT_PATH_OCCLUDER_EXCLUDE"); exclude && d.mesh->name.find(exclude) != std::string::npos) {
+            mask &= ~128u;
         }
         if (mask == 0) {
             continue;
@@ -1203,10 +1304,27 @@ void SceneRenderer::RecordRayTracing(VkCommandBuffer cmd) {
         c.mask = static_cast<uint8_t>(mask);
         c.alpha_test = (textures_->MaterialFlags(d.material) & gpu::kMatAlphaTest) != 0;
         c.double_sided = d.sub->shadow ? d.sub->shadow_double_sided : d.sub->double_sided;
+        c.fitting = path_fitting && (mask & 128u) != 0;
         rt_casters_.push_back(c);
     }
-    BindSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE);
-    rt_->Build(cmd, renderer_->FrameIndex(), rt_casters_);
+    if (static const bool log_fittings = std::getenv("PT_RT_FITTING_LOG") != nullptr; log_fittings && frame_counter_ % 120 == 0) {
+        for (const SceneLight* l : light_sources_) {
+            for (const Draw& d : draws_) {
+                if (glm::distance(l->position, d.center) < d.radius + 0.6f && d.radius < 1.0f) {
+                    LogInfo("ray tracing: light {} ({:.2f} {:.2f} {:.2f}) near {}#{} radius {:.2f} centre ({:.2f} {:.2f} {:.2f}) shadow {} kind {} "
+                            "material flags {:#x} fitting {}",
+                            l->name.empty() ? "(effect)" : l->name, l->position.x, l->position.y, l->position.z, d.mesh->name,
+                            static_cast<int>(d.sub - d.mesh->submeshes.data()), d.radius, d.center.x, d.center.y, d.center.z, d.sub->shadow,
+                            static_cast<int>(d.sub->kind), textures_->MaterialFlags(d.material),
+                            d.radius < 0.5f && glm::distance(l->position, d.center) < d.radius + 0.02f);
+                }
+            }
+        }
+    }
+    BindSets(cmd, gpu::BindPoint::Compute);
+    if (!rt_->Build(cmd, renderer_->FrameIndex(), rt_casters_)) {
+        untraced();
+    }
     static const bool log_frames = std::getenv("PT_RT_LOG") != nullptr;
     if (log_frames) {
         const RtStats& s = rt_->Stats();
@@ -1221,8 +1339,8 @@ void SceneRenderer::RecordRayTracing(VkCommandBuffer cmd) {
     }
 }
 
-void SceneRenderer::RecordShadows(VkCommandBuffer cmd) {
-    if (rt_active_ || rt_reflections_ || rt_ao_active_ || rt_contact_active_) {
+void SceneRenderer::RecordShadows(gpu::CommandList& cmd) {
+    if (rt_active_ || rt_reflections_ || rt_ao_active_ || rt_contact_active_ || RtFullAny()) {
         RecordRayTracing(cmd);
     }
     if (rt_active_) {
@@ -1235,18 +1353,22 @@ void SceneRenderer::RecordShadows(VkCommandBuffer cmd) {
     for (const ShadowView& sv : shadow_views_) {
         rows = std::max(rows, static_cast<uint32_t>(sv.rect.offset.y) + sv.rect.extent.height);
     }
-    UseTargets(cmd, {{&shadow_, VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL}});
-    BeginPass(cmd, {shadow_.Extent().width, rows}, {}, &shadow_, false, true);
-    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, shadow_pipeline_);
+    cmd.UseTargets({{&shadow_, gpu::Layout::DepthAttachment}});
+    cmd.BeginPass({shadow_.Extent().width, rows}, {}, &shadow_, false, true);
+    cmd.BindPipeline(gpu::BindPoint::Graphics, shadow_pipeline_);
     for (const ShadowView& sv : shadow_views_) {
-        SetViewport(cmd, sv.rect);
-        vkCmdSetDepthBias(cmd, sv.bias_constant, 0.0f, sv.bias_slope);
+        cmd.SetViewport(sv.rect);
+        cmd.SetDepthBias(sv.bias_constant, 0.0f, sv.bias_slope);
         const uint8_t casters = sv.casters;
+        uint32_t shadow_draws = 0, shadow_indices = 0;
         for (const Draw& d : draws_) {
             if (!d.sub->shadow || (d.hidden_views & casters) != 0) {
                 continue;
             }
             if (static const char* exclude = std::getenv("PT_SHADOW_EXCLUDE"); exclude && d.mesh->name.find(exclude) != std::string::npos) {
+                continue;
+            }
+            if (light_sources_[sv.light]->id == kMirrorLightId && MirrorLightSkips(*d.mesh, static_cast<int>(d.sub - d.mesh->submeshes.data()))) {
                 continue;
             }
             if (static const bool skin_shadow_only = std::getenv("PT_SHADOW_SKIN_ONLY") != nullptr; skin_shadow_only && !d.sub->skinned) {
@@ -1261,93 +1383,121 @@ void SceneRenderer::RecordShadows(VkCommandBuffer cmd) {
             if (sv.frustum && !SphereInPlanes(d.center, d.radius, sv.planes)) {
                 continue;
             }
+            ++shadow_draws; shadow_indices += d.sub->index_count;
+            ++shadow_draws; shadow_indices += d.sub->index_count;
+            if (static const bool dump = std::getenv("PT_SHADOW_PASS_DUMP") != nullptr; dump && light_sources_[sv.light]->id == kMirrorLightId) {
+                LogInfo("shadow draw: {}#{} {} verts-radius {:.2f} centre ({:.2f} {:.2f} {:.2f})", d.mesh->name, static_cast<int>(d.sub - d.mesh->submeshes.data()), d.sub->index_count, d.radius, d.center.x, d.center.y, d.center.z);
+            }
             DrawMesh(cmd, d, sv.view, 0, false, false, nullptr, sv.cull, true);
         }
+        if (static const bool trace = std::getenv("PT_SHADOW_PASS_TRACE") != nullptr; trace) {
+            LogInfo("shadow pass: {} casters {:#x} draws {} indices {} at ({:.3f} {:.3f} {:.3f})", light_sources_[sv.light]->name, sv.casters, shadow_draws, shadow_indices, sv.center.x, sv.center.y, sv.center.z);
+        }
     }
-    vkCmdEndRendering(cmd);
-    UseTargets(cmd, {{&shadow_, VK_IMAGE_LAYOUT_DEPTH_READ_ONLY_OPTIMAL}});
+    cmd.EndPass();
+    cmd.UseTargets({{&shadow_, gpu::Layout::DepthReadOnly}});
 }
 
-void SceneRenderer::RecordGBuffer(VkCommandBuffer cmd, const ViewSetup& view) {
-    UseTargets(cmd, {{&albedo_, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL},
-                     {&normal_, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL},
-                     {&material_, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL},
-                     {&depth_, VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL}});
-    BeginPass(cmd, ViewArea(view), {{&albedo_, true, {}}, {&normal_, true, {}}, {&material_, true, {}}}, &depth_, false, true);
+void SceneRenderer::RecordGBuffer(gpu::CommandList& cmd, const ViewSetup& view) {
+    cmd.UseTargets({{&albedo_, gpu::Layout::ColorAttachment},
+                     {&normal_, gpu::Layout::ColorAttachment},
+                     {&material_, gpu::Layout::ColorAttachment},
+                     {&depth_, gpu::Layout::DepthAttachment}});
+    cmd.BeginPass(ViewArea(view), {{&albedo_, true, {}}, {&normal_, true, {}}, {&material_, true, {}}}, &depth_, false, true);
     uint32_t debug_flags = 0;
     if (debug_view == DebugView::UV0) {
         debug_flags = 2;
     } else if (debug_view == DebugView::VertexColor) {
         debug_flags = 3;
     }
+    if (static const bool lod = std::getenv("PT_DEBUG_LOD") != nullptr; lod) {
+        debug_flags = 4;
+    }
     const glm::vec4 aux[2] = {glm::vec4(0.0f), glm::vec4(0.0f, 0.0f, 0.0f, static_cast<float>(reflection_cube_))};
     for (int pass = 0; pass < 2; ++pass) {
-        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pass == 0 ? gbuffer_ : decal_);
+        const bool path = rt_path_ && view.index == main_view_.index && pt_gbuffer_ && pt_decal_;
+        cmd.BindPipeline(gpu::BindPoint::Graphics, pass == 0 ? (path ? pt_gbuffer_ : gbuffer_) : (path ? pt_decal_ : decal_));
         if (pass == 1) {
-            vkCmdSetDepthBias(cmd, 1.0f, 0.0f, 1.0f);
+            static const bool legacy_bias = std::getenv("PT_DECAL_BIAS") != nullptr;
+            cmd.SetDepthBias(legacy_bias ? 1.0f : 0.0f, 0.0f, legacy_bias ? 1.0f : 0.0f);
         }
+        const RenderPass wanted = pass == 0 ? RenderPass::Opaque : RenderPass::Decal;
+        decal_order_.clear();
         for (const Draw& d : draws_) {
-            const RenderPass wanted = pass == 0 ? RenderPass::Opaque : RenderPass::Decal;
-            if (d.sub->pass != wanted || d.sub->kind != gpu::kKindDeferred || !Visible(d, view)) {
-                continue;
+            if (d.sub->pass == wanted && d.sub->kind == gpu::kKindDeferred && Visible(d, view)) {
+                decal_order_.push_back(&d);
             }
-            DrawMesh(cmd, d, view.index, debug_flags, view.mirrored, false, aux);
+        }
+        static const bool by_layer = [] {
+            const char* env = std::getenv("PT_DECAL_LAYERS");
+            return !env || std::atoi(env) != 0;
+        }();
+        if (pass == 1 && by_layer) {
+            std::stable_sort(decal_order_.begin(), decal_order_.end(), [](const Draw* a, const Draw* b) { return a->sub->layer < b->sub->layer; });
+        }
+        for (const Draw* d : decal_order_) {
+            DrawMesh(cmd, *d, view.index, debug_flags, view.mirrored, false, aux);
         }
     }
-    vkCmdEndRendering(cmd);
+    cmd.EndPass();
 }
 
-void SceneRenderer::RecordOcclusion(VkCommandBuffer cmd, const ViewSetup& view) {
-    UseTargets(cmd, {{&depth_, VK_IMAGE_LAYOUT_DEPTH_READ_ONLY_OPTIMAL}, {&ao_[0], VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL}});
-    BeginPass(cmd, extent_, {{&ao_[0], false, {}}});
+void SceneRenderer::RecordOcclusion(gpu::CommandList& cmd, const ViewSetup& view) {
+    cmd.UseTargets({{&depth_, gpu::Layout::DepthReadOnly}, {&ao_[0], gpu::Layout::ColorAttachment}});
+    cmd.BeginPass(extent_, {{&ao_[0], false, {}}});
     gpu::PassPush push;
     push.ids = glm::uvec4(view.index, 0, 0, 0);
     push.f0 = glm::vec4(3.0f, 1.0f, 0.0f, 0.0f);
     push.f1 = glm::vec4(1.0f, 4.0f, 1.0f, 0.25f);
     push.f2 = glm::vec4(1.0f / 5.0f, 0.85f, std::min(camera_.far_plane, 100.0f + 150.0f), 1.0f / 150.0f);
     Fullscreen(cmd, occlusion_, push);
-    vkCmdEndRendering(cmd);
-    UseTargets(cmd, {{&ao_[0], VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL}, {&ao_[1], VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL}});
-    BeginPass(cmd, extent_, {{&ao_[1], false, {}}});
+    cmd.EndPass();
+    cmd.UseTargets({{&ao_[0], gpu::Layout::ShaderReadOnly}, {&ao_[1], gpu::Layout::ColorAttachment}});
+    cmd.BeginPass(extent_, {{&ao_[1], false, {}}});
     push.f0 = glm::vec4(0.45f, 0.0f, 0.0f, 0.0f);
     Fullscreen(cmd, occlusion_blur_, push);
-    vkCmdEndRendering(cmd);
-    UseTargets(cmd, {{&ao_[1], VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL}});
+    cmd.EndPass();
+    cmd.UseTargets({{&ao_[1], gpu::Layout::ShaderReadOnly}});
 }
 
 bool SceneRenderer::EnsureAoTargets() {
+    const vk::AllocTag tag("ray tracing");
     if (rt_ao_images_[0].Valid() && rt_ao_images_[0].Extent().width == extent_.width && rt_ao_images_[0].Extent().height == extent_.height) {
         return true;
     }
-    vk::Context& ctx = renderer_->Context();
-    vkDeviceWaitIdle(device_);
+    if (rt_ao_failed_extent_.width == extent_.width && rt_ao_failed_extent_.height == extent_.height &&
+        std::chrono::steady_clock::now() - rt_ao_failed_at_ < std::chrono::seconds(5)) {
+        return false;
+    }
+    gpu_->WaitIdle();
     for (RenderTarget& t : rt_ao_images_) {
-        ctx.DestroyImage(t.image);
+        gpu_->DestroyImage(t.image);
         t = RenderTarget{};
     }
-    const VkFormat formats[RayTracing::kAoImages] = {VK_FORMAT_R32_SFLOAT, VK_FORMAT_R16G16B16A16_SFLOAT, VK_FORMAT_R16G16B16A16_SFLOAT,
-                                                     VK_FORMAT_R32_SFLOAT, VK_FORMAT_R32_SFLOAT};
-    VkImageView views[RayTracing::kAoImages]{};
+    const gpu::Format formats[RayTracing::kAoImages] = {gpu::Format::R32Sfloat, gpu::Format::R16G16B16A16Sfloat, gpu::Format::R16G16B16A16Sfloat,
+                                                     gpu::Format::R32Sfloat, gpu::Format::R32Sfloat};
+    gpu::ImageViewHandle views[RayTracing::kAoImages]{};
     for (uint32_t i = 0; i < RayTracing::kAoImages; ++i) {
-        if (!CreateTarget(rt_ao_images_[i], formats[i], extent_, VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
-                          VK_IMAGE_ASPECT_COLOR_BIT)) {
+        if (!CreateTarget(rt_ao_images_[i], formats[i], extent_, gpu::ImageUsage::Storage | gpu::ImageUsage::TransferDst,
+                          gpu::Aspect::Color)) {
             LogError("ray tracing: AO image creation failed at {}x{}", extent_.width, extent_.height);
+            rt_ao_failed_extent_ = extent_;
+            rt_ao_failed_at_ = std::chrono::steady_clock::now();
             for (RenderTarget& t : rt_ao_images_) {
-                ctx.DestroyImage(t.image);
+                gpu_->DestroyImage(t.image);
                 t = RenderTarget{};
             }
             return false;
         }
         views[i] = rt_ao_images_[i].image.view;
     }
-    ctx.Submit([&](VkCommandBuffer cmd) {
-        const VkImageSubresourceRange range{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+    gpu_->Submit([&](gpu::CommandList& cmd) {
         for (uint32_t i = 0; i < RayTracing::kAoImages; ++i) {
-            UseTargets(cmd, {{&rt_ao_images_[i], VK_IMAGE_LAYOUT_GENERAL}});
-            const VkClearColorValue value = (i == 1 || i == 2) ? VkClearColorValue{} : VkClearColorValue{{1.0f, 1.0f, 1.0f, 1.0f}};
-            vkCmdClearColorImage(cmd, rt_ao_images_[i].image.image, VK_IMAGE_LAYOUT_GENERAL, &value, 1, &range);
+            cmd.UseTargets({{&rt_ao_images_[i], gpu::Layout::General}});
+            const gpu::ClearColor value = (i == 1 || i == 2) ? gpu::ClearColor{} : gpu::ClearColor{{1.0f, 1.0f, 1.0f, 1.0f}};
+            cmd.ClearColorImage(rt_ao_images_[i].image, gpu::Layout::General, value, 1, 1);
         }
-        UseTargets(cmd, {{&rt_ao_images_[0], VK_IMAGE_LAYOUT_GENERAL}});
+        cmd.UseTargets({{&rt_ao_images_[0], gpu::Layout::General}});
     });
     rt_->SetAoImages(views);
     rt_ao_history_ = false;
@@ -1355,7 +1505,7 @@ bool SceneRenderer::EnsureAoTargets() {
     return true;
 }
 
-void SceneRenderer::RecordRtAmbientOcclusion(VkCommandBuffer cmd, const ViewSetup& view) {
+void SceneRenderer::RecordRtAmbientOcclusion(gpu::CommandList& cmd, const ViewSetup& view) {
     const gpu::View& v = frame_->views[view.index];
     const bool cut = glm::distance(rt_ao_previous_eye_, view.eye) > kCameraCutDistance;
     const uint32_t previous = rt_ao_written_;
@@ -1363,26 +1513,26 @@ void SceneRenderer::RecordRtAmbientOcclusion(VkCommandBuffer cmd, const ViewSetu
     push.ids = glm::uvec4(view.index, static_cast<uint32_t>(frame_counter_ & 0xFFFFFFu), std::getenv("PT_RT_AO_RAYS")?rt_ao_rays_:2u << std::clamp(graphics.ray_quality,0,2), 0);
     push.f0 = glm::vec4(rt_ao_reach_, rt_ao_frames_, 0.0f, 0.0f);
     push.m = rt_ao_previous_;
-    BindSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE);
-    const VkDescriptorSet rt_set = rt_->Set(renderer_->FrameIndex());
-    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, rt_->Layout(), 2, 1, &rt_set, 0, nullptr);
+    BindSets(cmd, gpu::BindPoint::Compute);
+    const gpu::BindingSetHandle rt_set = rt_->Set(renderer_->FrameIndex());
+    cmd.BindSets(gpu::BindPoint::Compute, rt_->Layout(), 2, {&rt_set, 1});
     const uint32_t groups_x = (extent_.width + 7) / 8;
     const uint32_t groups_y = (extent_.height + 7) / 8;
-    UseTargets(cmd, {{&depth_, VK_IMAGE_LAYOUT_DEPTH_READ_ONLY_OPTIMAL}, {&normal_, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL}});
-    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, rt_ao_trace_);
+    cmd.UseTargets({{&depth_, gpu::Layout::DepthReadOnly}, {&normal_, gpu::Layout::ShaderReadOnly}});
+    cmd.BindPipeline(gpu::BindPoint::Compute, rt_ao_trace_);
     PushConstants(cmd, &push, sizeof(push));
-    vkCmdDispatch(cmd, groups_x, groups_y, 1);
-    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, rt_ao_filter_);
+    cmd.Dispatch(groups_x, groups_y, 1);
+    cmd.BindPipeline(gpu::BindPoint::Compute, rt_ao_filter_);
     for (uint32_t pass = 0; pass < 3; ++pass) {
-        UseTargets(cmd, {{&rt_ao_images_[0], VK_IMAGE_LAYOUT_GENERAL}, {&rt_ao_images_[1], VK_IMAGE_LAYOUT_GENERAL},
-                         {&rt_ao_images_[2], VK_IMAGE_LAYOUT_GENERAL}, {&rt_ao_images_[3], VK_IMAGE_LAYOUT_GENERAL}});
+        cmd.UseTargets({{&rt_ao_images_[0], gpu::Layout::General}, {&rt_ao_images_[1], gpu::Layout::General},
+                         {&rt_ao_images_[2], gpu::Layout::General}, {&rt_ao_images_[3], gpu::Layout::General}});
         push.ids.z = pass;
         push.ids.w = previous | (rt_ao_history_ && !cut ? 0u : 2u);
         PushConstants(cmd, &push, sizeof(push));
-        vkCmdDispatch(cmd, groups_x, groups_y, 1);
+        cmd.Dispatch(groups_x, groups_y, 1);
     }
-    UseTargets(cmd, {{&rt_ao_images_[4], VK_IMAGE_LAYOUT_GENERAL}});
-    BindSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS);
+    cmd.UseTargets({{&rt_ao_images_[4], gpu::Layout::General}});
+    BindSets(cmd, gpu::BindPoint::Graphics);
     rt_ao_written_ = previous ^ 1u;
     rt_ao_history_ = true;
     rt_ao_previous_ = v.view_projection;
@@ -1390,71 +1540,146 @@ void SceneRenderer::RecordRtAmbientOcclusion(VkCommandBuffer cmd, const ViewSetu
     rt_ao_ready_ = true;
 }
 
-void SceneRenderer::RecordLighting(VkCommandBuffer cmd, const ViewSetup& view) {
-    const VkCullModeFlags cull = view.mirrored ? VK_CULL_MODE_BACK_BIT : VK_CULL_MODE_FRONT_BIT;
-    const bool probes = toggles.probes && probe_count_ > 0;
-    const bool lights = toggles.lights && debug_view != DebugView::Ambient;
-    const VkExtent2D area = ViewArea(view);
+glm::mat4 SceneRenderer::SpotVolume(const SceneLight& l, float radius, float& size) {
+    size = 0.0f;
+    if (!(l.inv_cone_range > 0.0f) || !(l.cone_exponent > 0.0f) || !(radius > 0.0f) || !std::isfinite(l.cos_outer)) {
+        return glm::mat4(1.0f);
+    }
+    const float length_dir = glm::length(l.direction);
+    if (!(length_dir > 1.0e-6f)) {
+        return glm::mat4(1.0f);
+    }
+    const glm::vec3 axis = l.direction / length_dir;
+    const glm::vec3 u = glm::normalize(glm::cross(axis, AnyPerpendicular(axis)));
+    const glm::vec3 w = glm::cross(axis, u);
+    constexpr float kMargin = 0.05f;
+    const float c = std::clamp(l.cos_outer - 1.0e-3f, -1.0f, 1.0f);
+    float z_min = -kMargin;
+    float lateral = radius;
+    if (c >= 0.0f) {
+        lateral = std::min(radius, radius * std::sqrt(std::max(0.0f, 1.0f - c * c)) + kMargin);
+    } else {
+        z_min = std::max(-radius, radius * c - kMargin);
+    }
+    const float z_max = radius;
+    const float half_z = 0.5f * (z_max - z_min);
+    const glm::vec3 center = l.position + axis * (0.5f * (z_max + z_min));
+    size = lateral * lateral * half_z;
+    return glm::mat4(glm::vec4(u * lateral, 0.0f), glm::vec4(w * lateral, 0.0f), glm::vec4(axis * half_z, 0.0f), glm::vec4(center, 1.0f));
+}
+
+glm::vec2 SceneRenderer::LightDepthBounds(const gpu::Light& light, const gpu::View& view, const glm::mat4* volume) {
+    const double outer = std::pow(1.0 / std::max(static_cast<double>(light.range.z), 1.0e-30), 0.25);
+    const double reach = std::max(outer, outer - static_cast<double>(light.range.x));
+    const double radius = reach * 1.02 + 0.05;
+    const double center_z = static_cast<double>((view.view * glm::vec4(glm::vec3(light.position), 1.0f)).z);
+    const double near_distance = static_cast<double>(view.projection_param.z);
+    double far_z = center_z + radius;
+    double near_z = center_z - radius;
+    if (volume) {
+        double lo_z = std::numeric_limits<double>::max();
+        double hi_z = -std::numeric_limits<double>::max();
+        for (int corner = 0; corner < 8; ++corner) {
+            const glm::vec4 local((corner & 1) ? 1.0f : -1.0f, (corner & 2) ? 1.0f : -1.0f, (corner & 4) ? 1.0f : -1.0f, 1.0f);
+            const double z = static_cast<double>((view.view * (*volume * local)).z);
+            lo_z = std::min(lo_z, z);
+            hi_z = std::max(hi_z, z);
+        }
+        const double margin = 0.01 + 1.0e-4 * std::max(std::abs(lo_z), std::abs(hi_z));
+        if (std::isfinite(lo_z) && std::isfinite(hi_z)) {
+            near_z = std::max(near_z, lo_z - margin);
+            far_z = std::min(far_z, hi_z + margin);
+        }
+    }
+    if (!(far_z > 0.0) || !(near_distance > 0.0) || !std::isfinite(far_z) || !std::isfinite(near_z) || near_z > far_z) {
+        return {0.0f, 1.0f};
+    }
+    const double lo = near_distance / far_z * (1.0 - 1.0e-4);
+    const double hi = near_z > 0.0 ? near_distance / near_z * (1.0 + 1.0e-4) : 1.0;
+    return {static_cast<float>(std::clamp(lo, 0.0, 1.0)), static_cast<float>(std::clamp(hi, 0.0, 1.0))};
+}
+
+void SceneRenderer::RecordLighting(gpu::CommandList& cmd, const ViewSetup& view) {
+    const gpu::CullMode cull = view.mirrored ? gpu::CullMode::Back : gpu::CullMode::Front;
+    const bool path = rt_path_ && view.index == main_view_.index && lighting_->valid && rt_full_traced_;
+    const bool probes = toggles.probes && probe_count_ > 0 && !path;
+    const bool lights = toggles.lights && debug_view != DebugView::Ambient && !path;
+    const gpu::Extent2D area = ViewArea(view);
     static const bool legacy_resolve = [] {
         const char* v = std::getenv("PT_SH_RESOLVE");
         return v && std::string_view(v) == "legacy";
     }();
     const bool ao = rt_ao_ready_ && view.index == main_view_.index;
     const bool shrink = !up_.enabled && !ao && !legacy_resolve;
-    const VkExtent2D acc_area{shrink ? (area.width + 1) / 2 : area.width, shrink ? (area.height + 1) / 2 : area.height};
+    const gpu::Extent2D acc_area{shrink ? (area.width + 1) / 2 : area.width, shrink ? (area.height + 1) / 2 : area.height};
     auto draw_probes = [&](uint32_t shrink_flag) {
         if (ao) {
-            vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, probe_ao_);
-            const VkDescriptorSet rt_set = rt_->Set(renderer_->FrameIndex());
-            vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, rt_->Layout(), 2, 1, &rt_set, 0, nullptr);
+            cmd.BindPipeline(gpu::BindPoint::Graphics, probe_ao_);
+            const gpu::BindingSetHandle rt_set = rt_->Set(renderer_->FrameIndex());
+            cmd.BindSets(gpu::BindPoint::Graphics, rt_->Layout(), 2, {&rt_set, 1});
         } else {
-            vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, probe_);
+            cmd.BindPipeline(gpu::BindPoint::Graphics, probe_);
         }
-        vkCmdSetCullMode(cmd, cull);
+        cmd.SetCullMode(cull);
         for (uint32_t i = 0; i < probe_count_; ++i) {
             const SceneProbe& p = lighting_->probes[probe_order_[i]];
             gpu::PassPush push;
             push.ids = glm::uvec4(view.index, i, shrink_flag, 0);
             push.m = p.box_world;
             PushConstants(cmd, &push, sizeof(push));
-            vkCmdDraw(cmd, 36, 1, 0, 0);
+            cmd.Draw(36, 1, 0, 0);
         }
     };
     if (probes) {
-        UseTargets(cmd, {{&normal_, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL},
-                         {&depth_, VK_IMAGE_LAYOUT_DEPTH_READ_ONLY_OPTIMAL},
-                         {&probe_acc_, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL}});
-        VkClearColorValue transmittance{};
+        cmd.UseTargets({{&normal_, gpu::Layout::ShaderReadOnly},
+                         {&depth_, gpu::Layout::DepthReadOnly},
+                         {&probe_acc_, gpu::Layout::ColorAttachment}});
+        gpu::ClearColor transmittance{};
         transmittance.float32[3] = 1.0f;
-        BeginPass(cmd, acc_area, {{&probe_acc_, true, transmittance}});
+        cmd.BeginPass(acc_area, {{&probe_acc_, true, transmittance}});
         draw_probes(shrink ? 1u : 0u);
-        vkCmdEndRendering(cmd);
-        UseTargets(cmd, {{&probe_acc_, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL}});
+        cmd.EndPass();
+        cmd.UseTargets({{&probe_acc_, gpu::Layout::ShaderReadOnly}});
     }
-    UseTargets(cmd, {{&albedo_, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL},
-                     {&normal_, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL},
-                     {&material_, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL},
-                     {&depth_, VK_IMAGE_LAYOUT_DEPTH_READ_ONLY_OPTIMAL},
-                     {&diffuse_, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL},
-                     {&specular_, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL}});
-    BeginPass(cmd, area, {{&diffuse_, true, {}}, {&specular_, true, {}}}, &depth_, true, false);
+    cmd.UseTargets({{&albedo_, gpu::Layout::ShaderReadOnly},
+                     {&normal_, gpu::Layout::ShaderReadOnly},
+                     {&material_, gpu::Layout::ShaderReadOnly},
+                     {&depth_, gpu::Layout::DepthReadOnly},
+                     {&diffuse_, gpu::Layout::ColorAttachment},
+                     {&specular_, gpu::Layout::ColorAttachment}});
+    cmd.BeginPass(area, {{&diffuse_, true, {}}, {&specular_, true, {}}}, &depth_, true, false);
     if (probes) {
-        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, probe_resolve_);
+        cmd.BindPipeline(gpu::BindPoint::Graphics, probe_resolve_);
         gpu::PassPush push;
         push.ids = glm::uvec4(legacy_resolve ? 2u : (shrink ? 1u : 0u), acc_area.width, acc_area.height, view.index);
         PushConstants(cmd, &push, sizeof(push));
-        vkCmdDraw(cmd, 3, 1, 0, 0);
+        cmd.Draw(3, 1, 0, 0);
     }
-    const bool contact = rt_contact_active_ && view.index == main_view_.index;
+    if (view.index == main_view_.index) {
+        Stamp(cmd, 15);
+    }
+    const bool full = rt_full_shadows_ && view.index == main_view_.index && lighting_->valid && rt_full_traced_;
+    if (full) {
+        cmd.EndPass();
+        cmd.UseTargets({{&rt_full_images_[0], gpu::Layout::ColorAttachment}, {&rt_full_images_[1], gpu::Layout::ColorAttachment}});
+        cmd.BeginPass(area, {{&rt_full_images_[0], true, {}}, {&specular_, false, {}}, {&rt_full_images_[1], true, {}}}, &depth_, true, false);
+    }
+    const bool contact = rt_contact_active_ && view.index == main_view_.index && !full;
+    FrameSlot& timing_slot = slots_[renderer_->FrameIndex()];
+    const bool light_timing = timing_slot.light_queries && view.index == main_view_.index;
+    if (light_timing) {
+        cmd.ResetQueries(timing_slot.light_queries, 0, 2 * gpu::kMaxLights);
+        timing_slot.light_names.clear();
+    }
     if (lights && light_count_ > 0) {
-        if (rt_active_ || contact) {
-            vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, rt_active_ ? light_rt_ : light_contact_);
-            const VkDescriptorSet rt_set = rt_->Set(renderer_->FrameIndex());
-            vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, rt_->Layout(), 2, 1, &rt_set, 0, nullptr);
+        if (rt_active_ || contact || full) {
+            cmd.BindPipeline(gpu::BindPoint::Graphics, full ? light_full_ : rt_active_ ? light_rt_ : light_contact_);
+            const gpu::BindingSetHandle rt_set = rt_->Set(renderer_->FrameIndex());
+            cmd.BindSets(gpu::BindPoint::Graphics, rt_->Layout(), 2, {&rt_set, 1});
         } else {
-            vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, light_);
+            cmd.BindPipeline(gpu::BindPoint::Graphics, light_);
         }
-        vkCmdSetCullMode(cmd, cull);
+        cmd.SetCullMode(cull);
         for (uint32_t i = 0; i < light_count_; ++i) {
             const SceneLight& l = *light_sources_[i];
             if (const char* only = std::getenv("PT_LIGHT_DRAW_ONLY"); only && l.name.find(only) == std::string::npos) {
@@ -1465,16 +1690,41 @@ void SceneRenderer::RecordLighting(VkCommandBuffer cmd, const ViewSetup& view) {
             }
             const float radius = l.outer_range * 1.02f + 0.05f;
             glm::mat4 volume = glm::translate(glm::mat4(1.0f), l.position) * glm::scale(glm::mat4(1.0f), glm::vec3(radius));
+            float volume_size = radius * radius * radius;
+            const bool area_bounds = l.has_area && l.area_clip_mode == AreaClipMode::Box;
+            bool drawn_area = false;
             if (l.has_area) {
                 const glm::mat3 box(l.area_world);
                 const glm::vec3 half(glm::length(box[0]), glm::length(box[1]), glm::length(box[2]));
                 if (half.x * half.y * half.z < radius * radius * radius) {
                     volume = l.area_world;
+                    volume_size = half.x * half.y * half.z;
+                    drawn_area = true;
                 }
             }
+            static const bool spot_box = [] {
+                const char* v = std::getenv("PT_LIGHT_SPOT_BOX");
+                return !(v && v[0] == '0');
+            }();
+            static const bool alternate = [] {
+                const char* v = std::getenv("PT_LIGHT_DEPTH_BOUNDS");
+                return v && std::string_view(v) == "alternate";
+            }();
+            const bool former = alternate && (frame_counter_ & 1u);
+            if (spot_box && !former && l.type == LightType::Spot && (!drawn_area || area_bounds)) {
+                float size = 0.0f;
+                const glm::mat4 cone_box = SpotVolume(l, radius, size);
+                if (size > 0.0f && size < volume_size) {
+                    volume = cone_box;
+                    volume_size = size;
+                    drawn_area = false;
+                }
+            }
+            const bool volume_bounds = !drawn_area || area_bounds;
             gpu::PassPush push;
             const uint32_t mirror_light = mirror_shadow_lights_[i];
-            const bool has_shadow = view.view_bit == 2 ? mirror_light != gpu::kInvalid : (light_shadow_views_[i] & view.view_bit) != 0;
+            const bool has_shadow = full ? frame_->lights[i].info.x >= 0
+                                         : view.view_bit == 2 ? mirror_light != gpu::kInvalid : (light_shadow_views_[i] & view.view_bit) != 0;
             const uint32_t light_index = view.view_bit == 2 && has_shadow ? mirror_light : i;
             push.ids = glm::uvec4(view.index, light_index, toggles.shadows && has_shadow ? 1u : 0u, 0);
             if (const char* unshadowed = std::getenv("PT_LIGHT_DRAW_NO_SHADOW"); unshadowed && l.name.find(unshadowed) != std::string::npos) {
@@ -1482,37 +1732,68 @@ void SceneRenderer::RecordLighting(VkCommandBuffer cmd, const ViewSetup& view) {
             }
             push.f0.x = contact ? rt_contact_reach_ : 0.0f;
             push.f0.y = contact && rt_contact_legacy_ ? 1.0f : 0.0f;
+            static const bool contact_centre = std::getenv("PT_RT_CONTACT_CENTRE") != nullptr;
+            static const float contact_rays = [] {
+                const char* value = std::getenv("PT_RT_CONTACT_RAYS");
+                return value ? static_cast<float>(std::clamp(std::atoi(value), 1, 8)) : 2.0f;
+            }();
+            push.f0.z = contact && !contact_centre && rt_active_ && raytracing.soft_shadows ? contact_rays : 0.0f;
+            if (full) {
+                push.f0.w = 0.0015f;
+            }
             push.m = volume;
             PushConstants(cmd, &push, sizeof(push));
-            vkCmdDraw(cmd, 36, 1, 0, 0);
+            if (light_depth_bounds_) {
+                const glm::vec2 bounds = former ? glm::vec2(0.0f, 1.0f)
+                                                                              : LightDepthBounds(frame_->lights[light_index], frame_->views[view.index],
+                                                                                                 volume_bounds ? &volume : nullptr);
+                cmd.SetDepthBounds(bounds.x, bounds.y);
+            }
+            const uint32_t timed = static_cast<uint32_t>(timing_slot.light_names.size());
+            if (light_timing) {
+                const gpu::Light& g = frame_->lights[light_index];
+                timing_slot.light_names.push_back(std::format("{} {} r {:.2f}{}{}", l.name.empty() ? "(effect)" : l.name,
+                                                              l.type == LightType::Spot ? "spot" : "point", l.outer_range,
+                                                              push.ids.z ? " shadow" : "", g.info.y >= 0 || g.info.w > 0 ? " mask" : ""));
+                cmd.WriteTimestamp(timing_slot.light_queries, 2 * timed);
+            }
+            cmd.Draw(36, 1, 0, 0);
+            if (light_timing) {
+                cmd.WriteTimestamp(timing_slot.light_queries, 2 * timed + 1);
+            }
         }
     }
-    vkCmdEndRendering(cmd);
-    UseTargets(cmd, {{&diffuse_, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL}, {&specular_, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL}});
+    cmd.EndPass();
+    if (light_timing) {
+        timing_slot.light_timed = !timing_slot.light_names.empty();
+    }
+    if (view.index == main_view_.index) {
+        Stamp(cmd, 16);
+        Stamp(cmd, 21);
+        if (RtFullAny() && lighting_->valid && rt_full_traced_) {
+            RecordRtFullResolve(cmd, view);
+        }
+        Stamp(cmd, 22);
+    }
+    cmd.UseTargets({{&diffuse_, gpu::Layout::ShaderReadOnly}, {&specular_, gpu::Layout::ShaderReadOnly}});
 }
 
-void SceneRenderer::RecordLuminance(VkCommandBuffer cmd) {
+void SceneRenderer::RecordLuminance(gpu::CommandList& cmd) {
     FrameSlot& slot = slots_[renderer_->FrameIndex()];
-    const uint32_t gx = (extent_.width + 31) / 32;
-    const uint32_t gy = (extent_.height + 31) / 32;
-    if (gx * gy > 16384) {
-        return;
+    const uint32_t gx = 2;
+    const uint32_t gy = 2;
+    cmd.BindPipeline(gpu::BindPoint::Compute, luminance_);
+    BindSets(cmd, gpu::BindPoint::Compute);
+    if (slot.dispatch_set) {
+        const uint32_t groups[4] = {gx, gy, 1, 0};
+        std::memcpy(slot.dispatch.mapped, groups, sizeof(groups));
+        cmd.BindSets(gpu::BindPoint::Compute, layout_, 3, {&slot.dispatch_set, 1});
     }
-    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, luminance_);
-    BindSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE);
     gpu::PassPush push;
     PushConstants(cmd, &push, sizeof(push));
-    vkCmdDispatch(cmd, gx, gy, 1);
-    VkMemoryBarrier2 barrier{VK_STRUCTURE_TYPE_MEMORY_BARRIER_2};
-    barrier.srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
-    barrier.srcAccessMask = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT;
-    barrier.dstStageMask = VK_PIPELINE_STAGE_2_HOST_BIT;
-    barrier.dstAccessMask = VK_ACCESS_2_HOST_READ_BIT;
-    VkDependencyInfo dependency{VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
-    dependency.memoryBarrierCount = 1;
-    dependency.pMemoryBarriers = &barrier;
-    vkCmdPipelineBarrier2(cmd, &dependency);
-    slot.luminance_groups = gx * gy;
+    cmd.Dispatch(gx, gy, 1);
+    cmd.GlobalBarrier(gpu::PipelineStage::ComputeShader, gpu::Bits(gpu::Access::ShaderStorageWrite), gpu::PipelineStage::Host, gpu::Bits(gpu::Access::HostRead));
+    slot.luminance_groups = gpu::kMeterTexels;
 }
 
 void SceneRenderer::UpdateReflectionTexture(const std::string& path) {
@@ -1683,7 +1964,7 @@ uint32_t SceneRenderer::MirrorLights(const Draw& draw, glm::vec4 aux[2]) const {
     return block;
 }
 
-void SceneRenderer::RecordForward(VkCommandBuffer cmd, const ViewSetup& view, RenderTarget& output) {
+void SceneRenderer::RecordForward(gpu::CommandList& cmd, const ViewSetup& view, RenderTarget& output) {
     const bool main_view = &output == &hdr_;
     bool any = false;
     for (const Draw& d : draws_) {
@@ -1694,20 +1975,23 @@ void SceneRenderer::RecordForward(VkCommandBuffer cmd, const ViewSetup& view, Re
         return;
     }
     if (main_view) {
-        vkCmdEndRendering(cmd);
-        UseTargets(cmd, {{&particles_, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL}, {&depth_, VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL}});
-        BeginPass(cmd, extent_, {{&particles_, true, {{0.0f, 0.0f, 0.0f, 1.0f}}}}, &depth_, false, false);
+        cmd.EndPass();
+        cmd.UseTargets({{&particles_, gpu::Layout::ColorAttachment}, {&depth_, gpu::Layout::DepthAttachment}});
+        cmd.BeginPass(extent_, {{&particles_, true, {{0.0f, 0.0f, 0.0f, 1.0f}}}}, &depth_, false, false);
     }
-    VkPipeline bound = VK_NULL_HANDLE;
+    gpu::PipelineHandle bound;
     for (const Draw& d : draws_) {
         const RenderPass pass = d.sub->pass;
         if ((pass != RenderPass::Unlit && pass != RenderPass::Transparent) || d.sub->kind == gpu::kKindShadowOnly || !Visible(d, view)) {
             continue;
         }
+        if (main_view && rt_path_ && rt_full_traced_ && (d.sub->kind == gpu::kKindGlass || d.sub->kind == gpu::kKindParallax)) {
+            continue;
+        }
         const bool emissive = d.sub->kind == gpu::kKindConstant || d.sub->kind == gpu::kKindSky;
-        const VkPipeline pipeline = emissive ? forward_emissive_ : forward_;
+        const gpu::PipelineHandle pipeline = emissive ? forward_emissive_ : forward_;
         if (pipeline != bound) {
-            vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
+            cmd.BindPipeline(gpu::BindPoint::Graphics, pipeline);
             bound = pipeline;
         }
         uint32_t flags = main_view ? 0x80u : 0u;
@@ -1759,33 +2043,48 @@ void SceneRenderer::RecordForward(VkCommandBuffer cmd, const ViewSetup& view, Re
     if (!main_view) {
         return;
     }
-    vkCmdEndRendering(cmd);
-    UseTargets(cmd, {{&output, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL}, {&hdr_copy_, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL}});
-    VkImageCopy copy{};
-    copy.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
-    copy.dstSubresource = copy.srcSubresource;
+    cmd.EndPass();
+    cmd.UseTargets({{&output, gpu::Layout::TransferSrc}, {&hdr_copy_, gpu::Layout::TransferDst}});
+    gpu::ImageCopy copy;
+    copy.src = {gpu::Aspect::Color, 0, 0, 1};
+    copy.dst = copy.src;
     copy.extent = {extent_.width, extent_.height, 1};
-    vkCmdCopyImage(cmd, output.image.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, hdr_copy_.image.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1,
-                   &copy);
-    UseTargets(cmd, {{&output, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL},
-                     {&hdr_copy_, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL},
-                     {&particles_, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL}});
-    BeginPass(cmd, extent_, {{&output, false, {}}});
+    cmd.CopyImage(output.image, gpu::Layout::TransferSrc, hdr_copy_.image, gpu::Layout::TransferDst, {&copy, 1});
+    cmd.UseTargets({{&output, gpu::Layout::ColorAttachment},
+                     {&hdr_copy_, gpu::Layout::ShaderReadOnly},
+                     {&particles_, gpu::Layout::ShaderReadOnly}});
+    cmd.BeginPass(extent_, {{&output, false, {}}});
     gpu::PassPush push;
     push.ids.x = 1u;
     Fullscreen(cmd, vfx_composite_, push);
-    vkCmdEndRendering(cmd);
-    UseTargets(cmd, {{&output, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL}, {&depth_, VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL}});
-    BeginPass(cmd, extent_, {{&output, false, {}}}, &depth_, false, false);
+    cmd.EndPass();
+    cmd.UseTargets({{&output, gpu::Layout::ColorAttachment}, {&depth_, gpu::Layout::DepthAttachment}});
+    cmd.BeginPass(extent_, {{&output, false, {}}}, &depth_, false, false);
 }
 
-void SceneRenderer::RecordEffects(VkCommandBuffer cmd, RenderTarget& output, SceneVfxContext context) {
-    vkCmdEndRendering(cmd);
-    UseTargets(cmd, {{&particles_, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL}, {&depth_, VK_IMAGE_LAYOUT_DEPTH_READ_ONLY_OPTIMAL}});
-    BeginPass(cmd, extent_, {{&particles_, true, {{0.0f, 0.0f, 0.0f, 1.0f}}}}, &depth_, true, false);
+void SceneRenderer::RecordEffects(gpu::CommandList& cmd, RenderTarget& output, SceneVfxContext context) {
+    cmd.EndPass();
+    const gpu::Extent2D effect_extent = particles_near_.Extent();
+    cmd.UseTargets({{&depth_, gpu::Layout::DepthReadOnly},
+                     {&near_far_depth_, gpu::Layout::ColorAttachment},
+                     {&near_far_depth_attachment_, gpu::Layout::DepthAttachment}});
+    cmd.BeginPass(effect_extent, {{&near_far_depth_, true, {}}}, &near_far_depth_attachment_, false, true);
+    BindSets(cmd, gpu::BindPoint::Graphics);
+    Fullscreen(cmd, vfx_depth_down_, gpu::PassPush{});
+    cmd.EndPass();
+    cmd.UseTargets({{&near_far_depth_, gpu::Layout::ShaderReadOnly},
+                     {&near_far_depth_attachment_, gpu::Layout::DepthReadOnly},
+                     {&particles_near_, gpu::Layout::ColorAttachment},
+                     {&particles_far_, gpu::Layout::ColorAttachment}});
+    const gpu::ClearColor clear_transmittance{{0.0f, 0.0f, 0.0f, 1.0f}};
+    cmd.BeginPass(effect_extent, {{&particles_near_, true, clear_transmittance}, {&particles_far_, true, clear_transmittance}},
+              &near_far_depth_attachment_, true, false);
     uint32_t recorded = 0;
     context.subset = kVfxOffscreen;
     context.recorded = &recorded;
+    context.extent = effect_extent;
+    context.depth_view = near_far_depth_attachment_.image.view;
+    context.near_far_depth_view = near_far_depth_.image.view;
     bool copied = false;
     context.copy_scene = nullptr;
     if (context.scene_copy_view) {
@@ -1794,89 +2093,91 @@ void SceneRenderer::RecordEffects(VkCommandBuffer cmd, RenderTarget& output, Sce
                 return;
             }
             copied = true;
-            vkCmdEndRendering(cmd);
-            UseTargets(cmd, {{&output, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL}, {&hdr_copy_, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL}});
-            VkImageCopy copy{};
-            copy.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
-            copy.dstSubresource = copy.srcSubresource;
+            cmd.EndPass();
+            cmd.UseTargets({{&output, gpu::Layout::TransferSrc}, {&hdr_copy_, gpu::Layout::TransferDst}});
+            gpu::ImageCopy copy;
+            copy.src = {gpu::Aspect::Color, 0, 0, 1};
+            copy.dst = copy.src;
             copy.extent = {extent_.width, extent_.height, 1};
-            vkCmdCopyImage(cmd, output.image.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, hdr_copy_.image.image,
-                           VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copy);
-            UseTargets(cmd, {{&hdr_copy_, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL},
-                             {&particles_, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL},
-                             {&depth_, VK_IMAGE_LAYOUT_DEPTH_READ_ONLY_OPTIMAL}});
-            BeginPass(cmd, extent_, {{&particles_, false, {}}}, &depth_, true, false);
+            cmd.CopyImage(output.image, gpu::Layout::TransferSrc, hdr_copy_.image, gpu::Layout::TransferDst, {&copy, 1});
+            cmd.UseTargets({{&hdr_copy_, gpu::Layout::ShaderReadOnly},
+                             {&particles_near_, gpu::Layout::ColorAttachment},
+                             {&particles_far_, gpu::Layout::ColorAttachment},
+                             {&near_far_depth_, gpu::Layout::ShaderReadOnly},
+                             {&near_far_depth_attachment_, gpu::Layout::DepthReadOnly}});
+            cmd.BeginPass(effect_extent, {{&particles_near_, false, {}}, {&particles_far_, false, {}}},
+                      &near_far_depth_attachment_, true, false);
         };
     }
     vfx_forward(context);
-    BindSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS);
-    vkCmdEndRendering(cmd);
+    BindSets(cmd, gpu::BindPoint::Graphics);
+    cmd.EndPass();
     if (recorded > 0) {
-        UseTargets(cmd, {{&output, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL}, {&hdr_copy_, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL}});
-        VkImageCopy copy{};
-        copy.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
-        copy.dstSubresource = copy.srcSubresource;
+        cmd.UseTargets({{&output, gpu::Layout::TransferSrc}, {&hdr_copy_, gpu::Layout::TransferDst}});
+        gpu::ImageCopy copy;
+        copy.src = {gpu::Aspect::Color, 0, 0, 1};
+        copy.dst = copy.src;
         copy.extent = {extent_.width, extent_.height, 1};
-        vkCmdCopyImage(cmd, output.image.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, hdr_copy_.image.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-                       1, &copy);
-        UseTargets(cmd, {{&output, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL},
-                         {&hdr_copy_, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL},
-                         {&particles_, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL}});
-        BeginPass(cmd, extent_, {{&output, false, {}}});
+        cmd.CopyImage(output.image, gpu::Layout::TransferSrc, hdr_copy_.image, gpu::Layout::TransferDst, {&copy, 1});
+        cmd.UseTargets({{&output, gpu::Layout::ColorAttachment},
+                         {&hdr_copy_, gpu::Layout::ShaderReadOnly},
+                         {&depth_, gpu::Layout::DepthReadOnly},
+                         {&near_far_depth_, gpu::Layout::ShaderReadOnly},
+                         {&particles_near_, gpu::Layout::ShaderReadOnly},
+                         {&particles_far_, gpu::Layout::ShaderReadOnly}});
+        cmd.BeginPass(extent_, {{&output, false, {}}});
         gpu::PassPush push;
+        push.f0.x = context.projection[3][2];
         Fullscreen(cmd, vfx_composite_, push);
-        vkCmdEndRendering(cmd);
+        cmd.EndPass();
     }
-    UseTargets(cmd, {{&output, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL}, {&depth_, VK_IMAGE_LAYOUT_DEPTH_READ_ONLY_OPTIMAL}});
-    BeginPass(cmd, extent_, {{&output, false, {}}}, &depth_, true, false);
+    cmd.UseTargets({{&output, gpu::Layout::ColorAttachment}, {&depth_, gpu::Layout::DepthReadOnly}});
+    cmd.BeginPass(extent_, {{&output, false, {}}}, &depth_, true, false);
 }
 
-void SceneRenderer::RecordSceneCopy(VkCommandBuffer cmd, RenderTarget& output) {
-    vkCmdEndRendering(cmd);
-    UseTargets(cmd, {{&output, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL}, {&hdr_copy_, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL}});
-    VkImageCopy copy{};
-    copy.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
-    copy.dstSubresource = copy.srcSubresource;
+void SceneRenderer::RecordSceneCopy(gpu::CommandList& cmd, RenderTarget& output) {
+    cmd.EndPass();
+    cmd.UseTargets({{&output, gpu::Layout::TransferSrc}, {&hdr_copy_, gpu::Layout::TransferDst}});
+    gpu::ImageCopy copy;
+    copy.src = {gpu::Aspect::Color, 0, 0, 1};
+    copy.dst = copy.src;
     copy.extent = {extent_.width, extent_.height, 1};
-    vkCmdCopyImage(cmd, output.image.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, hdr_copy_.image.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1,
-                   &copy);
-    UseTargets(cmd, {{&output, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL},
-                     {&hdr_copy_, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL},
-                     {&depth_, VK_IMAGE_LAYOUT_DEPTH_READ_ONLY_OPTIMAL}});
-    BeginPass(cmd, extent_, {{&output, false, {}}}, &depth_, true, false);
+    cmd.CopyImage(output.image, gpu::Layout::TransferSrc, hdr_copy_.image, gpu::Layout::TransferDst, {&copy, 1});
+    cmd.UseTargets({{&output, gpu::Layout::ColorAttachment},
+                     {&hdr_copy_, gpu::Layout::ShaderReadOnly},
+                     {&depth_, gpu::Layout::DepthReadOnly}});
+    cmd.BeginPass(extent_, {{&output, false, {}}}, &depth_, true, false);
 }
 
-void SceneRenderer::RecordMirrorTemporal(VkCommandBuffer cmd) {
+void SceneRenderer::RecordMirrorTemporal(gpu::CommandList& cmd) {
     const uint32_t size = mirror_view_.area.width;
     const glm::vec3 origin(mirrors_.front()->transform[3]);
     const float capture_exposure = frame_->views[mirror_view_.index].exposure.x;
     const bool valid_history = mirror_history_valid_ && !up_.reset && mirror_history_size_ == size &&
                                glm::distance(origin, mirror_history_origin_) < 0.001f;
-    UseTargets(cmd, {{&mirror_, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL},
-                     {&depth_, VK_IMAGE_LAYOUT_DEPTH_READ_ONLY_OPTIMAL},
-                     {&mirror_history_, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL},
-                     {&mirror_temporal_, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL}});
-    BeginPass(cmd, mirror_view_.area, {{&mirror_temporal_, false, {}}});
+    cmd.UseTargets({{&mirror_, gpu::Layout::ShaderReadOnly},
+                     {&depth_, gpu::Layout::DepthReadOnly},
+                     {&mirror_history_, gpu::Layout::ShaderReadOnly},
+                     {&mirror_temporal_, gpu::Layout::ColorAttachment}});
+    cmd.BeginPass(mirror_view_.area, {{&mirror_temporal_, false, {}}});
     gpu::PassPush push;
     push.ids = glm::uvec4(valid_history ? 1u : 0u, 0, 0, mirror_view_.index);
     push.f0 = glm::vec4(size, size, 1.0f / extent_.width, 1.0f / extent_.height);
     push.f1 = glm::vec4(capture_exposure / std::max(mirror_history_exposure_, 1.0e-12f), 0.9f, 0.0f, 0.0f);
     push.m = mirror_previous_view_projection_;
     Fullscreen(cmd, mirror_temporal_pipeline_, push);
-    vkCmdEndRendering(cmd);
-    UseTargets(cmd, {{&mirror_temporal_, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL},
-                     {&mirror_history_, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL},
-                     {&mirror_, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL}});
-    VkImageCopy copy{};
-    copy.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
-    copy.dstSubresource = copy.srcSubresource;
+    cmd.EndPass();
+    cmd.UseTargets({{&mirror_temporal_, gpu::Layout::TransferSrc},
+                     {&mirror_history_, gpu::Layout::TransferDst},
+                     {&mirror_, gpu::Layout::TransferDst}});
+    gpu::ImageCopy copy;
+    copy.src = {gpu::Aspect::Color, 0, 0, 1};
+    copy.dst = copy.src;
     copy.extent = {size, size, 1};
-    vkCmdCopyImage(cmd, mirror_temporal_.image.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, mirror_history_.image.image,
-                   VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copy);
-    vkCmdCopyImage(cmd, mirror_temporal_.image.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, mirror_.image.image,
-                   VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copy);
-    UseTargets(cmd, {{&mirror_, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL},
-                     {&mirror_history_, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL}});
+    cmd.CopyImage(mirror_temporal_.image, gpu::Layout::TransferSrc, mirror_history_.image, gpu::Layout::TransferDst, {&copy, 1});
+    cmd.CopyImage(mirror_temporal_.image, gpu::Layout::TransferSrc, mirror_.image, gpu::Layout::TransferDst, {&copy, 1});
+    cmd.UseTargets({{&mirror_, gpu::Layout::ShaderReadOnly},
+                     {&mirror_history_, gpu::Layout::ShaderReadOnly}});
     mirror_previous_view_projection_ = mirror_current_view_projection_;
     mirror_history_exposure_ = capture_exposure;
     mirror_history_origin_ = origin;
@@ -1884,20 +2185,19 @@ void SceneRenderer::RecordMirrorTemporal(VkCommandBuffer cmd) {
     mirror_history_valid_ = true;
 }
 
-void SceneRenderer::RecordReflections(VkCommandBuffer cmd, const ViewSetup& view) {
+void SceneRenderer::RecordReflections(gpu::CommandList& cmd, const ViewSetup& view) {
     constexpr float kFarLimit = 2000.0f - 0.01f;
     constexpr float kLines = 1080.0f;
     const glm::mat3 rotation(frame_->views[view.index].view);
     const glm::vec3 plane = glm::normalize(rotation * glm::vec3(0.0f, 1.0f, 0.0f));
-    glm::vec3 forward = camera_.Forward();
-    forward.y = 0.0f;
+    const glm::vec3 forward = camera_.Forward();
     const float length = glm::length(forward);
     const glm::vec3 horizontal = length > 1.0e-6f ? rotation * (forward / length) : glm::vec3(0.0f);
     const float aspect = static_cast<float>(extent_.width) / static_cast<float>(std::max(extent_.height, 1u));
 
-    UseTargets(cmd, {{&normal_, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL},
-                     {&depth_, VK_IMAGE_LAYOUT_DEPTH_READ_ONLY_OPTIMAL},
-                     {&refmap_, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL}});
+    cmd.UseTargets({{&normal_, gpu::Layout::ShaderReadOnly},
+                     {&depth_, gpu::Layout::DepthReadOnly},
+                     {&refmap_, gpu::Layout::ColorAttachment}});
     gpu::PassPush push;
     push.ids = glm::uvec4(view.index, 0, 0, 0);
     push.f0 = glm::vec4(plane, kFarLimit);
@@ -1912,11 +2212,11 @@ void SceneRenderer::RecordReflections(VkCommandBuffer cmd, const ViewSetup& view
         push.f2.w = static_cast<float>(frame_counter_ % 64u);
     }
     if (rt_reflections_) {
-        UseTargets(cmd, {{&refmap_color_, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL}});
-        BeginPass(cmd, refmap_.Extent(), {{&refmap_, false, {}}, {&refmap_color_, false, {}}});
+        cmd.UseTargets({{&refmap_color_, gpu::Layout::ColorAttachment}});
+        cmd.BeginPass(refmap_.Extent(), {{&refmap_, false, {}}, {&refmap_color_, false, {}}});
         static const uint32_t debug = [] {
             const char* value = std::getenv("PT_RT_REFLECTION_DEBUG");
-            return value ? (std::atoi(value) == 2 ? 2u : 1u) : 0u;
+            return value ? static_cast<uint32_t>(std::clamp(std::atoi(value), 1, 7)) : 0u;
         }();
         push.ids = glm::uvec4(view.index, light_count_, probe_count_, debug);
         uint32_t hidden[16] = {};
@@ -1925,32 +2225,36 @@ void SceneRenderer::RecordReflections(VkCommandBuffer cmd, const ViewSetup& view
                 hidden[i >> 5] |= 1u << (i & 31u);
             }
         }
+        if (rt_glossy_active_) {
+            const float on = 1.0f;
+            std::memcpy(&hidden[15], &on, sizeof(on));
+        }
         std::memcpy(&push.m, hidden, sizeof(hidden));
-        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, reflect_make_rt_);
-        const VkDescriptorSet rt_set = rt_->Set(renderer_->FrameIndex());
-        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, rt_->Layout(), 2, 1, &rt_set, 0, nullptr);
+        cmd.BindPipeline(gpu::BindPoint::Graphics, reflect_make_rt_);
+        const gpu::BindingSetHandle rt_set = rt_->Set(renderer_->FrameIndex());
+        cmd.BindSets(gpu::BindPoint::Graphics, rt_->Layout(), 2, {&rt_set, 1});
         PushConstants(cmd, &push, sizeof(push));
-        vkCmdDraw(cmd, 3, 1, 0, 0);
-        vkCmdEndRendering(cmd);
-        UseTargets(cmd, {{&refmap_color_, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL}});
+        cmd.Draw(3, 1, 0, 0);
+        cmd.EndPass();
+        cmd.UseTargets({{&refmap_color_, gpu::Layout::ShaderReadOnly}});
         push.ids = glm::uvec4(view.index, 0, 0, 0);
         push.m = glm::mat4(1.0f);
     } else {
-        BeginPass(cmd, refmap_.Extent(), {{&refmap_, false, {}}});
+        cmd.BeginPass(refmap_.Extent(), {{&refmap_, false, {}}});
         Fullscreen(cmd, reflect_make_, push);
-        vkCmdEndRendering(cmd);
+        cmd.EndPass();
     }
 
-    UseTargets(cmd, {{&refmap_, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL},
-                     {&hdr_, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL},
-                     {&hdr_copy_, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL}});
-    VkImageCopy copy{};
-    copy.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
-    copy.dstSubresource = copy.srcSubresource;
+    cmd.UseTargets({{&refmap_, gpu::Layout::ShaderReadOnly},
+                     {&hdr_, gpu::Layout::TransferSrc},
+                     {&hdr_copy_, gpu::Layout::TransferDst}});
+    gpu::ImageCopy copy;
+    copy.src = {gpu::Aspect::Color, 0, 0, 1};
+    copy.dst = copy.src;
     copy.extent = {extent_.width, extent_.height, 1};
-    vkCmdCopyImage(cmd, hdr_.image.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, hdr_copy_.image.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1,
-                   &copy);
+    cmd.CopyImage(hdr_.image, gpu::Layout::TransferSrc, hdr_copy_.image, gpu::Layout::TransferDst, {&copy, 1});
     push.f0 = glm::vec4(plane, depth_legacy ? 1.0f : 0.0f);
+    push.ids.z = rt_glossy_active_ ? 1u : 0u;
     const ScreenSettings& screen = lighting_->screen;
     push.f1 = glm::vec4(1.0f, 1.0f, screen.reflect_scale, screen.reflect_bias);
     push.f2 = glm::vec4(horizontal, screen.reflect_edge ? 1.0f : 0.0f);
@@ -1962,24 +2266,24 @@ void SceneRenderer::RecordReflections(VkCommandBuffer cmd, const ViewSetup& view
     }
     reflect_history_valid_ = false;
     reflect_post_upscale_ = false;
-    UseTargets(cmd, {{&hdr_copy_, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL},
-                     {&material_, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL},
-                     {&hdr_, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL}});
-    BeginPass(cmd, extent_, {{&hdr_, false, {}}});
+    cmd.UseTargets({{&hdr_copy_, gpu::Layout::ShaderReadOnly},
+                     {&material_, gpu::Layout::ShaderReadOnly},
+                     {&hdr_, gpu::Layout::ColorAttachment}});
+    cmd.BeginPass(extent_, {{&hdr_, false, {}}});
     if (rt_reflections_) {
-        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, reflect_blend_rt_);
-        const VkDescriptorSet rt_set = rt_->Set(renderer_->FrameIndex());
-        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, rt_->Layout(), 2, 1, &rt_set, 0, nullptr);
+        cmd.BindPipeline(gpu::BindPoint::Graphics, reflect_blend_rt_);
+        const gpu::BindingSetHandle rt_set = rt_->Set(renderer_->FrameIndex());
+        cmd.BindSets(gpu::BindPoint::Graphics, rt_->Layout(), 2, {&rt_set, 1});
         PushConstants(cmd, &push, sizeof(push));
-        vkCmdDraw(cmd, 3, 1, 0, 0);
+        cmd.Draw(3, 1, 0, 0);
     } else {
         Fullscreen(cmd, reflect_blend_, push);
     }
-    vkCmdEndRendering(cmd);
-    UseTargets(cmd, {{&hdr_, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL}});
+    cmd.EndPass();
+    cmd.UseTargets({{&hdr_, gpu::Layout::ShaderReadOnly}});
 }
 
-void SceneRenderer::RecordReflectionTemporal(VkCommandBuffer cmd, const ViewSetup& view, gpu::PassPush push) {
+void SceneRenderer::RecordReflectionTemporal(gpu::CommandList& cmd, const ViewSetup& view, gpu::PassPush push) {
     const float exposure = frame_->views[view.index].exposure.x;
     const bool valid_history = reflect_history_valid_ && !up_.reset && reflect_history_frame_ + 1 == frame_counter_;
     static uint32_t logged = 0;
@@ -1989,64 +2293,63 @@ void SceneRenderer::RecordReflectionTemporal(VkCommandBuffer cmd, const ViewSetu
     }
     const uint32_t previous = reflect_history_index_;
     const uint32_t current = 1u - previous;
-    UseTargets(cmd, {{&hdr_copy_, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL},
-                     {&material_, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL},
-                     {&reflect_layer_, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL},
-                     {&reflect_offset_, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL}});
-    BeginPass(cmd, extent_, {{&reflect_layer_, false, {}}, {&reflect_offset_, false, {}}});
+    cmd.UseTargets({{&hdr_copy_, gpu::Layout::ShaderReadOnly},
+                     {&material_, gpu::Layout::ShaderReadOnly},
+                     {&reflect_layer_, gpu::Layout::ColorAttachment},
+                     {&reflect_offset_, gpu::Layout::ColorAttachment}});
+    cmd.BeginPass(extent_, {{&reflect_layer_, false, {}}, {&reflect_offset_, false, {}}});
     push.m = previous_view_projection_;
     if (rt_reflections_) {
-        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, reflect_layer_rt_);
-        const VkDescriptorSet rt_set = rt_->Set(renderer_->FrameIndex());
-        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, rt_->Layout(), 2, 1, &rt_set, 0, nullptr);
+        cmd.BindPipeline(gpu::BindPoint::Graphics, reflect_layer_rt_);
+        const gpu::BindingSetHandle rt_set = rt_->Set(renderer_->FrameIndex());
+        cmd.BindSets(gpu::BindPoint::Graphics, rt_->Layout(), 2, {&rt_set, 1});
         PushConstants(cmd, &push, sizeof(push));
-        vkCmdDraw(cmd, 3, 1, 0, 0);
+        cmd.Draw(3, 1, 0, 0);
     } else {
         Fullscreen(cmd, reflect_layer_pipeline_, push);
     }
-    vkCmdEndRendering(cmd);
+    cmd.EndPass();
 
-    UseTargets(cmd, {{&reflect_layer_, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL},
-                     {&reflect_offset_, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL},
-                     {&reflect_history_[previous], VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL},
-                     {&reflect_history_[current], VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL},
-                     {&hdr_, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL}});
-    BeginPass(cmd, extent_, {{&hdr_, false, {}}, {&reflect_history_[current], false, {}}});
+    cmd.UseTargets({{&reflect_layer_, gpu::Layout::ShaderReadOnly},
+                     {&reflect_offset_, gpu::Layout::ShaderReadOnly},
+                     {&reflect_history_[previous], gpu::Layout::ShaderReadOnly},
+                     {&reflect_history_[current], gpu::Layout::ColorAttachment},
+                     {&hdr_, gpu::Layout::ColorAttachment}});
+    cmd.BeginPass(extent_, {{&hdr_, false, {}}, {&reflect_history_[current], false, {}}});
     gpu::PassPush temporal;
     temporal.ids = glm::uvec4(view.index, valid_history ? 1u : 0u, gpu::kImgReflectHistoryA + previous, 0u);
     static const bool pre_upscale = std::getenv("PT_REFLECT_PRE_UPSCALE") != nullptr;
     reflect_post_upscale_ = !pre_upscale;
     temporal.f1 = glm::vec4(exposure / std::max(reflect_history_exposure_, 1.0e-12f), 0.9f, 1.25f, reflect_post_upscale_ ? 1.0f : 0.0f);
     Fullscreen(cmd, reflect_temporal_pipeline_, temporal);
-    vkCmdEndRendering(cmd);
-    UseTargets(cmd, {{&hdr_, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL},
-                     {&reflect_history_[current], VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL}});
+    cmd.EndPass();
+    cmd.UseTargets({{&hdr_, gpu::Layout::ShaderReadOnly},
+                     {&reflect_history_[current], gpu::Layout::ShaderReadOnly}});
     reflect_history_index_ = current;
     reflect_history_frame_ = frame_counter_;
     reflect_history_exposure_ = exposure;
     reflect_history_valid_ = true;
 }
 
-void SceneRenderer::Stamp(VkCommandBuffer cmd, uint32_t index) {
+void SceneRenderer::Stamp(gpu::CommandList& cmd, uint32_t index) {
     if (queries_) {
-        vkCmdWriteTimestamp2(cmd, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, queries_, index);
+        cmd.WriteTimestamp(queries_, index);
     }
 }
 
-void SceneRenderer::RecordObjectVelocity(VkCommandBuffer cmd, const ViewSetup& view) {
-    UseTargets(cmd, {{&object_velocity_, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL}, {&depth_, VK_IMAGE_LAYOUT_DEPTH_READ_ONLY_OPTIMAL}});
-    BeginPass(cmd, extent_, {{&object_velocity_, true, {}}}, &depth_, true, false);
-    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, velocity_pipeline_);
+void SceneRenderer::RecordObjectVelocity(gpu::CommandList& cmd, const ViewSetup& view) {
+    cmd.UseTargets({{&object_velocity_, gpu::Layout::ColorAttachment}, {&depth_, gpu::Layout::DepthReadOnly}});
+    cmd.BeginPass(extent_, {{&object_velocity_, true, {}}}, &depth_, true, false);
+    cmd.BindPipeline(gpu::BindPoint::Graphics, velocity_pipeline_);
     for (const Draw& d : draws_) {
         const SubMesh& sub = *d.sub;
         if (d.previous_model == gpu::kInvalid || sub.pass != RenderPass::Opaque || sub.kind != gpu::kKindDeferred || !Visible(d, view)) {
             continue;
         }
-        vkCmdSetCullMode(cmd, sub.double_sided ? VK_CULL_MODE_NONE : VK_CULL_MODE_BACK_BIT);
-        vkCmdSetFrontFace(cmd, VK_FRONT_FACE_COUNTER_CLOCKWISE);
-        VkDeviceSize offset = 0;
-        vkCmdBindVertexBuffers(cmd, 0, 1, &d.mesh->vertices.buffer, &offset);
-        vkCmdBindIndexBuffer(cmd, d.mesh->indices.buffer, 0, VK_INDEX_TYPE_UINT32);
+        cmd.SetCullMode(sub.double_sided ? gpu::CullMode::None : gpu::CullMode::Back);
+        cmd.SetFrontFace(gpu::FrontFace::CounterClockwise);
+        cmd.BindVertexBuffer(d.mesh->vertices.buffer, 0);
+        cmd.BindIndexBuffer(d.mesh->indices.buffer, 0, gpu::IndexType::Uint32);
         gpu::DrawPush push;
         push.model = d.transform;
         push.ids = glm::uvec4(view.index, d.material, motion_view_, sub.skinned ? d.skin_base : gpu::kInvalid);
@@ -2054,62 +2357,97 @@ void SceneRenderer::RecordObjectVelocity(VkCommandBuffer cmd, const ViewSetup& v
         const uint32_t previous_skin = sub.skinned ? d.previous_skin : gpu::kInvalid;
         push.aux[0] = glm::vec4(std::bit_cast<float>(d.previous_model), std::bit_cast<float>(previous_skin), 0.0f, 0.0f);
         PushConstants(cmd, &push, sizeof(push));
-        vkCmdDrawIndexed(cmd, sub.index_count, 1, sub.first_index, sub.vertex_offset, 0);
+        cmd.DrawIndexed(sub.index_count, 1, sub.first_index, sub.vertex_offset, 0);
     }
-    vkCmdEndRendering(cmd);
-    UseTargets(cmd, {{&object_velocity_, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL}});
+    cmd.EndPass();
+    cmd.UseTargets({{&object_velocity_, gpu::Layout::ShaderReadOnly}});
 }
 
-void SceneRenderer::RecordView(VkCommandBuffer cmd, const ViewSetup& view, RenderTarget& output, bool main_view) {
-    BeginLabel(cmd, main_view ? "gbuffer" : "mirror gbuffer");
+void SceneRenderer::RecordView(gpu::CommandList& cmd, const ViewSetup& view, RenderTarget& output, bool main_view) {
+    cmd.BeginLabel(main_view ? "gbuffer" : "mirror gbuffer");
     RecordGBuffer(cmd, view);
-    EndLabel(cmd);
+    cmd.EndLabel();
     if (main_view) {
         Stamp(cmd, 3);
         if (MotionBlurActive()) {
-            BeginLabel(cmd, "object velocity");
+            cmd.BeginLabel("object velocity");
             RecordObjectVelocity(cmd, view);
-            EndLabel(cmd);
+            cmd.EndLabel();
         }
+        Stamp(cmd, 12);
     }
-    const bool occlusion = toggles.occlusion && lighting_->valid && main_view;
+    const bool occlusion = toggles.occlusion && lighting_->valid && main_view && !rt_path_;
     if (occlusion) {
-        BeginLabel(cmd, "occlusion");
+        cmd.BeginLabel("occlusion");
         RecordOcclusion(cmd, view);
-        EndLabel(cmd);
+        cmd.EndLabel();
+    }
+    if (main_view) {
+        Stamp(cmd, 13);
     }
     rt_ao_ready_ = false;
     if (main_view && rt_ao_active_ && lighting_->valid) {
-        BeginLabel(cmd, "ray traced ambient occlusion");
+        cmd.BeginLabel("ray traced ambient occlusion");
         RecordRtAmbientOcclusion(cmd, view);
-        EndLabel(cmd);
+        cmd.EndLabel();
     }
-    BeginLabel(cmd, main_view ? "lighting" : "mirror lighting");
+    if (main_view) {
+        Stamp(cmd, 17);
+        if (RtFullAny() && lighting_->valid) {
+            cmd.BeginLabel("ray traced full tier");
+            RecordRtFullTrace(cmd, view);
+            cmd.EndLabel();
+        } else {
+            Stamp(cmd, 18);
+            for (uint32_t s = 25; s <= 28; ++s) {
+                Stamp(cmd, s);
+            }
+            Stamp(cmd, 19);
+            Stamp(cmd, 20);
+        }
+        Stamp(cmd, 14);
+    }
+    cmd.BeginLabel(main_view ? "lighting" : "mirror lighting");
     RecordLighting(cmd, view);
-    EndLabel(cmd);
+    cmd.EndLabel();
     static const bool sss_off = [] {
         const char* v = std::getenv("PT_SUBSURFACE");
         return v && v[0] == '0';
     }();
-    if (main_view && sss_ready_ && !sss_off && lighting_->valid && lighting_->screen.subsurface_scatter && toggles.subsurface_scatter) {
-        BeginLabel(cmd, "subsurface scattering");
-        sss_.Record(cmd, diffuse_, view.index, [&] { BindSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS); });
-        EndLabel(cmd);
+    if (main_view && sss_ready_ && sss_.HasTargets() && !sss_off && lighting_->valid && lighting_->screen.subsurface_scatter && toggles.subsurface_scatter) {
+        cmd.BeginLabel("subsurface scattering");
+        sss_.Record(cmd, diffuse_, view.index, [&] { BindSets(cmd, gpu::BindPoint::Graphics); });
+        cmd.EndLabel();
+    }
+    if (main_view && rt_path_ && rt_full_traced_ && lighting_->valid) {
+        cmd.BeginLabel("path traced indirect light");
+        RecordPathIndirect(cmd, view);
+        cmd.EndLabel();
     }
     if (main_view) {
         Stamp(cmd, 4);
-        BeginLabel(cmd, "luminance");
+        cmd.BeginLabel("luminance");
         RecordLuminance(cmd);
-        EndLabel(cmd);
+        cmd.EndLabel();
+        Stamp(cmd, 23);
+        if (rt_full_traced_ && lighting_->valid) {
+            RecordRtFullBounce(cmd, view);
+            if (rt_path_) {
+                cmd.BeginLabel("path traced layers");
+                RecordPathLayers(cmd, view);
+                cmd.EndLabel();
+            }
+        }
+        Stamp(cmd, 24);
     }
-    BeginLabel(cmd, main_view ? "compose and forward" : "mirror compose and forward");
-    UseTargets(cmd, {{&output, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL},
-                     {&albedo_, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL},
-                     {&depth_, VK_IMAGE_LAYOUT_DEPTH_READ_ONLY_OPTIMAL}});
+    cmd.BeginLabel(main_view ? "compose and forward" : "mirror compose and forward");
+    cmd.UseTargets({{&output, gpu::Layout::ColorAttachment},
+                     {&albedo_, gpu::Layout::ShaderReadOnly},
+                     {&depth_, gpu::Layout::DepthReadOnly}});
     if (main_view && mirror_active_) {
-        UseTargets(cmd, {{&mirror_, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL}});
+        cmd.UseTargets({{&mirror_, gpu::Layout::ShaderReadOnly}});
     }
-    BeginPass(cmd, ViewArea(view), {{&output, false, {}}}, &depth_, true, false);
+    cmd.BeginPass(ViewArea(view), {{&output, false, {}}}, &depth_, true, false);
     gpu::PassPush push;
     push.ids = glm::uvec4(view.index, occlusion ? 1u : 0u, 0, 0);
     const TppAtmosphereSettings& tpp = lighting_->tpp;
@@ -2131,28 +2469,47 @@ void SceneRenderer::RecordView(VkCommandBuffer cmd, const ViewSetup& view, Rende
         push.f0 = glm::vec4(1.0f / (c * c), t, c, 0.0f);
     }
     Fullscreen(cmd, compose_, push);
-    vkCmdEndRendering(cmd);
+    const bool reference = main_view && PathReference() && rt_full_traced_ && lighting_->valid;
+    if (reference) {
+        RecordPathReferenceOut(cmd, view);
+    } else if (main_view && rt_path_ && rt_full_traced_ && lighting_->valid) {
+        RecordPathLayerOut(cmd, view);
+    }
+    cmd.EndPass();
     if (main_view && dump_requested_ && &output == &hdr_) {
         RecordDumpCopy(cmd, output, dump_compose_);
     }
-    UseTargets(cmd, {{&depth_, VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL}});
-    BeginPass(cmd, ViewArea(view), {{&output, false, {}}}, &depth_, false, false);
-    RecordForward(cmd, view, output);
-    vkCmdEndRendering(cmd);
+    if (&output == &hdr_ && flare_depth_.Valid()) {
+        cmd.UseTargets({{&depth_, gpu::Layout::TransferSrc}, {&flare_depth_, gpu::Layout::TransferDst}});
+        gpu::ImageCopy copy;
+        copy.src = {gpu::Aspect::Depth, 0, 0, 1};
+        copy.dst = copy.src;
+        copy.extent = {extent_.width, extent_.height, 1};
+        cmd.CopyImage(depth_.image, gpu::Layout::TransferSrc, flare_depth_.image, gpu::Layout::TransferDst, {&copy, 1});
+        cmd.UseTargets({{&flare_depth_, gpu::Layout::DepthReadOnly}});
+    }
+    cmd.UseTargets({{&depth_, gpu::Layout::DepthAttachment}});
+    cmd.BeginPass(ViewArea(view), {{&output, false, {}}}, &depth_, false, false);
+    if (!reference) {
+        RecordForward(cmd, view, output);
+    }
+    cmd.EndPass();
     if (main_view && dump_requested_ && &output == &hdr_) {
         RecordDumpCopy(cmd, output, dump_forward_);
     }
-    UseTargets(cmd, {{&depth_, VK_IMAGE_LAYOUT_DEPTH_READ_ONLY_OPTIMAL}});
+    cmd.UseTargets({{&depth_, gpu::Layout::DepthReadOnly}});
     if (main_view) {
         Stamp(cmd, 7);
     }
-    BeginPass(cmd, ViewArea(view), {{&output, false, {}}}, &depth_, true, false);
+    cmd.BeginPass(ViewArea(view), {{&output, false, {}}}, &depth_, true, false);
     if (main_view && up_.enabled) {
         RecordOpaqueSnapshot(cmd, output);
     }
+    SceneVfxContext liquid_context;
+    bool liquid_depth = false;
     if (vfx_forward) {
         SceneVfxContext context;
-        context.cmd = cmd;
+        context.cmd = &cmd;
         context.view = view.view;
         context.projection = view.projection;
         context.view_projection = view.projection * view.view;
@@ -2174,18 +2531,29 @@ void SceneRenderer::RecordView(VkCommandBuffer cmd, const ViewSetup& view, Rende
             context.subset = kVfxScene;
         }
         vfx_forward(context);
-        BindSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS);
+        BindSets(cmd, gpu::BindPoint::Graphics);
         if (&output == &hdr_) {
             RecordEffects(cmd, output, context);
         }
+        liquid_context = context;
+        liquid_depth = vfx_liquid_depth && main_view && &output == &hdr_ && !context.mirrored;
     }
-    vkCmdEndRendering(cmd);
+    cmd.EndPass();
+    if (liquid_depth) {
+        cmd.UseTargets({{&depth_, gpu::Layout::DepthAttachment}, {&hdr_copy_, gpu::Layout::ShaderReadOnly}});
+        cmd.BeginPass(ViewArea(view), {}, &depth_, false, false);
+        liquid_context.cmd = &cmd;
+        vfx_liquid_depth(liquid_context);
+        cmd.EndPass();
+        cmd.UseTargets({{&depth_, gpu::Layout::DepthReadOnly}});
+        BindSets(cmd, gpu::BindPoint::Graphics);
+    }
     if (main_view && dump_requested_ && &output == &hdr_) {
         RecordDumpCopy(cmd, output, dump_scene_);
         dump_recorded_ = true;
     }
-    UseTargets(cmd, {{&output, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL}});
-    EndLabel(cmd);
+    cmd.UseTargets({{&output, gpu::Layout::ShaderReadOnly}});
+    cmd.EndLabel();
     if (main_view) {
         Stamp(cmd, 5);
     }
@@ -2193,28 +2561,26 @@ void SceneRenderer::RecordView(VkCommandBuffer cmd, const ViewSetup& view, Rende
 
 void SceneRenderer::SettleExposure(const ExposureSettings& settings) {
     FrameSlot& slot = slots_[renderer_->FrameIndex()];
-    renderer_->Context().Submit([&](VkCommandBuffer cmd) {
-        BeginLabel(cmd, "settle exposure");
-        BindSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS);
+    gpu_->Submit([&](gpu::CommandList& cmd) {
+        cmd.BeginLabel("settle exposure");
+        BindSets(cmd, gpu::BindPoint::Graphics);
         RecordShadows(cmd);
         RecordGBuffer(cmd, main_view_);
         RecordLighting(cmd, main_view_);
         RecordLuminance(cmd);
-        EndLabel(cmd);
+        cmd.EndLabel();
     });
-    vmaInvalidateAllocation(renderer_->Context().allocator, slot.luminance.allocation, 0, VK_WHOLE_SIZE);
-    const glm::vec2* partial = static_cast<const glm::vec2*>(slot.luminance.mapped);
-    double sum = 0.0;
-    double count = 0.0;
-    for (uint32_t i = 0; i < slot.luminance_groups; ++i) {
-        sum += partial[i].x;
-        count += partial[i].y;
-    }
+    gpu_->InvalidateMapped(slot.luminance, 0, ~0ull);
+    const float measured = MeterLuminance(static_cast<const glm::vec2*>(slot.luminance.mapped), slot.luminance_groups);
     adaptation_valid_ = true;
-    if (count <= 0.0) {
+    if (measured < 0.0f) {
         return;
     }
-    const float raw = static_cast<float>(sum / count) / std::max(exposure_, 1.0e-12f);
+    const float raw = measured / std::max(exposure_, 1.0e-12f);
+    if (!std::isfinite(raw)) {
+        adaptation_valid_ = false;
+        return;
+    }
     float ev = ev_;
     for (int i = 0; i < 64; ++i) {
         const float adapted = raw * std::exp2(ev);
@@ -2237,6 +2603,9 @@ void SceneRenderer::Render(const Camera& camera, const std::vector<DrawItem>& it
 
 void SceneRenderer::Render(const Camera& camera, const std::vector<DrawItem>& items, const SceneLighting& lighting, float dt) {
     const auto cpu_start = std::chrono::steady_clock::now();
+    if (frame_counter_ == 0) {
+        ApplyEnvironmentOverrides();
+    }
     struct ToggleGuard {
         RenderToggles& toggles;
         RenderToggles saved;
@@ -2249,17 +2618,61 @@ void SceneRenderer::Render(const Camera& camera, const std::vector<DrawItem>& it
         toggles.distortion = false;
         toggles.full_screen_blur = false;
     }
-    if (frame_counter_ == 0) {
-        ApplyEnvironmentOverrides();
+    struct DateBaselineGuard {
+        SceneRenderer& renderer;
+        RayTracingSettings raytracing;
+        AppSettings::Graphics graphics;
+        bool on;
+        ~DateBaselineGuard() {
+            if (on) {
+                renderer.raytracing = raytracing;
+                renderer.graphics = graphics;
+            }
+        }
+    } date_baseline{*this, raytracing, graphics, false};
+    static const bool date_baseline_off = [] {
+        const char* v = std::getenv("PT_DATE_BASELINE");
+        return v && std::string_view(v) == "0";
+    }();
+    if (date_resolve_on_ && !date_baseline_off && vr_eye_ < 0) {
+        date_baseline.on = true;
+        raytracing = RayTracingSettings{};
+        const AppSettings::Graphics original;
+        graphics.shadow_quality = original.shadow_quality;
+        graphics.ambient_occlusion = original.ambient_occlusion;
+        graphics.reflections = original.reflections;
+        graphics.ray_quality = original.ray_quality;
+        graphics.clarity = original.clarity;
     }
-    if(!EnsureShadowTarget()) return;
-    const VkExtent2D output = renderer_->RenderExtent();
+    if (std::chrono::steady_clock::now() < targets_retry_at_) return;
+    if(!EnsureShadowTarget()) {
+        targets_retry_at_ = std::chrono::steady_clock::now() + std::chrono::seconds(1);
+        return;
+    }
+    const gpu::Extent2D output = renderer_->RenderExtent();
     const bool upscaling = BeginUpscaleFrame(output);
     if (!EnsureTargets(upscaling ? up_.render : output, output, upscaling)) {
-        return;
+        bool made = false;
+        if (textures_->ReleaseEnhancedTextures("render targets")) {
+            made = EnsureTargets(upscaling ? up_.render : output, output, upscaling);
+        }
+        while (!made && shadow_.Valid() && shadow_.Extent().width > 512u * 4) {
+            gpu_->WaitIdle();
+            gpu_->DestroyImage(shadow_.image);
+            shadow_ = RenderTarget{};
+            shadow_tile_cap_ = std::max(512u, shadow_tile_cap_ / 2);
+            LogWarn("graphics: shadow atlas tile lowered to {} px for the render targets: out of video memory", shadow_tile_cap_);
+            made = EnsureShadowTarget() && EnsureTargets(upscaling ? up_.render : output, output, upscaling);
+        }
+        if (!made) {
+            targets_retry_at_ = std::chrono::steady_clock::now() + std::chrono::seconds(1);
+            return;
+        }
     }
     FrameSlot& slot = slots_[renderer_->FrameIndex()];
     textures_->FlushMaterials();
+    const int measured_vr_eye = slot.vr_eye;
+    const bool measured_vr_gpu = slot.timed;
     if (has_last_eye_ && glm::distance(camera.position, last_eye_) > kCameraCutDistance) {
         adaptation_valid_ = false;
     }
@@ -2277,15 +2690,7 @@ void SceneRenderer::Render(const Camera& camera, const std::vector<DrawItem>& it
     }
     ev_pinned_ = lighting_->exposure.pinned;
     if (!timing_ring_.empty()) {
-        VmaBudget budgets[VK_MAX_MEMORY_HEAPS] = {};
-        vmaGetHeapBudgets(renderer_->Context().allocator, budgets);
-        const VkPhysicalDeviceMemoryProperties* memory = nullptr;
-        vmaGetMemoryProperties(renderer_->Context().allocator, &memory);
-        double bytes = 0.0;
-        for (uint32_t h = 0; memory && h < memory->memoryHeapCount; ++h) {
-            bytes += static_cast<double>(budgets[h].statistics.blockBytes);
-        }
-        stats_.device_mb = static_cast<float>(bytes / (1024.0 * 1024.0));
+        stats_.device_mb = static_cast<float>(static_cast<double>(gpu_->AllocatedBytes()) / (1024.0 * 1024.0));
     }
     if (slot.timed && frame_counter_ > 8) {
         gpu_ms_sum_ += stats_.gpu_ms;
@@ -2295,6 +2700,9 @@ void SceneRenderer::Render(const Camera& camera, const std::vector<DrawItem>& it
             t.gpu_ms = stats_.gpu_ms;
             std::copy(std::begin(stats_.pass_ms), std::end(stats_.pass_ms), std::begin(t.pass_ms));
             std::copy(std::begin(stats_.part_ms), std::end(stats_.part_ms), std::begin(t.part_ms));
+            std::copy(std::begin(stats_.light_ms), std::end(stats_.light_ms), std::begin(t.light_ms));
+            std::copy(std::begin(stats_.rt_ms), std::end(stats_.rt_ms), std::begin(t.rt_ms));
+            std::copy(std::begin(stats_.pt_ms), std::end(stats_.pt_ms), std::begin(t.pt_ms));
             t.device_mb = stats_.device_mb;
             t.frame = frame_counter_ >= Renderer::kFramesInFlight ? frame_counter_ - Renderer::kFramesInFlight : 0;
         }
@@ -2306,11 +2714,46 @@ void SceneRenderer::Render(const Camera& camera, const std::vector<DrawItem>& it
         exposure_ = renderer_->exposure;
     }
     UpdateMotion(camera, dt);
-    rt_active_ = rt_ && raytracing.shadows && toggles.shadows;
-    rt_reflections_ = rt_ && reflect_make_rt_ && raytracing.reflections && toggles.local_reflections;
-    rt_contact_active_ = rt_ && light_contact_ && raytracing.contact_shadows && toggles.shadows;
-    rt_ao_active_ = rt_ && rt_ao_trace_ && rt_ao_filter_ && probe_ao_ && raytracing.ambient_occlusion && toggles.probes && EnsureAoTargets();
-    if (!rt_ao_active_) {
+    const bool rt_ready = rt_ && rt_->Ready(renderer_->FrameIndex());
+    rt_active_ = rt_ready && raytracing.shadows && toggles.shadows;
+    rt_reflections_ = rt_ready && reflect_make_rt_ && raytracing.reflections && toggles.local_reflections;
+    rt_contact_active_ = rt_ready && light_contact_ && raytracing.contact_shadows && toggles.shadows;
+    rt_ao_active_ = rt_ready && rt_ao_trace_ && rt_ao_filter_ && probe_ao_ && raytracing.ambient_occlusion && toggles.probes && EnsureAoTargets();
+    const bool full_ready = rt_ready && raytracing.full && light_full_ && toggles.lights;
+    rt_full_shadows_ = full_ready && raytracing.full_shadows && rt_active_;
+    rt_gi_active_ = full_ready && raytracing.bounce_light;
+    rt_glossy_active_ = full_ready && raytracing.glossy_reflections;
+    rt_full_traced_ = false;
+    rt_path_ = rt_ready && raytracing.path_traced && pt_direct_ && pt_resolve_ && rt_full_filter_ && toggles.lights && vr_eye_ < 0;
+    if (rt_path_) {
+        rt_full_shadows_ = rt_gi_active_ = rt_glossy_active_ = false;
+    }
+    rr_frame_ = rt_path_ && up_.enabled && up_.backend && up_.ray_reconstruction && pt_rr_guides_;
+    if (RtFullAny() && !EnsureFullTargets()) {
+        rt_full_shadows_ = rt_gi_active_ = rt_glossy_active_ = rt_path_ = false;
+    }
+    if (rt_path_ && !EnsurePathTargets()) {
+        rt_path_ = false;
+    }
+    if (rr_frame_ && (!rt_path_ || !EnsureRrTargets())) {
+        rr_frame_ = false;
+    }
+    const bool traced_any = rt_active_ || rt_reflections_ || rt_contact_active_ || rt_ao_active_ || RtFullAny();
+    rr_raster_ = !rt_path_ && traced_any && up_.enabled && up_.backend && up_.ray_reconstruction && rt_rr_guides_ && vr_eye_ < 0 &&
+                 EnsureRrTargets();
+    if (rt_path_) {
+        rt_contact_active_ = false;
+        rt_ao_active_ = false;
+    } else {
+        pt_history_ = false;
+    }
+    if (rt_full_shadows_) {
+        rt_contact_active_ = false;
+    }
+    if (!RtFullAny() || vr_eye_ >= 0) {
+        rt_full_history_ = false;
+    }
+    if (!rt_ao_active_ || vr_eye_ >= 0) {
         rt_ao_history_ = false;
     }
     rt_ao_ready_ = false;
@@ -2322,18 +2765,38 @@ void SceneRenderer::Render(const Camera& camera, const std::vector<DrawItem>& it
     if (!adaptation_valid_ && lighting_->valid && toggles.adaptation) {
         SettleExposure(lighting_->exposure);
     }
-    VkCommandBuffer cmd = renderer_->Cmd();
-    vkCmdResetQueryPool(cmd, slot.queries, 0, kTimestamps);
+    gpu::CommandList& cmd = renderer_->List();
+    cmd.ResetQueries(slot.queries, 0, kTimestamps);
     if (up_.enabled) {
-        vkCmdResetQueryPool(cmd, slot.upscale_queries, 0, 4);
+        cmd.ResetQueries(slot.upscale_queries, 0, 4);
     }
     queries_ = slot.queries;
     Stamp(cmd, 0);
-    BindSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS);
-    BeginLabel(cmd, "shadows");
+    BindSets(cmd, gpu::BindPoint::Graphics);
+    cmd.BeginLabel("shadows");
     RecordShadows(cmd);
-    EndLabel(cmd);
+    cmd.EndLabel();
     Stamp(cmd, 1);
+    if (mirror_render_cache_index_ != mirror_cache_index_) {
+        auto copy_capture = [&](RenderTarget& source, RenderTarget& target, uint32_t size) {
+            cmd.UseTargets({{&source, gpu::Layout::TransferSrc}, {&target, gpu::Layout::TransferDst}});
+            gpu::ImageCopy copy;
+            copy.src = {gpu::Aspect::Color, 0, 0, 1};
+            copy.dst = copy.src;
+            copy.extent = {size, size, 1};
+            cmd.CopyImage(source.image, gpu::Layout::TransferSrc, target.image, gpu::Layout::TransferDst, {&copy, 1});
+            cmd.UseTargets({{&source, gpu::Layout::ShaderReadOnly}, {&target, gpu::Layout::ShaderReadOnly}});
+        };
+        const MirrorStale& previous = mirror_stale_cache_[mirror_render_cache_index_];
+        if (previous.valid) {
+            copy_capture(mirror_, mirror_capture_cache_[mirror_render_cache_index_], previous.size);
+        }
+        if (mirror_stale_.valid) {
+            copy_capture(mirror_capture_cache_[mirror_cache_index_], mirror_, mirror_stale_.size);
+        }
+        mirror_render_cache_index_ = mirror_cache_index_;
+        mirror_history_valid_ = false;
+    }
     if (mirror_active_) {
         RecordView(cmd, mirror_view_, mirror_, false);
         if (mirror_temporal_enabled_) {
@@ -2358,9 +2821,8 @@ void SceneRenderer::Render(const Camera& camera, const std::vector<DrawItem>& it
                 const char* value = std::getenv("PT_MIRROR_PROBE");
                 return value && std::atoi(value) != 0;
             }();
-            static vk::Buffer probe_buffers[3];
+            static gpu::BufferResource probe_buffers[3];
             if (probe_capture) {
-                vk::Context& pctx = renderer_->Context();
                 RenderTarget* targets[3] = {&albedo_, &material_, &diffuse_};
                 const char* names[3] = {"albedo", "material", "diffuse"};
                 const uint32_t side = mirror_view_.area.width;
@@ -2369,18 +2831,18 @@ void SceneRenderer::Render(const Camera& camera, const std::vector<DrawItem>& it
                     if (!target.Valid()) {
                         continue;
                     }
-                    const VkExtent3D e = target.image.extent;
-                    const VkDeviceSize bytes = VkDeviceSize(e.width) * e.height * TargetTexelBytes(target.image.format);
+                    const gpu::Extent3D e = target.image.extent;
+                    const uint64_t bytes = uint64_t(e.width) * e.height * TargetTexelBytes(target.image.format);
                     if (probe_buffers[t].size < bytes) {
-                        pctx.DestroyBuffer(probe_buffers[t]);
-                        pctx.CreateBuffer(probe_buffers[t], bytes, VK_BUFFER_USAGE_TRANSFER_DST_BIT, true);
+                        gpu_->DestroyBuffer(probe_buffers[t]);
+                        MakeBuffer(probe_buffers[t], bytes, gpu::BufferUsage::TransferDst, true);
                     }
                     if (!probe_buffers[t].mapped) {
                         continue;
                     }
                     RecordDumpCopy(cmd, target, probe_buffers[t]);
-                    pctx.Submit([&](VkCommandBuffer sync) { (void)sync; });
-                    vmaInvalidateAllocation(pctx.allocator, probe_buffers[t].allocation, 0, VK_WHOLE_SIZE);
+                    gpu_->Submit([&](gpu::CommandList& sync) { (void)sync; });
+                    gpu_->InvalidateMapped(probe_buffers[t], 0, ~0ull);
                     const bool wide = TargetTexelBytes(target.image.format) == 8;
                     double sum = 0.0;
                     float peak = 0.0f;
@@ -2417,58 +2879,101 @@ void SceneRenderer::Render(const Camera& camera, const std::vector<DrawItem>& it
     Stamp(cmd, 2);
     RecordView(cmd, main_view_, hdr_, true);
     RecordReflectionSample(cmd, *lighting_);
-    BindSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS);
+    BindSets(cmd, gpu::BindPoint::Graphics);
     if (debug_view == DebugView::Lit || debug_view == DebugView::Ambient) {
         if (up_.enabled) {
-            BeginLabel(cmd, "upscale inputs");
+            cmd.BeginLabel("upscale inputs");
             RecordUpscaleInputs(cmd, main_view_);
-            EndLabel(cmd);
+            cmd.EndLabel();
         }
         Stamp(cmd, 8);
         reflect_post_upscale_ = false;
-        if (toggles.local_reflections && lighting_->valid && lighting_->screen.local_reflections) {
-            BeginLabel(cmd, "reflections");
+        if (toggles.local_reflections && lighting_->valid && lighting_->screen.local_reflections && !rt_path_) {
+            cmd.BeginLabel("reflections");
             RecordReflections(cmd, main_view_);
-            EndLabel(cmd);
+            cmd.EndLabel();
         }
         Stamp(cmd, 9);
         if (up_.enabled) {
-            BeginLabel(cmd, "upscale");
-            RecordUpscale(cmd, dt);
-            EndLabel(cmd);
-            post_bindings_ = true;
-            BindSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS);
+            if (up_.backend && up_.backend->ExternalSubmit() && vr_eye_ < 0) {
+                cmd.BeginLabel("upscale");
+                RecordUpscalePrepare(dt);
+                if (upscale.frame_generation == FrameGenKind::Metalfx) {
+                    PrepareFrameGeneration(up_dispatch_, true);
+                }
+                cmd.EndLabel();
+                VkSemaphore signal = VK_NULL_HANDLE;
+                VkSemaphore wait = VK_NULL_HANDLE;
+                uint64_t signal_value = 0;
+                uint64_t wait_value = 0;
+                if (up_.backend->ExternalSync(signal, signal_value, wait, wait_value) && renderer_->SplitForExternal(signal, signal_value, wait, wait_value)) {
+                    const bool upscaled = up_.backend->ExternalRun(up_dispatch_);
+                    cmd.BeginLabel("upscale resolve");
+                    BindSets(cmd, gpu::BindPoint::Graphics);
+                    RecordUpscaleResolve(cmd, upscaled);
+                    cmd.EndLabel();
+                } else {
+                    upscale_stats_.error = "the upscaler's frame split failed";
+                    RecordUpscaleResolve(renderer_->List(), false);
+                }
+                post_bindings_ = true;
+                BindSets(cmd, gpu::BindPoint::Graphics);
+            } else {
+                cmd.BeginLabel("upscale");
+                RecordUpscale(cmd, dt);
+                cmd.EndLabel();
+                post_bindings_ = true;
+                BindSets(cmd, gpu::BindPoint::Graphics);
+            }
         }
         Stamp(cmd, 10);
-        BeginLabel(cmd, "post");
+        cmd.BeginLabel("post");
         RecordPost(cmd, *lighting_, dt);
-        EndLabel(cmd);
+        cmd.EndLabel();
         post_bindings_ = false;
     } else {
         for (uint32_t index : {8u, 9u, 10u, 11u}) {
             Stamp(cmd, index);
         }
-        BeginLabel(cmd, "debug view");
+        cmd.BeginLabel("debug view");
         RecordDebug(cmd);
-        EndLabel(cmd);
+        cmd.EndLabel();
     }
     Stamp(cmd, 6);
-    queries_ = VK_NULL_HANDLE;
+    queries_ = {};
     last_timed_slot_ = renderer_->FrameIndex();
     slot.timed = true;
     slot.measured = true;
     slot.exposure_used = exposure_;
+    slot.vr_eye = vr_eye_;
     stats_.ev = ev_;
     stats_.exposure = exposure_;
-    if (vr_eye_ != 1) {
+    if (vr_eye_ != 0) {
         ++frame_counter_;
     }
     stats_.cpu_ms = std::chrono::duration<float, std::milli>(std::chrono::steady_clock::now() - cpu_start).count();
+    static const bool vr_trace = std::getenv("PT_VR_RENDER_TRACE") != nullptr;
+    if (vr_trace && vr_eye_ >= 0) {
+        const uint64_t submission = vr_trace_submissions_++;
+        if (vr_trace_lines_ < 512 && (submission < 8 || submission % 120 < 2)) {
+            LogInfo("vr render: submission {} eye {} slot {} measured eye {} valid {} gpu {:.3f} ms cpu {:.3f} ms size {}x{} exposure {:.5f}",
+                    submission, vr_eye_, renderer_->FrameIndex(), measured_vr_eye, measured_vr_gpu, stats_.gpu_ms, stats_.cpu_ms,
+                    output.width, output.height, exposure_);
+            if (++vr_trace_lines_ == 512) LogInfo("vr render: trace limit reached (512 eye timings)");
+        }
+    }
     if (static const bool frame_csv = std::getenv("PT_FRAME_CSV") != nullptr; frame_csv) {
         const float interval = previous_frame_start_ == std::chrono::steady_clock::time_point{}
                                    ? 0.0f
                                    : std::chrono::duration<float, std::milli>(cpu_start - previous_frame_start_).count();
-        frame_trace_.push_back({stats_.cpu_ms, interval, stats_.lights, stats_.shadow_views, stats_.draws});
+        const vk::PipelineCreationStats pipelines = vk::PipelineStats(renderer_->Context().device);
+        const uint64_t created = pipelines.graphics_count + pipelines.compute_count - pipelines.background_count;
+        const uint64_t created_ns = pipelines.duration_ns - pipelines.background_ns;
+        frame_trace_.push_back({stats_.cpu_ms, interval, stats_.lights, stats_.shadow_views, stats_.draws,
+                                static_cast<uint32_t>(created - frame_trace_pipelines_),
+                                static_cast<float>(static_cast<double>(created_ns - frame_trace_pipeline_ns_) * 1e-6)});
+        frame_trace_pipelines_ = created;
+        frame_trace_pipeline_ns_ = created_ns;
     }
     previous_frame_start_ = cpu_start;
     if (frame_counter_ > 8) {

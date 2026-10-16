@@ -248,6 +248,7 @@ public:
     void StopAll();
     void ToggleLoop(std::string_view demo_id);
     void Skip(std::string_view demo_id = {});
+    bool SkipToEnd(std::string_view demo_id, float fade_seconds);
     void ResyncAudio(std::string_view demo_id);
     bool IsPlaying(std::string_view demo_id) const;
     bool IsAnyPlaying() const { return !playing_.empty(); }

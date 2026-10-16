@@ -45,6 +45,7 @@ struct Swapchain {
     VkExtent2D extent{};
     std::vector<VkImage> images;
     std::vector<VkImageView> views;
+    std::vector<void*> d3d12_images;
     uint32_t index = 0;
     bool acquired = false;
 };
@@ -69,7 +70,9 @@ public:
     Host(const Host&) = delete;
     Host& operator=(const Host&) = delete;
 
-    bool Init(const std::string& application);
+    bool Init(const std::string& application, bool d3d12 = false);
+    bool D3D12() const;
+    void D3D12Adapter(uint8_t (&luid)[8], int& min_feature_level) const;
     bool Ready() const;
     const std::string& Error() const { return error_; }
     const std::string& RuntimeName() const { return runtime_name_; }
@@ -79,6 +82,7 @@ public:
     VkResult CreateDevice(VkPhysicalDevice physical, const VkDeviceCreateInfo& info, VkDevice& device) override;
 
     bool StartSession(vk::Context& ctx, float scale);
+    bool StartSessionD3D12(void* device, void* queue, float scale);
     void Shutdown();
 
     void PollEvents();
@@ -98,6 +102,9 @@ public:
 
     const ViewPose& Eye(int i) const { return eyes_[i]; }
     const ViewPose& Head() const { return head_; }
+    bool FloorEyeHeightValid() const { return floor_eye_valid_; }
+    float FloorEyeHeight() const { return floor_eye_height_; }
+    uint32_t Recentres() const { return recentres_; }
     bool ViewsValid() const { return views_valid_; }
     const ControllerState& Controllers() const { return controllers_; }
     void Haptic(int hand, float amplitude, float seconds);
@@ -114,12 +121,17 @@ public:
     struct Impl;
 
 private:
+    bool Start(const void* binding, float scale);
+
     std::unique_ptr<Impl> impl_;
     std::string error_;
     std::string runtime_name_;
     ViewPose eyes_[2];
     ViewPose head_;
     bool views_valid_ = false;
+    bool floor_eye_valid_ = false;
+    float floor_eye_height_ = 0.0f;
+    uint32_t recentres_ = 0;
     ControllerState controllers_;
     Swapchain eye_swapchains_[2];
     Swapchain hud_swapchain_;

@@ -7,8 +7,16 @@
 #include <format>
 
 #include "engine/core/log.h"
+#include "engine/platform/controller_feedback.h"
 
 namespace pt {
+
+void KeyPressLatch::ProcessEvent(const SDL_Event& event, uint32_t scancode) {
+    if (event.type == SDL_EVENT_KEY_DOWN && !event.key.repeat && event.key.scancode == scancode) {
+        pressed_ = true;
+    }
+}
+
 namespace {
 
 constexpr float kTouchSelectX = 768.0f / 1920.0f;
@@ -44,10 +52,31 @@ constexpr KeyBinding kKeyBindings[] = {
     {KeyAction::MenuColumn, SDL_SCANCODE_TAB, 0},
     {KeyAction::MenuQuit, SDL_SCANCODE_Q, 0},
     {KeyAction::MenuHouse, SDL_SCANCODE_H, 0},
+    {KeyAction::DateAuto, SDL_SCANCODE_A, 0},
+    {KeyAction::DateSkip, SDL_SCANCODE_TAB, 0},
+    {KeyAction::PhotoSave, SDL_SCANCODE_P, 0},
+    {KeyAction::PhotoHide, SDL_SCANCODE_H, 0},
+    {KeyAction::FreeRise, SDL_SCANCODE_SPACE, 0},
+    {KeyAction::FreeSink, SDL_SCANCODE_LCTRL, 0},
+    {KeyAction::FreeFast, SDL_SCANCODE_LSHIFT, 0},
+    {KeyAction::MusicBack, SDL_SCANCODE_J, 0},
+    {KeyAction::MusicForward, SDL_SCANCODE_K, 0},
+    {KeyAction::MusicRestart, SDL_SCANCODE_R, 0},
+    {KeyAction::MusicLoop, SDL_SCANCODE_L, 0},
+    {KeyAction::MenuTabPrev, SDL_SCANCODE_Q, 0},
+    {KeyAction::MenuTabNext, SDL_SCANCODE_E, 0},
+    {KeyAction::MenuDonate, SDL_SCANCODE_P, 0},
 };
+
+KeyLayoutFunction g_key_layout = nullptr;
 
 PromptStyle StyleOf(SDL_Gamepad* pad) {
     PromptStyle style;
+    if (IsSteamGamepadId(SDL_GetGamepadVendor(pad), SDL_GetGamepadProduct(pad))) {
+        style.device = PromptDevice::Steam;
+        style.faces = {'A', 'B', 'X', 'Y'};
+        return style;
+    }
     const SDL_GamepadType type = SDL_GetGamepadType(pad);
     switch (type) {
         case SDL_GAMEPAD_TYPE_PS3:
@@ -179,6 +208,7 @@ GamepadInfo Describe(SDL_Gamepad* pad) {
     const SDL_PropertiesID props = SDL_GetGamepadProperties(pad);
     info.rumble = SDL_GetBooleanProperty(props, SDL_PROP_GAMEPAD_CAP_RUMBLE_BOOLEAN, false);
     info.trigger_rumble = SDL_GetBooleanProperty(props, SDL_PROP_GAMEPAD_CAP_TRIGGER_RUMBLE_BOOLEAN, false);
+    info.gyro = SDL_GamepadHasSensor(pad, SDL_SENSOR_GYRO);
     return info;
 }
 
@@ -208,6 +238,10 @@ const KeyBinding* FirstBinding(KeyAction action, bool keys_only) {
     return nullptr;
 }
 
+void SetKeyLayoutForTest(KeyLayoutFunction layout) {
+    g_key_layout = layout;
+}
+
 std::string KeyBindingName(const KeyBinding& binding) {
     if (binding.mouse) {
         return binding.mouse == SDL_BUTTON_LEFT ? "Left mouse button" : binding.mouse == SDL_BUTTON_RIGHT ? "Right mouse button" : "Middle mouse button";
@@ -231,7 +265,8 @@ std::string KeyBindingName(const KeyBinding& binding) {
         case SDL_SCANCODE_PAGEDOWN: return "PgDn";
         default: break;
     }
-    const SDL_Keycode key = SDL_GetKeyFromScancode(static_cast<SDL_Scancode>(binding.scancode), SDL_KMOD_NONE, false);
+    const SDL_Keycode key = g_key_layout ? static_cast<SDL_Keycode>(g_key_layout(binding.scancode))
+                                         : SDL_GetKeyFromScancode(static_cast<SDL_Scancode>(binding.scancode), SDL_KMOD_NONE, false);
     const char* name = key != SDLK_UNKNOWN ? SDL_GetKeyName(key) : SDL_GetScancodeName(static_cast<SDL_Scancode>(binding.scancode));
     return name && *name ? std::string(name) : std::format("Key {}", binding.scancode);
 }
@@ -241,8 +276,32 @@ const char* PromptDeviceName(PromptDevice device) {
         case PromptDevice::PlayStation: return "PlayStation";
         case PromptDevice::Xbox: return "Xbox";
         case PromptDevice::Nintendo: return "Nintendo";
+        case PromptDevice::Steam: return "Steam";
         default: return "keyboard";
     }
+}
+
+bool IsSteamGamepadId(uint16_t vendor, uint16_t product) {
+    if (vendor == 0x28DE) {
+        switch (product) {
+            case 0x1101:
+            case 0x1102:
+            case 0x1105:
+            case 0x1106:
+            case 0x1142:
+            case 0x11FF:
+            case 0x1201:
+            case 0x1202:
+            case 0x1205:
+            case 0x1302:
+            case 0x1303:
+            case 0x1304:
+            case 0x1305:
+                return true;
+            default: return false;
+        }
+    }
+    return vendor == 0x0F0D && (product == 0x01AB || product == 0x0196);
 }
 
 uint32_t PlayerButtonsFromRaw(uint32_t raw) {
@@ -255,6 +314,16 @@ uint32_t PlayerButtonsFromRaw(uint32_t raw) {
     return buttons;
 }
 
+void MergeFrameButtons(InputState& pending, const InputState& polled) {
+    pending.pressed |= polled.pressed;
+    pending.music_pressed |= polled.music_pressed;
+    pending.menu_keys_pressed |= polled.menu_keys_pressed;
+    pending.capture_pose_pressed |= polled.capture_pose_pressed;
+    pending.raw_pressed |= polled.raw_pressed;
+    pending.held = polled.held | (pending.pressed & (kPadGouge - 1u));
+    pending.raw_held = polled.raw_held | pending.raw_pressed;
+}
+
 std::string DescribeGamepad(const GamepadInfo& info) {
     if (!info.is_gamepad) {
         return std::format("{} '{}' joystick without a gamepad mapping, VID {:04X} PID {:04X}, path {}", info.id, info.name, info.vendor,
@@ -263,7 +332,7 @@ std::string DescribeGamepad(const GamepadInfo& info) {
     return std::format("{} '{}' type {}, {}, VID {:04X} PID {:04X}, path {}, serial '{}', player {}, rumble {}{}, touchpads {}, power {}{}", info.id,
                        info.name, info.type, info.connection, info.vendor, info.product, info.path, info.serial, info.player_index,
                        info.rumble ? "yes" : "no", info.trigger_rumble ? " (trigger motors too)" : "", info.touchpads, info.power,
-                       info.is_virtual ? ", virtual" : "");
+                       info.is_virtual ? ", virtual" : "") + (info.gyro ? ", gyro" : "");
 }
 
 std::vector<GamepadInfo> DescribeJoysticks() {
@@ -347,9 +416,35 @@ void InputDevice::UsePrompts(const PromptStyle& style, uint32_t pad) {
     }
 }
 
+PromptStyle InputDevice::ShownPrompts() const {
+    if (settings.prompt_style <= 0 || prompts_.device == PromptDevice::Keyboard) return prompts_;
+    PromptStyle style;
+    switch (settings.prompt_style) {
+        case 1: style.device = PromptDevice::PlayStation; break;
+        case 3:
+            style.device = PromptDevice::Nintendo;
+            style.faces = {'B', 'A', 'Y', 'X'};
+            break;
+        case 4:
+            style.device = PromptDevice::Steam;
+            style.faces = {'A', 'B', 'X', 'Y'};
+            break;
+        default:
+            style.device = PromptDevice::Xbox;
+            style.faces = {'A', 'B', 'X', 'Y'};
+            break;
+    }
+    return style;
+}
+
 void InputDevice::Shutdown() {
-    if (Pad* pad = Find(rumble_pad_); pad && (rumble_sent_[0] || rumble_sent_[1])) {
-        SDL_RumbleGamepad(pad->handle, 0, 0, 0);
+    if (Pad* pad = Find(rumble_pad_); pad) {
+        if (rumble_sent_[0] || rumble_sent_[1]) {
+            SDL_RumbleGamepad(pad->handle, 0, 0, 0);
+        }
+        if (trigger_rumble_sent_[0] || trigger_rumble_sent_[1]) {
+            SDL_RumbleGamepadTriggers(pad->handle, 0, 0, 0);
+        }
     }
     for (Pad& pad : pads_) {
         SDL_CloseGamepad(pad.handle);
@@ -357,6 +452,18 @@ void InputDevice::Shutdown() {
     pads_.clear();
     rumble_pad_ = 0;
     rumble_sent_[0] = rumble_sent_[1] = 0;
+    trigger_rumble_sent_[0] = trigger_rumble_sent_[1] = 0;
+    trigger_rumble_sent_at_ = 0;
+}
+
+SDL_Gamepad* InputDevice::LastUsedGamepad() const {
+    const Pad* target = nullptr;
+    for (const Pad& pad : pads_) {
+        if (!target || pad.last_used > target->last_used) {
+            target = &pad;
+        }
+    }
+    return target ? target->handle : nullptr;
 }
 
 InputDevice::Pad* InputDevice::Find(uint32_t id) {
@@ -430,7 +537,18 @@ void InputDevice::Open(uint32_t id) {
         LogWarn("input: cannot open gamepad {}: {}", id, SDL_GetError());
         return;
     }
-    pads_.push_back({handle, id, 0, 0, StyleOf(handle)});
+    Pad pad;
+    pad.handle = handle;
+    pad.id = id;
+    pad.style = StyleOf(handle);
+    pad.trigger_rumble_supported = Describe(handle).trigger_rumble;
+    pad.has_gyro = SDL_GamepadHasSensor(handle, SDL_SENSOR_GYRO);
+    {
+        char guid[64] = {};
+        SDL_GUIDToString(SDL_GetJoystickGUID(SDL_GetGamepadJoystick(handle)), guid, sizeof(guid));
+        pad.guid = guid;
+    }
+    pads_.push_back(std::move(pad));
     LogInfo("input: gamepad opened: {} ({} connected)", DescribeGamepad(Describe(handle)), pads_.size());
 }
 
@@ -441,11 +559,25 @@ void InputDevice::Close(uint32_t id) {
         }
         const char* name = SDL_GetGamepadName(it->handle);
         LogInfo("input: gamepad {} removed ('{}'), {} left", id, name ? name : "", pads_.size() - 1);
+        if (it->id == rumble_pad_) {
+            if (rumble_sent_[0] || rumble_sent_[1]) {
+                SDL_RumbleGamepad(it->handle, 0, 0, 0);
+            }
+            if (trigger_rumble_sent_[0] || trigger_rumble_sent_[1]) {
+                SDL_RumbleGamepadTriggers(it->handle, 0, 0, 0);
+            }
+        }
         SDL_CloseGamepad(it->handle);
+        if (gyro_pad_ == id) {
+            gyro_pad_ = 0;
+            gyro_.Reset();
+        }
         pads_.erase(it);
         if (rumble_pad_ == id) {
             rumble_pad_ = 0;
             rumble_sent_[0] = rumble_sent_[1] = 0;
+            trigger_rumble_sent_[0] = trigger_rumble_sent_[1] = 0;
+            trigger_rumble_sent_at_ = 0;
         }
         if (prompt_pad_ == id) {
             const Pad* next = nullptr;
@@ -514,6 +646,7 @@ void InputDevice::ProcessEvent(const SDL_Event& event) {
         break;
     case SDL_EVENT_MOUSE_WHEEL:
         UsePrompts(PromptStyle{}, 0);
+        wheel_ += event.wheel.direction == SDL_MOUSEWHEEL_FLIPPED ? -event.wheel.y : event.wheel.y;
         break;
     case SDL_EVENT_KEY_DOWN:
         if (event.key.repeat) {
@@ -521,6 +654,8 @@ void InputDevice::ProcessEvent(const SDL_Event& event) {
         }
         any_edge_ = true;
         last_from_gamepad_ = false;
+        key_pressed_since_poll_ = true;
+        if (event.key.scancode == SDL_SCANCODE_F9) capture_pose_edge_ = true;
         UsePrompts(PromptStyle{}, 0);
         for (const KeyBinding& binding : kKeyBindings) {
             if (binding.scancode == 0 || binding.scancode != event.key.scancode) {
@@ -539,6 +674,9 @@ void InputDevice::ProcessEvent(const SDL_Event& event) {
         any_edge_ = true;
         last_from_gamepad_ = false;
         UsePrompts(PromptStyle{}, 0);
+        if (event.button.button >= 1 && event.button.button <= 32) {
+            mouse_down_latch_ |= SDL_BUTTON_MASK(event.button.button);
+        }
         if (event.button.button == SDL_BUTTON_LEFT) {
             click_edge_ = true;
         } else if (event.button.button == SDL_BUTTON_RIGHT) {
@@ -556,6 +694,38 @@ void InputDevice::ProcessEvent(const SDL_Event& event) {
                 pad->event_raw |= TouchHalves(pad->handle);
             } else if (event.gbutton.button == SDL_GAMEPAD_BUTTON_BACK) {
                 settings_edge_ = true;
+                pad_back_edge_ = true;
+            }
+        }
+        break;
+    case SDL_EVENT_GAMEPAD_SENSOR_UPDATE:
+        if (event.gsensor.sensor == SDL_SENSOR_GYRO && settings.gyro != 0) {
+            Pad* pad = Find(event.gsensor.which);
+            if (pad && (gyro_pad_ == 0 || gyro_pad_ == pad->id)) {
+                if (gyro_pad_ != pad->id) {
+                    const auto stored = settings.gyro_bias.find(pad->guid);
+                    if (stored != settings.gyro_bias.end()) {
+                        gyro_.SetOffset({stored->second[0], stored->second[1], stored->second[2]});
+                    } else {
+                        gyro_.ClearOffset();
+                    }
+                }
+                gyro_pad_ = pad->id;
+                gyro_.SetTightening(settings.gyro_tightening * 0.0174532925f);
+                const uint64_t time = event.gsensor.sensor_timestamp;
+                const float dt = pad->gyro_time != 0 && time > pad->gyro_time ? static_cast<float>(time - pad->gyro_time) * 1.0e-9f : 0.0f;
+                pad->gyro_time = time;
+                if (dt > 0.0f && dt <= 0.05f) {
+                    gyro_.Add(glm::vec3(event.gsensor.data[0], event.gsensor.data[1], event.gsensor.data[2]), dt,
+                              std::clamp(settings.gyro_sensitivity, 0.25f, 4.0f));
+                    glm::vec3 offset;
+                    if (gyro_.TakeCalibrated(offset)) {
+                        calibrated_guid_ = pad->guid;
+                        calibrated_offset_ = {offset.x, offset.y, offset.z};
+                        calibrated_ready_ = true;
+                        LogInfo("input: gyro of gamepad {} calibrated, offset {:.4f} {:.4f} {:.4f} rad/s", pad->id, offset.x, offset.y, offset.z);
+                    }
+                }
             }
         }
         break;
@@ -602,15 +772,23 @@ void InputDevice::InjectMouseButton(uint8_t button, bool down) {
     ProcessEvent(event);
 }
 
+void InputDevice::InjectMouseMotion(float dx, float dy, int polls) {
+    injected_motion_ = glm::vec2(dx, dy);
+    injected_motion_polls_ = std::max(0, polls);
+}
+
 InputState InputDevice::Poll(bool keyboard_free, MouseUse mouse, bool pads_free) {
     InputState state;
+    state.gamepad_sensitivity = settings.gamepad_sensitivity;
     uint32_t raw = 0;
     const bool video = SDL_WasInit(SDL_INIT_VIDEO) != 0;
     const bool* sdl_keys = keyboard_free && video ? SDL_GetKeyboardState(nullptr) : nullptr;
     auto key = [&](SDL_Scancode code) {
         return (sdl_keys && sdl_keys[code]) || (static_cast<size_t>(code) < injected_keys_.size() && injected_keys_[code]);
     };
-    const SDL_MouseButtonFlags buttons = (mouse != MouseUse::None && video ? SDL_GetMouseState(nullptr, nullptr) : 0u) | injected_mouse_;
+    const SDL_MouseButtonFlags buttons =
+        mouse != MouseUse::None ? (video ? SDL_GetMouseState(nullptr, nullptr) : 0u) | injected_mouse_ | mouse_down_latch_ : injected_mouse_;
+    mouse_down_latch_ = 0;
     auto held = [&](KeyAction action) {
         for (const KeyBinding& binding : kKeyBindings) {
             if (binding.action != action) {
@@ -650,6 +828,40 @@ InputState InputDevice::Poll(bool keyboard_free, MouseUse mouse, bool pads_free)
     const bool house_key = mouse == MouseUse::Menu && held(KeyAction::MenuHouse);
     state.house_pressed = house_key && !previous_house_key_;
     previous_house_key_ = house_key;
+    const bool date_auto_key = mouse == MouseUse::Menu && held(KeyAction::DateAuto);
+    const bool date_skip_key = mouse == MouseUse::Menu && held(KeyAction::DateSkip);
+    state.date_auto_pressed = date_auto_key && !previous_date_auto_key_;
+    state.date_skip_pressed = date_skip_key && !previous_date_skip_key_;
+    previous_date_auto_key_ = date_auto_key;
+    previous_date_skip_key_ = date_skip_key;
+    uint32_t music_keys = 0;
+    if (mouse == MouseUse::Menu) {
+        if (held(KeyAction::MusicBack)) music_keys |= kMusicPressBack;
+        if (held(KeyAction::MusicForward)) music_keys |= kMusicPressForward;
+        if (held(KeyAction::MusicRestart)) music_keys |= kMusicPressRestart;
+        if (held(KeyAction::MusicLoop)) music_keys |= kMusicPressLoop;
+    }
+    state.music_pressed = music_keys & ~previous_music_keys_;
+    previous_music_keys_ = music_keys;
+    uint32_t menu_keys = 0;
+    if (mouse == MouseUse::Menu) {
+        const bool shift = key(SDL_SCANCODE_LSHIFT) || key(SDL_SCANCODE_RSHIFT);
+        const bool tab = key(SDL_SCANCODE_TAB);
+        if (held(KeyAction::MenuTabPrev) || (tab && shift)) menu_keys |= kMenuKeyTabPrev;
+        if (held(KeyAction::MenuTabNext) || (tab && !shift)) menu_keys |= kMenuKeyTabNext;
+        if (key(SDL_SCANCODE_E)) menu_keys |= kMenuKeyFromE;
+        if (held(KeyAction::MenuDonate)) menu_keys |= kMenuKeyDonate;
+    }
+    state.menu_keys_pressed = menu_keys & ~previous_menu_keys_;
+    if (!(state.menu_keys_pressed & kMenuKeyTabNext)) state.menu_keys_pressed &= ~kMenuKeyFromE;
+    previous_menu_keys_ = menu_keys;
+    state.capture_pose_pressed = capture_pose_edge_;
+    capture_pose_edge_ = false;
+    if (injected_motion_polls_ > 0) {
+        --injected_motion_polls_;
+        mouse_dx_ += injected_motion_.x;
+        mouse_dy_ += injected_motion_.y;
+    }
     if (mouse == MouseUse::Look) {
         state.mouse_look = glm::vec2(mouse_dx_, mouse_dy_) * settings.mouse_sensitivity;
     }
@@ -664,9 +876,10 @@ InputState InputDevice::Poll(bool keyboard_free, MouseUse mouse, bool pads_free)
     }
     if (mouse_settle_ > 0) {
         --mouse_settle_;
-    } else if (mouse_travel_ >= kPromptMouseTravel) {
+    } else if (mouse == MouseUse::Menu && mouse_travel_ >= kPromptMouseTravel && !key_pressed_since_poll_) {
         UsePrompts(PromptStyle{}, 0);
     }
+    key_pressed_since_poll_ = false;
     mouse_travel_ = 0.0f;
     mouse_dx_ = 0.0f;
     mouse_dy_ = 0.0f;
@@ -675,6 +888,10 @@ InputState InputDevice::Poll(bool keyboard_free, MouseUse mouse, bool pads_free)
     glm::vec2 right(0.0f);
     for (Pad& pad : pads_) {
         const uint32_t held = HeldRaw(pad) | pad.event_raw;
+        const bool voice_chord = SDL_GetGamepadAxis(pad.handle, SDL_GAMEPAD_AXIS_LEFT_TRIGGER) > 16383 &&
+                                 SDL_GetGamepadAxis(pad.handle, SDL_GAMEPAD_AXIS_RIGHT_TRIGGER) > 16383;
+        state.voice_keyword_pressed |= pads_free && voice_chord && !pad.previous_voice_chord;
+        pad.previous_voice_chord = voice_chord;
         uint32_t gouge_button = kRawSquare;
         if (pad.style.device == PromptDevice::PlayStation) {
             gouge_button = kRawCross;
@@ -718,6 +935,18 @@ InputState InputDevice::Poll(bool keyboard_free, MouseUse mouse, bool pads_free)
         state.from_gamepad = true;
     }
     raw |= pad_raw;
+    UpdateGyroSensors();
+    {
+        const glm::vec2 turn = gyro_.TakeTurn();
+        if (pads_free && settings.gyro == 1) {
+            state.gyro_turn = turn * std::clamp(settings.gyro_sensitivity, 0.25f, 4.0f);
+        } else if (pads_free && settings.gyro == 2) {
+            if (pad_raw & ~previous_raw_ & kRawL3) {
+                gyro_.Recenter();
+            }
+            state.gyro_light = gyro_.AimStick();
+        }
+    }
     state.raw_held = raw;
     state.raw_pressed = raw & ~previous_raw_;
     previous_raw_ = raw;
@@ -726,22 +955,84 @@ InputState InputDevice::Poll(bool keyboard_free, MouseUse mouse, bool pads_free)
     if(state.gouge_pressed)state.pressed |= kPadGouge;
     previous_held_ = state.held;
     const uint32_t pad_pressed = state.raw_pressed & pad_raw;
+    if (pad_pressed & kRawL1) state.music_pressed |= kMusicPressBack;
+    if (pad_pressed & kRawR1) state.music_pressed |= kMusicPressForward;
+    if (pad_pressed & kRawSquare) state.music_pressed |= kMusicPressRestart;
+    if (pad_pressed & kRawTriangle) state.music_pressed |= kMusicPressLoop;
+    if (pad_pressed & kRawL1) state.menu_keys_pressed |= kMenuKeyTabPrev;
+    if (pad_pressed & kRawR1) state.menu_keys_pressed |= kMenuKeyTabNext;
+    if ((pad_pressed & kRawSelect) || pad_back_edge_) state.menu_keys_pressed |= kMenuKeyDonate;
+    pad_back_edge_ = false;
     state.pause = pause_edge_ || ((pad_pressed & kRawStart) && !(pad_pressed & kRawSelect));
+    state.pause_held = held(KeyAction::Menu) || (pad_raw & kRawStart) != 0;
     state.confirm = confirm_edge_;
     state.cancel = cancel_edge_;
     state.click = click_edge_;
     state.right_click = right_click_edge_;
+    state.wheel = wheel_;
+    wheel_ = 0.0f;
     state.pc_settings = settings_edge_;
     state.any_button = any_edge_;
     state.from_gamepad = state.from_gamepad || last_from_gamepad_;
-    state.prompts = prompts_;
+    state.prompts = ShownPrompts();
     pause_edge_ = confirm_edge_ = cancel_edge_ = click_edge_ = right_click_edge_ = settings_edge_ = any_edge_ = false;
     return state;
+}
+
+bool InputDevice::AnyGyroPad() const {
+    return std::any_of(pads_.begin(), pads_.end(), [](const Pad& pad) { return pad.has_gyro; });
+}
+
+bool InputDevice::TakeGyroCalibrated(std::string& guid, std::array<float, 3>& offset) {
+    if (!calibrated_ready_) return false;
+    calibrated_ready_ = false;
+    guid = calibrated_guid_;
+    offset = calibrated_offset_;
+    return true;
+}
+
+void InputDevice::UpdateGyroSensors() {
+    const bool want = settings.gyro != 0;
+    bool any = false;
+    for (Pad& pad : pads_) {
+        const bool on = want && pad.has_gyro;
+        any |= on;
+        if (on == pad.gyro_on) {
+            continue;
+        }
+        if (SDL_SetGamepadSensorEnabled(pad.handle, SDL_SENSOR_GYRO, on)) {
+            pad.gyro_on = on;
+            pad.gyro_time = 0;
+            LogInfo("input: gyro {} on gamepad {}", on ? "enabled" : "disabled", pad.id);
+        } else {
+            pad.gyro_on = on;
+            LogWarn("input: gyro of gamepad {} could not be switched {}: {}", pad.id, on ? "on" : "off", SDL_GetError());
+        }
+    }
+    if (!want) {
+        if (gyro_.Samples() != 0 || gyro_pad_ != 0) {
+            gyro_ = GyroTracker{};
+            gyro_pad_ = 0;
+        }
+        gyro_missing_logged_ = false;
+    } else if (!any && !pads_.empty() && !gyro_missing_logged_) {
+        gyro_missing_logged_ = true;
+        LogInfo("input: gyro is on but no connected gamepad has a motion sensor");
+    }
 }
 
 void InputDevice::SetRumble(uint8_t large_motor, uint8_t small_motor) {
     rumble_want_[0] = settings.rumble ? large_motor : 0;
     rumble_want_[1] = settings.rumble ? small_motor : 0;
+    if (!settings.rumble || !settings.trigger_rumble) {
+        trigger_rumble_want_[0] = trigger_rumble_want_[1] = 0;
+    }
+    UpdateRumble();
+}
+
+void InputDevice::SetTriggerRumble(uint8_t left, uint8_t right) {
+    trigger_rumble_want_[0] = settings.rumble && settings.trigger_rumble ? left : 0;
+    trigger_rumble_want_[1] = settings.rumble && settings.trigger_rumble ? right : 0;
     UpdateRumble();
 }
 
@@ -757,8 +1048,13 @@ void InputDevice::UpdateRumble() {
         if (Pad* old = Find(rumble_pad_); old && (rumble_sent_[0] || rumble_sent_[1])) {
             SDL_RumbleGamepad(old->handle, 0, 0, 0);
         }
+        if (Pad* old = Find(rumble_pad_); old && (trigger_rumble_sent_[0] || trigger_rumble_sent_[1])) {
+            SDL_RumbleGamepadTriggers(old->handle, 0, 0, 0);
+        }
         rumble_pad_ = id;
         rumble_sent_[0] = rumble_sent_[1] = 0;
+        trigger_rumble_sent_[0] = trigger_rumble_sent_[1] = 0;
+        trigger_rumble_sent_at_ = 0;
         rumble_sent_at_ = 0;
     }
     if (!target) {
@@ -767,6 +1063,9 @@ void InputDevice::UpdateRumble() {
     const uint64_t now = SDL_GetTicks();
     const bool active = rumble_want_[0] || rumble_want_[1];
     const bool changed = rumble_want_[0] != rumble_sent_[0] || rumble_want_[1] != rumble_sent_[1];
+    const TriggerRumbleLevels trigger = BuildTriggerRumble(trigger_rumble_want_[0], trigger_rumble_want_[1], settings.rumble,
+                                                           settings.trigger_rumble, target->trigger_rumble_supported);
+    const bool trigger_changed = trigger.left != trigger_rumble_sent_[0] || trigger.right != trigger_rumble_sent_[1];
     if (active && rumble_logged_pad_ != id) {
         rumble_logged_pad_ = id;
         const char* name = SDL_GetGamepadName(target->handle);
@@ -778,6 +1077,12 @@ void InputDevice::UpdateRumble() {
         rumble_sent_[0] = rumble_want_[0];
         rumble_sent_[1] = rumble_want_[1];
         rumble_sent_at_ = now;
+    }
+    if (trigger_changed || (trigger.Active() && now - trigger_rumble_sent_at_ >= kRumbleRefreshMs)) {
+        SDL_RumbleGamepadTriggers(target->handle, trigger.left, trigger.right, trigger.Active() ? kRumbleDurationMs : 0);
+        trigger_rumble_sent_[0] = trigger.left;
+        trigger_rumble_sent_[1] = trigger.right;
+        trigger_rumble_sent_at_ = now;
     }
 }
 

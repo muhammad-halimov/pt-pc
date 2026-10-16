@@ -1,10 +1,12 @@
 #include "engine/fs/vfs.h"
 
+#include <chrono>
 #include <cstdio>
 #include <fstream>
 #include <iterator>
 
 #include "engine/core/log.h"
+#include "engine/fs/io_stats.h"
 #include "engine/platform/os.h"
 #include "engine/fs/mods.h"
 
@@ -14,7 +16,7 @@ bool Vfs::Mount(const std::filesystem::path& game_dir) {
     game_dir_ = game_dir;
     const auto psarc_path = game_dir / "chunk1.psarc";
     if (!std::filesystem::exists(psarc_path)) {
-        LogError("vfs: {} not found, game dir must be the extracted CUSA01127 folder", psarc_path.string());
+        LogError("vfs: {} not found, game dir must be the extracted CUSA01127 folder", pt::os::PathToUtf8(psarc_path));
         return false;
     }
     if (!archive_.Open(psarc_path)) {
@@ -22,11 +24,36 @@ bool Vfs::Mount(const std::filesystem::path& game_dir) {
     }
     const auto qar_path = game_dir / "texture.qar";
     if (!std::filesystem::exists(qar_path) || !textures_.Open(qar_path)) {
-        LogError("vfs: {} missing or unreadable", qar_path.string());
+        LogError("vfs: {} missing or unreadable", pt::os::PathToUtf8(qar_path));
         return false;
     }
     ReportDataDifferences();
     return true;
+}
+
+namespace {
+constexpr const char* kCoreArchive[] = {
+    "as/sh/level/common/resident.fpk",
+    "as/sh/level/promotion/pt_2014/start/pt14_start.fpk",
+    "as/sh/level/promotion/pt_2014/hallway/pt14_hallway.fpk",
+    "as/sh/level/promotion/pt_2014/hallway_maze_A/pt14_hallway_maze_A.fpk",
+    "as/sh/level/promotion/pt_2014/hallway_maze_B/pt14_hallway_maze_B.fpk",
+    "as/sh/level/promotion/pt_2014/hallway_maze_C/pt14_hallway_maze_C.fpk",
+    "as/sh/level/promotion/pt_2014/ending/ending.fpk",
+    "as/sh/level_asset/chara/player/game_object/player2_common_motion.fpk",
+    "as/sh/level_asset/chara/player/game_object/plparts_normal.fpk",
+    "as/sh/ui/ui_default_data.fpk",
+    "as/sh/ui/ui_default_lang.fpk",
+    "as/sh/level/ui/subtitles/EngVoice/EngText/subtitle.fpk",
+};
+}
+
+int Vfs::MissingCorePackages() const {
+    int missing = 0;
+    for (const char* path : kCoreArchive) {
+        if (!archive_.Contains(path)) ++missing;
+    }
+    return missing;
 }
 
 void Vfs::ReportDataDifferences() const {
@@ -42,29 +69,16 @@ void Vfs::ReportDataDifferences() const {
             }
         }
     }
-    static constexpr const char* kCore[] = {
-        "as/sh/level/common/resident.fpk",
-        "as/sh/level/promotion/pt_2014/start/pt14_start.fpk",
-        "as/sh/level/promotion/pt_2014/hallway/pt14_hallway.fpk",
-        "as/sh/level/promotion/pt_2014/hallway_maze_A/pt14_hallway_maze_A.fpk",
-        "as/sh/level/promotion/pt_2014/hallway_maze_B/pt14_hallway_maze_B.fpk",
-        "as/sh/level/promotion/pt_2014/hallway_maze_C/pt14_hallway_maze_C.fpk",
-        "as/sh/level/promotion/pt_2014/ending/ending.fpk",
-        "as/sh/level_asset/chara/player/game_object/player2_common_motion.fpk",
-        "as/sh/level_asset/chara/player/game_object/plparts_normal.fpk",
-        "as/sh/ui/ui_default_data.fpk",
-        "as/sh/ui/ui_default_lang.fpk",
-        "as/sh/level/ui/subtitles/EngVoice/EngText/subtitle.fpk",
-    };
+
     int missing = 0;
-    for (const char* path : kCore) {
+    for (const char* path : kCoreArchive) {
         if (!archive_.Contains(path)) {
             LogWarn("data: {} missing from chunk1.psarc, dependent content will not load", path);
             ++missing;
         }
     }
     if (missing == 0) {
-        LogInfo("data: {} core packages present", std::size(kCore));
+        LogInfo("data: {} core packages present", std::size(kCoreArchive));
     }
 }
 
@@ -129,6 +143,16 @@ void Vfs::UnloadPackage(std::string_view path) {
 }
 
 std::optional<std::vector<uint8_t>> Vfs::ReadFile(std::string_view path) const {
+    if (IoTraceOn()) {
+        const auto start = std::chrono::steady_clock::now();
+        auto data = ReadFileUntraced(path);
+        IoTrace("read", path, data ? data->size() : 0, std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count());
+        return data;
+    }
+    return ReadFileUntraced(path);
+}
+
+std::optional<std::vector<uint8_t>> Vfs::ReadFileUntraced(std::string_view path) const {
     if (auto data = mods::ReadOverride(path)) {
         return data;
     }
@@ -145,11 +169,14 @@ std::optional<std::vector<uint8_t>> Vfs::ReadFile(std::string_view path) const {
     }
     const auto loose = game_dir_ / std::filesystem::path(ToArchivePath(path));
     if (std::filesystem::is_regular_file(loose)) {
+        const auto read_start = std::chrono::steady_clock::now();
         FILE* f = os::OpenFile(loose, "rb");
         if (f) {
+            IoSimulatedLatency();
             std::vector<uint8_t> data(static_cast<size_t>(std::filesystem::file_size(loose)));
             const size_t read = std::fread(data.data(), 1, data.size(), f);
             std::fclose(f);
+            IoRecord(read, std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - read_start).count(), 0.0);
             if (read == data.size()) {
                 return data;
             }

@@ -1,8 +1,11 @@
 #include <cstdio>
+#include <cmath>
+#include <limits>
 #include <random>
 
 #include <glm/gtc/matrix_transform.hpp>
 
+#include "game/vr_play.h"
 #include "engine/xr/xr_view.h"
 
 namespace {
@@ -21,6 +24,66 @@ float Distance(const glm::vec3& a, const glm::vec3& b) { return glm::length(a - 
 }
 
 int main() {
+    const glm::vec3 logic_position(1.0f, 2.0f, 3.0f);
+    const glm::vec3 feet(1.0f, 0.0f, 3.0f);
+    const glm::vec3 eye(1.0f, 1.6f, 3.0f);
+    const glm::vec3 original_anchor = logic_position + (feet - eye) + glm::vec3(0.0f, 1.6f, 0.0f);
+    const glm::vec3 default_anchor = pt::game::VrEyeAnchor(logic_position, feet, eye, 1.6f, 0.0f);
+    Expect(Distance(default_anchor, original_anchor) < 1e-6f, "zero VR height offset preserves anchor");
+    const glm::vec3 raised_anchor = pt::game::VrEyeAnchor(logic_position, feet, eye, 1.6f, 0.25f);
+    Expect(std::abs(raised_anchor.y - default_anchor.y - 0.25f) < 1e-6f, "VR height offset raises anchor");
+    Expect(std::abs(pt::game::ClampVrHeightOffset(-2.0f) + 0.5f) < 1e-6f &&
+               std::abs(pt::game::ClampVrHeightOffset(2.0f) - 0.5f) < 1e-6f &&
+               pt::game::ClampVrHeightOffset(std::numeric_limits<float>::quiet_NaN()) == 0.0f,
+           "VR height offset clamps to supported range");
+    const glm::vec3 tracked_head_offset(0.1f, 0.2f, -0.3f);
+    Expect(Distance(pt::game::ScaleVrTrackedOffset(tracked_head_offset, 1.0f), tracked_head_offset) < 1e-6f,
+           "default VR world scale preserves tracked translation");
+    Expect(Distance(pt::game::ScaleVrTrackedOffset(tracked_head_offset, 2.0f), tracked_head_offset * 2.0f) < 1e-6f &&
+               std::abs(pt::game::ScaleVrTrackedOffset(tracked_head_offset, 2.0f).y - tracked_head_offset.y * 2.0f) < 1e-6f,
+           "VR world scale affects vertical and horizontal head translation");
+    const glm::vec3 eye_relative_offset(-0.032f, 0.0f, 0.0f);
+    const glm::vec3 mapped_eye = pt::game::MapVrEyeOffset(tracked_head_offset, eye_relative_offset, 2.0f);
+    Expect(Distance(mapped_eye, (tracked_head_offset + eye_relative_offset) * 2.0f) < 1e-6f,
+           "world scale applies the same metre mapping to head and eye offsets");
+    const glm::vec3 mapped_left_eye = pt::game::MapVrEyeOffset(tracked_head_offset, glm::vec3(-0.032f, 0.0f, 0.0f), 2.0f);
+    const glm::vec3 mapped_right_eye = pt::game::MapVrEyeOffset(tracked_head_offset, glm::vec3(0.032f, 0.0f, 0.0f), 2.0f);
+    Expect(std::abs(Distance(mapped_left_eye, mapped_right_eye) - 0.128f) < 1e-6f,
+           "200 percent maps runtime IPD into a doubled game-space eye baseline");
+    for (const float scale : {0.5f, 1.0f, 2.0f}) {
+        const glm::vec3 left = pt::game::MapVrEyeOffset(glm::vec3(0.0f), glm::vec3(-0.032f, 0.0f, 0.0f), scale);
+        const glm::vec3 right = pt::game::MapVrEyeOffset(glm::vec3(0.0f), glm::vec3(0.032f, 0.0f, 0.0f), scale);
+        Expect(std::abs(Distance(left, right) - 0.064f * scale) < 1e-6f,
+               "world scale changes the stereo baseline while the head is stationary");
+        const float model_depth = 2.0f;
+        const float disparity = 2.0f * std::atan((Distance(left, right) * 0.5f) / model_depth);
+        const float physical_disparity = 2.0f * std::atan(0.032f / (model_depth / scale));
+        Expect(std::abs(disparity - physical_disparity) < 1e-6f,
+               "world scale yields the documented inverse physical size through stereo disparity");
+    }
+    Expect(std::abs(pt::game::ClampVrWorldSize(0.1f) - 0.5f) < 1e-6f &&
+               std::abs(pt::game::ClampVrWorldSize(5.0f) - 2.0f) < 1e-6f &&
+               pt::game::ClampVrWorldSize(std::numeric_limits<float>::quiet_NaN()) == 1.0f,
+           "VR world size clamps to supported range");
+
+    using pt::game::VrUnitsPerMetre;
+    const float nan = std::numeric_limits<float>::quiet_NaN();
+    Expect(std::abs(VrUnitsPerMetre(-1.0f, 1.0f) - 1.0f) < 1e-6f, "no floor: one unit per metre");
+    Expect(std::abs(VrUnitsPerMetre(nan, 1.0f) - 1.0f) < 1e-6f, "no finite floor height: one unit per metre");
+    Expect(std::abs(VrUnitsPerMetre(1.645f, 1.0f) - 1.0f) < 1e-6f, "an eye at the protagonist's height: one unit per metre");
+    Expect(std::abs(VrUnitsPerMetre(1.50f, 1.0f) - 1.645f / 1.50f) < 1e-6f, "a 1.50 m eye takes 1.097 units per metre");
+    Expect(std::abs(VrUnitsPerMetre(1.10f, 1.0f) - 1.0f) < 1e-6f, "a seated eye keeps the real size");
+    Expect(std::abs(VrUnitsPerMetre(2.50f, 1.0f) - 1.645f / 2.1f) < 1e-6f, "a very high eye is clamped");
+    Expect(std::abs(VrUnitsPerMetre(1.645f, 2.0f) - 0.5f) < 1e-6f, "size 200 percent halves the units per metre");
+    Expect(std::abs(VrUnitsPerMetre(1.645f, 0.5f) - 2.0f) < 1e-6f, "size 50 percent doubles them");
+    for (const float floor_eye : {1.40f, 1.645f, 1.80f}) {
+        const float units = VrUnitsPerMetre(floor_eye, 1.0f);
+        Expect(std::abs(pt::game::kPs4EyeHeight / units - floor_eye) < 1e-5f, "the protagonist's eye at the player's eye", floor_eye);
+        const glm::vec3 l = pt::game::MapVrEyeOffset(glm::vec3(0.0f), glm::vec3(-0.032f, 0.0f, 0.0f), units);
+        const glm::vec3 r = pt::game::MapVrEyeOffset(glm::vec3(0.0f), glm::vec3(0.032f, 0.0f, 0.0f), units);
+        Expect(std::abs(Distance(l, r) - 0.064f * units) < 1e-6f, "the eye baseline takes the same units per metre", floor_eye);
+    }
+
     std::mt19937 rng(7);
     std::uniform_real_distribution<float> unit(-1.0f, 1.0f);
     float worst = 0.0f;
@@ -73,6 +136,11 @@ int main() {
     Expect(glm::length(rig.Offset(head_position)) < 1e-6f, "recentre position");
     const glm::vec3 moved(0.3f, 0.0f, 0.1f);
     const glm::vec3 before = rig.Offset(moved);
+    const glm::vec3 moved_up = moved + glm::vec3(0.0f, 0.2f, 0.0f);
+    const glm::vec3 tracked_up = pt::game::ScaleVrTrackedOffset(rig.Offset(moved_up), 1.0f);
+    const glm::vec3 tracked_level = pt::game::ScaleVrTrackedOffset(rig.Offset(moved), 1.0f);
+    Expect(std::abs((tracked_up.y - tracked_level.y) - 0.2f) < 1e-5f,
+           "tracked head height reaches the rendered eye position");
     rig.Turn(0.5236f, moved);
     Expect(Distance(rig.Offset(moved), before) < 1e-5f, "turn keeps the head", Distance(rig.Offset(moved), before));
     const pt::xr::Angles turned = pt::xr::AnglesOf(rig.ToWorld(head));

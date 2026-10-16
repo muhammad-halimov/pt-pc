@@ -3,6 +3,7 @@
 #include <zlib.h>
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstring>
 #include <map>
@@ -10,6 +11,7 @@
 
 #include "engine/core/log.h"
 #include "engine/core/pathcode.h"
+#include "engine/fs/io_stats.h"
 #include "engine/fs/mods.h"
 
 namespace pt {
@@ -53,17 +55,17 @@ bool ReadChunked(const std::vector<uint8_t>& file, size_t block, uint32_t unpack
 
 }
 
-VkFormat FtexTexture::Format() const {
+gpu::Format FtexTexture::Format() const {
     switch (pixel_format) {
-    case 0: return Srgb() ? VK_FORMAT_B8G8R8A8_SRGB : VK_FORMAT_B8G8R8A8_UNORM;
-    case 1: return VK_FORMAT_R8_UNORM;
-    case 2: return Srgb() ? VK_FORMAT_BC1_RGBA_SRGB_BLOCK : VK_FORMAT_BC1_RGBA_UNORM_BLOCK;
-    case 3: return Srgb() ? VK_FORMAT_BC2_SRGB_BLOCK : VK_FORMAT_BC2_UNORM_BLOCK;
-    case 4: return Srgb() ? VK_FORMAT_BC3_SRGB_BLOCK : VK_FORMAT_BC3_UNORM_BLOCK;
-    case 5: return VK_FORMAT_BC5_UNORM_BLOCK;
-    case 6: return VK_FORMAT_R32_SFLOAT;
-    case 8: return Srgb() ? VK_FORMAT_BC7_SRGB_BLOCK : VK_FORMAT_BC7_UNORM_BLOCK;
-    default: return VK_FORMAT_UNDEFINED;
+    case 0: return Srgb() ? gpu::Format::B8G8R8A8Srgb : gpu::Format::B8G8R8A8Unorm;
+    case 1: return gpu::Format::R8Unorm;
+    case 2: return Srgb() ? gpu::Format::Bc1RgbaSrgbBlock : gpu::Format::Bc1RgbaUnormBlock;
+    case 3: return Srgb() ? gpu::Format::Bc2SrgbBlock : gpu::Format::Bc2UnormBlock;
+    case 4: return Srgb() ? gpu::Format::Bc3SrgbBlock : gpu::Format::Bc3UnormBlock;
+    case 5: return gpu::Format::Bc5UnormBlock;
+    case 6: return gpu::Format::R32Sfloat;
+    case 8: return Srgb() ? gpu::Format::Bc7SrgbBlock : gpu::Format::Bc7UnormBlock;
+    default: return gpu::Format::Undefined;
     }
 }
 
@@ -80,7 +82,19 @@ std::optional<std::vector<uint8_t>> ReadTextureFile(const QarArchive& qar, const
     return qar.Read(PathCode64(name));
 }
 
+static bool LoadFtexUntraced(const QarArchive& qar, std::string_view path, FtexTexture& out);
+
 bool LoadFtex(const QarArchive& qar, std::string_view path, FtexTexture& out) {
+    if (IoTraceOn()) {
+        const auto start = std::chrono::steady_clock::now();
+        const bool ok = LoadFtexUntraced(qar, path, out);
+        IoTrace("texture", path, 0, std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count());
+        return ok;
+    }
+    return LoadFtexUntraced(qar, path, out);
+}
+
+static bool LoadFtexUntraced(const QarArchive& qar, std::string_view path, FtexTexture& out) {
     const std::string stem = FtexStem(path);
     auto header = mods::ReadOverride(stem + ".ftex");
     const bool modded = header.has_value();

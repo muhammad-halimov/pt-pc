@@ -2,6 +2,7 @@
 
 #include <cstdint>
 #include <memory>
+#include <string>
 #include <string_view>
 #include <unordered_map>
 #include <utility>
@@ -10,6 +11,7 @@
 #include "engine/platform/input.h"
 #include "engine/ui/uia.h"
 #include "game/ui/archive_view.h"
+#include "game/ui/dialog_view.h"
 #include "game/ui/pc_settings_page.h"
 #include "game/ui/uia_player.h"
 #include "game/ui/ui_icons.h"
@@ -33,15 +35,26 @@ struct MenuInput {
     bool back = false;
     bool open_pc = false;
     bool switch_column = false;
+    bool tab_prev = false;
+    bool tab_next = false;
+    bool tab_from_e = false;
+    bool donate = false;
     bool street_return = false;
     uint32_t held_dirs = 0;
+    uint32_t music = 0;
     bool pointer_valid = false;
     glm::vec2 pointer{0.0f};
     bool click = false;
     bool right_click = false;
+    float wheel = 0.0f;
 };
 
-MenuInput MapMenuInput(const InputState& input, uint32_t previous_held);
+inline constexpr uint32_t kMenuMusicBack = kMusicPressBack;
+inline constexpr uint32_t kMenuMusicForward = kMusicPressForward;
+inline constexpr uint32_t kMenuMusicRestart = kMusicPressRestart;
+inline constexpr uint32_t kMenuMusicLoop = kMusicPressLoop;
+
+MenuInput MapMenuInput(const InputState& input, uint32_t previous_held, uint32_t previous_dirs = 0);
 
 class OptionsMenu {
 public:
@@ -54,6 +67,7 @@ public:
     void SetPcSource(PcSettingsSource* source) { pc_source_ = source; }
     Page CurrentPage() const { return page_; }
     const PcSettingsPage& PcPage() const { return pc_; }
+    PcSettingsPage& PcPageForScript() { return pc_; }
     void Update(Game& game, const MenuInput& input, float dt);
     void Draw(ui::UiBatch& batch, const UiCanvas& canvas);
     void AdvancePresentation(float dt);
@@ -61,6 +75,7 @@ public:
     State CurrentState() const { return state_; }
     bool IsOpen() const { return state_ != State::Closed; }
     bool FirstBoot() const { return first_boot_; }
+    bool PictureFullScreen() const { return state_ == State::Active && page_ == Page::Pc && pc_.FullScreen(); }
     bool TakeClosed() { return std::exchange(just_closed_, false); }
     bool TakeResume() { return std::exchange(resume_, false); }
     bool TakeStreetReturn() { return std::exchange(street_return_, false); }
@@ -70,6 +85,7 @@ public:
     PromptDevice Prompts() const { return shown_prompts_; }
     const ui::UifModel* Model() const { return model_; }
     float SelectionFlash(float frame) const;
+    std::string DialogKind(int* focus) const;
 
 private:
     struct Animation {
@@ -113,6 +129,8 @@ private:
     uint16_t quit_label_ = 0;
     bool quit_confirming_ = false;
     bool quit_focused_ = false;
+    dialog::Nav ask_nav_;
+    float ask_flash_ = 0.0f;
     uint16_t street_label_ = 0;
     uint16_t street_icon_ = 0;
     uint16_t street_glow_ = 0;
@@ -121,9 +139,18 @@ private:
     bool street_shown_ = false;
     bool street_confirming_ = false;
     bool street_return_ = false;
-    void StreetReturn(Game& game);
+    bool leave_date_ = false;
+    void OpenAsk(Game& game, bool quit, uint32_t held);
+    void UpdateAsk(Game& game, const MenuInput& input, float dt);
     uint16_t entry_icon_ = 0;
     uint16_t entry_glow_ = 0;
+    enum class Button { None, PcSettings, Back, Quit, StreetReturn };
+    Button ButtonAt(glm::vec2 units) const;
+    uint16_t entry_bar_ = 0;
+    uint16_t back_bar_ = 0;
+    uint16_t quit_bar_ = 0;
+    Button hovered_ = Button::None;
+    float hover_frame_ = 0.0f;
     struct PromptNodes {
         uint16_t icon = 0;
         uint16_t glow = 0;
@@ -151,12 +178,14 @@ private:
     void CancelPhotoZoom();
     bool zoom_released_ = false;
     bool zoom_started_ = false;
+    float zoom_elapsed_ = 0.0f;
     decltype(ui::UifMaterial::textures) fragment_brain_textures_;
     decltype(ui::UifMaterial::textures) clean_brain_textures_;
     bool close_pending_ = false;
     bool resume_ = false;
     bool resume_sent_ = false;
     float clock_ = 0.0f;
+    float pillar_alpha_ = 0.0f;
 };
 
 }

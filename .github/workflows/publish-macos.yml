@@ -1,0 +1,41 @@
+name: Publish macOS artifacts
+
+on:
+  workflow_dispatch:
+    inputs:
+      run_id:
+        description: Successful macOS build run
+        required: true
+      tag:
+        description: Existing release tag
+        required: true
+
+permissions:
+  actions: read
+  contents: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Verify and upload the built packages
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN_ID: ${{ inputs.run_id }}
+          TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          test "$(gh run view "$RUN_ID" --repo "$GITHUB_REPOSITORY" --json conclusion --jq .conclusion)" = success
+          build_sha="$(gh run view "$RUN_ID" --repo "$GITHUB_REPOSITORY" --json headSha --jq .headSha)"
+          tag_sha="$(gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$TAG" --jq .object.sha)"
+          test "$build_sha" = "$tag_sha"
+          gh run download "$RUN_ID" --repo "$GITHUB_REPOSITORY" --dir artifacts
+          mapfile -t files < <(find artifacts -type f \( -name 'P.T.PC.Port-macOS-*.zip' -o -name 'P.T.PC.Port-macOS-*.dmg' \) | sort)
+          test "${#files[@]}" = 4
+          for arch in arm64 x64; do
+            for ext in zip dmg; do
+              test "$(find artifacts -type f -name "P.T.PC.Port-macOS-$arch.$ext" | wc -l)" -eq 1
+            done
+          done
+          gh release upload "$TAG" "${files[@]}" --clobber --repo "$GITHUB_REPOSITORY"

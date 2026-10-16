@@ -4,10 +4,14 @@
 
 #include <array>
 #include <cstdint>
+#include <map>
 #include <span>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
+
+#include "engine/platform/gyro.h"
 
 union SDL_Event;
 struct SDL_Gamepad;
@@ -52,8 +56,22 @@ uint32_t PlayerButtonsFromRaw(uint32_t raw);
 
 enum class KeyAction : uint8_t {
     WalkForward, WalkBack, WalkLeft, WalkRight, PadUp, PadDown, PadLeft, PadRight, Zoom, Act, Menu, Confirm, Cancel, PcSettings, MenuColumn,
-    MenuQuit, MenuHouse
+    MenuQuit, MenuHouse,
+    DateAuto, DateSkip,
+    PhotoSave, PhotoHide, FreeRise, FreeSink, FreeFast,
+    MusicBack, MusicForward, MusicRestart, MusicLoop,
+    MenuTabPrev, MenuTabNext, MenuDonate
 };
+
+inline constexpr uint32_t kMenuKeyTabPrev = 1;
+inline constexpr uint32_t kMenuKeyTabNext = 2;
+inline constexpr uint32_t kMenuKeyDonate = 4;
+inline constexpr uint32_t kMenuKeyFromE = 8;
+
+inline constexpr uint32_t kMusicPressBack = 1;
+inline constexpr uint32_t kMusicPressForward = 2;
+inline constexpr uint32_t kMusicPressRestart = 4;
+inline constexpr uint32_t kMusicPressLoop = 8;
 
 struct KeyBinding {
     KeyAction action;
@@ -64,9 +82,13 @@ struct KeyBinding {
 std::span<const KeyBinding> KeyBindings();
 const KeyBinding* FirstBinding(KeyAction action, bool keys_only = false);
 std::string KeyBindingName(const KeyBinding& binding);
+using KeyLayoutFunction = uint32_t (*)(uint16_t scancode);
+void SetKeyLayoutForTest(KeyLayoutFunction layout);
 
-enum class PromptDevice : uint8_t { Keyboard, PlayStation, Xbox, Nintendo };
+enum class PromptDevice : uint8_t { Keyboard, PlayStation, Xbox, Nintendo, Steam };
 const char* PromptDeviceName(PromptDevice device);
+
+bool IsSteamGamepadId(uint16_t vendor, uint16_t product);
 
 struct PromptStyle {
     PromptDevice device = PromptDevice::Keyboard;
@@ -84,6 +106,7 @@ struct InputState {
     uint32_t raw_held = 0;
     uint32_t raw_pressed = 0;
     bool pause = false;
+    bool pause_held = false;
     bool confirm = false;
     bool cancel = false;
     bool pc_settings = false;
@@ -92,19 +115,38 @@ struct InputState {
     bool left_stick_from_pad = false;
     bool click = false;
     bool right_click = false;
+    float wheel = 0.0f;
     bool gouge_pressed = false;
+    bool voice_keyword_pressed = false;
     bool house_pressed = false;
+    bool date_auto_pressed = false;
+    bool date_skip_pressed = false;
+    uint32_t music_pressed = 0;
+    uint32_t menu_keys_pressed = 0;
+    bool capture_pose_pressed = false;
     bool pointer_valid = false;
     glm::vec2 pointer{0.0f};
     PromptStyle prompts;
     bool vr_look = false;
     glm::vec2 vr_look_angles{0.0f};
+    float gamepad_sensitivity = 1.0f;
+    glm::vec2 gyro_turn{0.0f};
+    glm::vec2 gyro_light{0.0f};
 };
+
+void MergeFrameButtons(InputState& pending, const InputState& polled);
 
 struct InputSettings {
     float mouse_sensitivity = 0.0015f;
+    float gamepad_sensitivity = 1.0f;
     float stick_dead_zone = 26.0f / 255.0f;
     bool rumble = true;
+    bool trigger_rumble = false;
+    int prompt_style = 0;
+    int gyro = 0;
+    float gyro_sensitivity = 1.0f;
+    float gyro_tightening = 4.0f;
+    std::map<std::string, std::array<float, 3>> gyro_bias;
 };
 
 struct GamepadInfo {
@@ -125,6 +167,7 @@ struct GamepadInfo {
     int touchpads = 0;
     bool rumble = false;
     bool trigger_rumble = false;
+    bool gyro = false;
 };
 
 std::vector<GamepadInfo> DescribeJoysticks();
@@ -135,6 +178,16 @@ uint32_t MouseButtonFromName(std::string_view name);
 
 enum class MouseUse { None, Look, Menu };
 
+class KeyPressLatch {
+public:
+    void ProcessEvent(const SDL_Event& event, uint32_t scancode);
+    bool Consume() { return std::exchange(pressed_, false); }
+    void Discard() { pressed_ = false; }
+
+private:
+    bool pressed_ = false;
+};
+
 class InputDevice {
 public:
     void Init();
@@ -142,11 +195,21 @@ public:
     void ProcessEvent(const SDL_Event& event);
     InputState Poll(bool keyboard_free, MouseUse mouse, bool pads_free = true);
     void SetRumble(uint8_t large_motor, uint8_t small_motor);
+    void SetTriggerRumble(uint8_t left, uint8_t right);
     size_t GamepadCount() const { return pads_.size(); }
     uint32_t RumblePad() const { return rumble_pad_; }
-    const PromptStyle& Prompts() const { return prompts_; }
+    SDL_Gamepad* LastUsedGamepad() const;
+    PromptStyle Prompts() const { return ShownPrompts(); }
     void InjectKey(uint32_t scancode, bool down);
     void InjectMouseButton(uint8_t button, bool down);
+    void InjectMouseMotion(float dx, float dy, int polls);
+    const GyroTracker& Gyro() const { return gyro_; }
+    void StartGyroCalibration() { gyro_.StartCalibration(); }
+    void ClearGyroCalibration() { gyro_.ClearCalibration(); }
+    GyroTracker::Calibration GyroCalibration() const { return gyro_.CalibrationState(); }
+    float GyroCalibrationProgress() const { return gyro_.CalibrationProgress(); }
+    bool AnyGyroPad() const;
+    bool TakeGyroCalibrated(std::string& guid, std::array<float, 3>& offset);
 
     InputSettings settings;
 
@@ -158,6 +221,12 @@ private:
         uint64_t last_used = 0;
         PromptStyle style;
         uint32_t previous_gouge = 0;
+        bool previous_voice_chord = false;
+        bool trigger_rumble_supported = false;
+        bool has_gyro = false;
+        bool gyro_on = false;
+        std::string guid;
+        uint64_t gyro_time = 0;
     };
 
     void Open(uint32_t id);
@@ -168,9 +237,15 @@ private:
     uint32_t TouchRaw(const Pad& pad) const;
     glm::vec2 Stick(const Pad& pad, int x_axis, int y_axis) const;
     void UpdateRumble();
-    void UpdateTouch(const SDL_Event& event);
+    void UpdateGyroSensors();
 
     std::vector<Pad> pads_;
+    GyroTracker gyro_;
+    uint32_t gyro_pad_ = 0;
+    bool gyro_missing_logged_ = false;
+    std::string calibrated_guid_;
+    std::array<float, 3> calibrated_offset_{};
+    bool calibrated_ready_ = false;
     uint64_t use_counter_ = 0;
     float mouse_dx_ = 0.0f;
     float mouse_dy_ = 0.0f;
@@ -178,35 +253,40 @@ private:
     uint32_t previous_raw_ = 0;
     bool previous_gouge_key_ = false;
     bool previous_house_key_ = false;
+    uint32_t previous_menu_keys_ = 0;
+    bool pad_back_edge_ = false;
+    bool previous_date_auto_key_ = false;
+    bool previous_date_skip_key_ = false;
+    bool capture_pose_edge_ = false;
+    uint32_t previous_music_keys_ = 0;
     bool pause_edge_ = false;
     bool confirm_edge_ = false;
     bool cancel_edge_ = false;
     bool click_edge_ = false;
     bool right_click_edge_ = false;
+    float wheel_ = 0.0f;
     bool settings_edge_ = false;
     bool any_edge_ = false;
     bool last_from_gamepad_ = false;
     std::vector<bool> injected_keys_;
     uint32_t injected_mouse_ = 0;
-    struct TouchPoint {
-        uint64_t id = 0;
-        float x = 0.0f;
-        float y = 0.0f;
-        bool active = false;
-    };
-    std::array<TouchPoint, 16> touches_{};
-    glm::vec2 touch_left_{0.0f};
-    glm::vec2 touch_look_{0.0f};
-    uint32_t touch_raw_ = 0;
+    glm::vec2 injected_motion_{0.0f};
+    int injected_motion_polls_ = 0;
+    uint32_t mouse_down_latch_ = 0;
     PromptStyle prompts_;
+    PromptStyle ShownPrompts() const;
     uint32_t prompt_pad_ = 0;
     float mouse_travel_ = 0.0f;
+    bool key_pressed_since_poll_ = false;
     MouseUse last_mouse_use_ = MouseUse::None;
     int mouse_settle_ = 0;
     uint32_t rumble_pad_ = 0;
     uint32_t rumble_logged_pad_ = 0;
     uint8_t rumble_want_[2] = {0, 0};
     uint8_t rumble_sent_[2] = {0, 0};
+    uint8_t trigger_rumble_want_[2] = {0, 0};
+    uint16_t trigger_rumble_sent_[2] = {0, 0};
+    uint64_t trigger_rumble_sent_at_ = 0;
     uint64_t rumble_sent_at_ = 0;
 };
 

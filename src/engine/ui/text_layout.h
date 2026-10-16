@@ -19,12 +19,14 @@ struct TextStyle {
     float text_space = 0.0f;
     float line_space = 0.0f;
     float inline_advance = 0.0f;
+    std::vector<float> inline_advances;
 };
 
 struct LaidGlyph {
     const FfntGlyph* glyph = nullptr;
     glm::vec2 position{0.0f};
     glm::vec2 size{0.0f};
+    int picture = -1;
 };
 
 struct TextLine {

@@ -35,7 +35,8 @@ namespace {
 constexpr int kEm = 48;
 const char* FontFile(std::string_view family) {
     if (family == "Noto Sans") return "NotoSans.ttf";
-    if (family == "Noto Sans Arabic") return "NotoSansArabic.ttf";
+    if (family == "Noto Kufi Arabic") return "NotoKufiArabic.ttf";
+    if (family == "Noto Naskh Arabic") return "NotoNaskhArabic.ttf";
     if (family == "Noto Sans SC") return "NotoSansSC.ttf";
     return nullptr;
 }
@@ -175,7 +176,7 @@ bool FfntFont::LoadUnicodeFont(std::string_view family, std::string_view charact
     return true;
 }
 
-std::vector<ShapedGlyph> FfntFont::ShapeLine(std::span<const uint32_t> codes, float inline_advance) const {
+std::vector<ShapedGlyph> FfntFont::ShapeLine(std::span<const uint32_t> codes, float inline_advance, std::span<const float> code_advances) const {
     std::vector<ShapedGlyph> out;
     if (!unicode_ || codes.empty()) return out;
     const bool has_arabic = std::any_of(codes.begin(), codes.end(), [](uint32_t c) { return c >= 0x600 && c <= 0x6FF; });
@@ -184,8 +185,9 @@ std::vector<ShapedGlyph> FfntFont::ShapeLine(std::span<const uint32_t> codes, fl
         const auto part = codes.subspan(run.begin, run.end - run.begin);
         for (const auto& g : ShapeRun(*unicode_, part, run.rtl)) {
             const bool picture = g.cluster < part.size() && part[g.cluster] == 0xE000;
-            const float advance = picture ? inline_advance : g.advance;
-            out.push_back({picture ? nullptr : Find(0x100000 + g.glyph), pen, g.x, -g.y, advance});
+            const size_t code = run.begin + g.cluster;
+            const float advance = picture ? (code < code_advances.size() ? code_advances[code] : inline_advance) : g.advance;
+            out.push_back({picture ? nullptr : Find(0x100000 + g.glyph), pen, g.x, -g.y, advance, picture ? static_cast<int>(code) : -1});
             pen += advance;
         }
     }

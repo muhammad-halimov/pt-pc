@@ -2,10 +2,12 @@
 
 #include <algorithm>
 #include <cmath>
+#include <utility>
 
 #include "engine/core/log.h"
 #include "engine/core/strcode.h"
 #include "engine/fs/vfs.h"
+#include "game/archive.h"
 #include "game/demo_system.h"
 #include "game/game.h"
 
@@ -17,10 +19,12 @@ constexpr uint64_t kRandomBugText = 0x90BA012E9D3E;
 constexpr int kBugCases = 7;
 constexpr uint64_t kBugTexts[6] = {0x119CABD7B66A, 0x69D97AC6AF45, 0xC19FC491E18F, 0xF89D156E5DA1, 0xED7A96A7C6B6, 0xA957904C892D};
 constexpr uint64_t kBug3Mesh = 0x8F1B33D1D824;
+constexpr uint64_t kBugSetoutText = 0xE77E6C72FA82;
 constexpr const char* kBugPictures[kBugCases] = {"sh_bug_1, grey, mirrored lines", "sh_bug_2, black, Fix this damn bug",
                                                  "sh_bug_4, white, Knowing you ... -J", "sh_bug_5, red, I'm heading there now",
                                                  "sh_bug_6, yellow, I'll call later", "sh_bug_7, black, This game is purely fictitious",
                                                  "sh_bug_3, yellow, Release the game for free (port addition)"};
+constexpr std::string_view kBugTextures[kBugCases] = {"sh_bug_1", "sh_bug_2", "sh_bug_4", "sh_bug_5", "sh_bug_6", "sh_bug_7", "sh_bug_3"};
 
 std::string_view Stem(std::string_view path) {
     const size_t slash = path.find_last_of('/');
@@ -144,12 +148,19 @@ bool DemoUi::Text(uint64_t graph, uint64_t text, int bug_screen) {
         return false;
     }
     std::vector<ui::UigbAction> added;
+    if ((text & kStrCode64Mask) == kBugSetoutText) {
+        bug_graph_ = 0;
+    }
     if ((text & kStrCode64Mask) == kRandomBugText) {
+        bug_graph_ = graph;
+        bug_shown_ = 0.0f;
         uint32_t x = ReadTsc();
         x ^= x << 13;
         x ^= x >> 7;
         x ^= x << 5;
         const uint32_t pick = bug_screen >= 0 && bug_screen < kBugCases ? static_cast<uint32_t>(bug_screen) : x % kBugCases;
+        bug_pick_ = pick;
+        bug_unnoted_ = static_cast<int>(pick);
         LogInfo("ui: bug screen {} of {} ({}){}", pick, kBugCases, kBugPictures[pick], bug_screen >= 0 ? ", forced" : "");
         if (pick == 6) {
             if (const ui::UigbEvent* model = instance->data->FindEvent(kBugTexts[0])) {
@@ -174,6 +185,39 @@ bool DemoUi::Text(uint64_t graph, uint64_t text, int bug_screen) {
     LogInfo("ui: demo graph {:#x} event {:#x} ({} actions)", graph, text, event->actions.size());
     Run(*instance, event->actions);
     return true;
+}
+
+std::string_view DemoUi::BugPictureTexture(uint32_t pick) {
+    return pick < static_cast<uint32_t>(kBugCases) ? kBugTextures[pick] : std::string_view();
+}
+
+glm::vec4 DemoUi::BugPillarColor() const {
+    static constexpr glm::vec3 kColors[kBugCases] = {{110.0f, 111.0f, 110.0f}, {0.0f, 0.0f, 0.0f}, {255.0f, 255.0f, 255.0f}, {255.0f, 0.0f, 0.0f},
+                                                     {255.0f, 255.0f, 0.0f}, {0.0f, 0.0f, 0.0f}, {255.0f, 255.0f, 0.0f}};
+    const bool shown = bug_graph_ && std::any_of(instances_.begin(), instances_.end(), [&](const auto& i) { return i->graph == bug_graph_; });
+    if (!shown || bug_pick_ >= static_cast<uint32_t>(kBugCases)) return glm::vec4(0.0f);
+    return glm::vec4(kColors[bug_pick_] / 255.0f, 1.0f);
+}
+
+bool DemoUi::BugScreenStill() const {
+    constexpr float kSetInSeconds = 0.25f;
+    if (!bug_graph_ || bug_shown_ < kSetInSeconds) {
+        return false;
+    }
+    for (const auto& instance : instances_) {
+        if (instance->graph != bug_graph_) {
+            continue;
+        }
+        for (const Layout& layout : instance->layouts) {
+            for (const ModelView& model : layout.models) {
+                if (model.players.AnyPlaying()) {
+                    return false;
+                }
+            }
+        }
+        return true;
+    }
+    return false;
 }
 
 void DemoUi::Run(Instance& instance, const std::vector<ui::UigbAction>& actions) {
@@ -256,6 +300,7 @@ void DemoUi::Update(Game& game, float dt, bool paused) {
             Start(e.graph);
         } else if (functor == kTextFunctor) {
             Text(e.graph, e.text, game.Config().bug_screen);
+            if (bug_unnoted_ >= 0) game.NoteArchive(ArchiveBugScreenKey(BugPictureTexture(static_cast<uint32_t>(std::exchange(bug_unnoted_, -1)))));
         }
     }
     const size_t before = instances_.size();
@@ -266,6 +311,9 @@ void DemoUi::Update(Game& game, float dt, bool paused) {
         LogInfo("ui: {} demo graphs closed with the demo", before - instances_.size());
     }
     const float step = paused ? 0.0f : dt * game.Demos().time_scale;
+    if (bug_graph_) {
+        bug_shown_ += step;
+    }
     for (auto& instance : instances_) {
         for (Layout& layout : instance->layouts) {
             for (ModelView& model : layout.models) {

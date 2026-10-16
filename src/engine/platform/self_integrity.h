@@ -3,6 +3,9 @@
 #include <windows.h>
 #include <bcrypt.h>
 #endif
+#include "engine/platform/os.h"
+#include "engine/platform/signed_trailer.h"
+
 #include <cstdint>
 #include <cstring>
 #include <fstream>
@@ -74,14 +77,15 @@ inline bool Sha256(const unsigned char* data, size_t size, unsigned char out[32]
 
 inline bool IntegrityOk() {
 #ifdef _WIN32
-    wchar_t path[MAX_PATH];
-    const DWORD length = GetModuleFileNameW(nullptr, path, MAX_PATH);
-    if (length == 0 || length >= MAX_PATH) return false;
+    const std::filesystem::path path = pt::os::ExecutableFile();
+    if (path.empty()) return false;
 #else
     const char* path = "/proc/self/exe";
 #endif
     std::ifstream file(path, std::ios::binary);
     std::vector<unsigned char> bytes((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
+    if (bytes.size() >= trailer::kFooterSize)
+        if (const auto footer = trailer::Parse(bytes.data() + bytes.size() - trailer::kFooterSize, bytes.size())) bytes.resize(size_t(footer->body()));
     unsigned char marker[16];
     for (int i = 0; i < 16; ++i) marker[i] = kIntegrity[i];
     size_t at = std::string::npos;

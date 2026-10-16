@@ -25,6 +25,9 @@ struct ModelEntry {
     std::vector<glm::vec3> bone_bind_world;
     std::vector<glm::vec3> raw_positions;
     bool skinned = false;
+    uint32_t stage_refs = 0;
+    bool pinned = false;
+    std::vector<uint32_t> textures;
 };
 
 class ModelCache {
@@ -36,6 +39,26 @@ public:
                                 const std::function<void(Vertex&)>& transform = {});
     std::unordered_set<std::string> Paths() const;
     void Clear();
+    class StageScope {
+    public:
+        explicit StageScope(ModelCache& cache) : cache_(cache) { ++cache_.stage_scope_; }
+        ~StageScope() { --cache_.stage_scope_; }
+        StageScope(const StageScope&) = delete;
+        StageScope& operator=(const StageScope&) = delete;
+
+    private:
+        ModelCache& cache_;
+    };
+    void AddStageRef(const std::string& path);
+    void ReleaseStageRef(const std::string& path);
+    bool Holds(const GpuMesh* mesh) const;
+    struct Released {
+        uint32_t models = 0;
+        uint32_t textures = 0;
+        uint64_t mesh_bytes = 0;
+        uint64_t texture_bytes = 0;
+    };
+    Released ReleaseUnused();
     bool ReadMesh(const std::string& path, MeshData& out);
 
     uint32_t Loaded() const { return loaded_; }
@@ -57,6 +80,8 @@ private:
     std::vector<float> reflection_;
     bool reflection_loaded_ = false;
     std::unordered_map<std::string, ModelEntry> entries_;
+    int stage_scope_ = 0;
+    std::vector<uint32_t>* loading_textures_ = nullptr;
     uint32_t loaded_ = 0;
     uint32_t failed_ = 0;
     uint32_t missing_textures_ = 0;

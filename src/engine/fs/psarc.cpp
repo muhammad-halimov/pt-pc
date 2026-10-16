@@ -2,10 +2,12 @@
 
 #include <zlib.h>
 
+#include <chrono>
 #include <cstdio>
 #include <cstring>
 
 #include "engine/core/log.h"
+#include "engine/fs/io_stats.h"
 #include "engine/platform/os.h"
 
 namespace pt {
@@ -34,16 +36,16 @@ Psarc::~Psarc() {
 bool Psarc::Open(const std::filesystem::path& path) {
     file_ = os::OpenFile(path, "rb");
     if (!file_) {
-        LogError("psarc: cannot open {}", path.string());
+        LogError("psarc: cannot open {}", pt::os::PathToUtf8(path));
         return false;
     }
     uint8_t header[32];
     if (std::fread(header, 1, sizeof(header), file_) != sizeof(header) || std::memcmp(header, "PSAR", 4) != 0) {
-        LogError("psarc: bad header in {}", path.string());
+        LogError("psarc: bad header in {}", pt::os::PathToUtf8(path));
         return false;
     }
     if (std::memcmp(header + 8, "zlib", 4) != 0) {
-        LogError("psarc: unsupported compression in {}", path.string());
+        LogError("psarc: unsupported compression in {}", pt::os::PathToUtf8(path));
         return false;
     }
     const uint32_t toc_length = ReadBe32(header + 12);
@@ -90,7 +92,7 @@ bool Psarc::Open(const std::filesystem::path& path) {
     for (size_t i = 1; i < names_.size() && i < entries_.size(); ++i) {
         index_[names_[i]] = i;
     }
-    LogInfo("psarc: {} entries in {}", entries_.size() - 1, path.filename().string());
+    LogInfo("psarc: {} entries in {}", entries_.size() - 1, pt::os::PathToUtf8(path.filename()));
     return true;
 }
 
@@ -124,10 +126,13 @@ std::optional<std::vector<uint8_t>> Psarc::ReadEntry(size_t index) const {
     std::vector<uint8_t> out;
     out.reserve(entry.size);
     std::vector<uint8_t> block;
+    const auto wait_start = std::chrono::steady_clock::now();
     std::lock_guard lock(mutex_);
+    const auto read_start = std::chrono::steady_clock::now();
     if (os::SeekFile(file_, static_cast<long long>(entry.offset), SEEK_SET) != 0) {
         return std::nullopt;
     }
+    IoSimulatedLatency();
     uint32_t block_index = entry.first_block;
     while (out.size() < entry.size) {
         const uint32_t stored = block_sizes_[block_index] ? block_sizes_[block_index] : block_size_;
@@ -150,6 +155,9 @@ std::optional<std::vector<uint8_t>> Psarc::ReadEntry(size_t index) const {
         ++block_index;
     }
     out.resize(entry.size);
+    const auto end = std::chrono::steady_clock::now();
+    IoRecord(out.size(), std::chrono::duration<double, std::milli>(end - read_start).count(),
+             std::chrono::duration<double, std::milli>(read_start - wait_start).count());
     return out;
 }
 

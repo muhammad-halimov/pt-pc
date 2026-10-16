@@ -45,6 +45,7 @@ private:
     bool init_started_ = false;
     bool restart_objects_pending_ = false;
     bool new_session_pending_ = false;
+    bool release_after_ending_ = false;
     bool save_pending_ = false;
     bool disable_option_pending_ = false;
     bool option_menu_open_ = false;

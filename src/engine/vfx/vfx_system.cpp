@@ -242,16 +242,21 @@ uint32_t System::SeedFor(const Instance& inst, uint32_t seed, uint8_t type, uint
     return inst.random + node_id + inst.random;
 }
 
-bool System::Spawn(const InstanceKey& key, const std::string& path, const glm::mat4& world, uint32_t seed) {
+bool System::Spawn(const InstanceKey& key, const std::string& path, const glm::mat4& world, std::optional<uint32_t> seed) {
     std::shared_ptr<const EffectDef> def = Load(path);
-    if (!def || (def->shapes.empty() && def->flares.empty())) {
+    if (!def) {
+        return false;
+    }
+    const uint32_t creation_counter = creation_seed_counter_++;
+    const uint32_t requested_seed = seed.value_or(creation_counter);
+    if (def->shapes.empty() && def->flares.empty()) {
         return false;
     }
     Instance inst;
     inst.def = def;
     inst.world = world;
     inst.previous_world = world;
-    inst.seed = seed ? seed : 0xFFFFFFu;
+    inst.seed = requested_seed ? requested_seed : 0xFFFFFFu;
     inst.random = XorShiftOnce(inst.seed);
     if (inst.random == 0) {
         inst.random = 1;
@@ -276,6 +281,10 @@ bool System::Spawn(const InstanceKey& key, const std::string& path, const glm::m
         state.life_rng = SeedFor(inst, life.seed, life.seed_type, life.node_id);
         state.particle_rng = inst.random;
         state.material_rng = SeedFor(inst, 0, 0, def->shapes[i].material.node_id);
+    }
+    if (std::getenv("PT_VFX_TRACE_LOG")) {
+        LogDebug("vfx: create {} counter {} seed {:#x} ({}) at ({:.6f} {:.6f} {:.6f})", path, creation_counter, inst.seed,
+                 seed ? "user" : "counter", world[3].x, world[3].y, world[3].z);
     }
     instances_[key] = std::move(inst);
     return true;
@@ -612,7 +621,6 @@ void System::Spawn(Instance& inst, size_t shape_index, int count, const ViewInfo
     const EffectDef& def = *inst.def;
     const ShapeDef& shape = def.shapes[shape_index];
     ShapeState& state = inst.shapes[shape_index];
-    (void)view;
     if (count <= 0) {
         return;
     }
@@ -630,6 +638,8 @@ void System::Spawn(Instance& inst, size_t shape_index, int count, const ViewInfo
         p.life = std::max(p.life, 1.0f / kFrameRate);
         p.infinite = shape.life.infinite;
         p.spawn_world = inst.world;
+        p.spawn_camera = glm::mat4(glm::vec4(view.right, 0.0f), glm::vec4(view.up, 0.0f),
+                                   glm::vec4(view.forward, 0.0f), glm::vec4(view.position, 1.0f));
         if (shape.particle_random) {
             p.random = static_cast<uint16_t>(XorShift(state.particle_rng));
         }
@@ -739,11 +749,22 @@ glm::vec4 System::Eval(const EvalContext& c, int32_t index) const {
     case ExprOp::Zero:
         return glm::vec4(0.0f);
     case ExprOp::Const:
+    case ExprOp::Random:
+    case ExprOp::Spread: {
+        glm::vec4 v = e.op == ExprOp::Const ? e.v0 : e.slot >= 0 ? c.slots[e.slot] : glm::vec4(0.0f);
+        if ((e.flags & 1u) && !(e.flags & 8u)) {
+            const glm::vec3 x = glm::vec3(c.world[0]), y = glm::vec3(c.world[1]), z = glm::vec3(c.world[2]);
+            const float lx = glm::length(x), ly = glm::length(y), lz = glm::length(z);
+            if (lx > 1e-6f && ly > 1e-6f && lz > 1e-6f) {
+                const glm::mat3 r(x / lx, y / ly, z / lz);
+                v = glm::vec4(glm::transpose(r) * glm::vec3(v), v.w);
+            }
+        }
+        return v;
+    }
     case ExprOp::UvMap:
         return e.v0;
-    case ExprOp::Random:
     case ExprOp::UvRandom:
-    case ExprOp::Spread:
         return e.slot >= 0 ? c.slots[e.slot] : glm::vec4(0.0f);
     case ExprOp::Composition: {
         const glm::vec4 a = Eval(c, e.in[0]);
@@ -854,20 +875,36 @@ glm::vec4 System::Eval(const EvalContext& c, int32_t index) const {
         return in + glm::vec4(dir * e.v0.x, 0.0f);
     }
     case ExprOp::CameraFollow: {
-        const glm::vec3 q = glm::vec3(Eval(c, e.in[0]) + e.v0);
-        glm::vec3 forward = c.view->forward;
-        glm::vec3 up = c.view->up;
-        glm::vec3 right = c.view->right;
+        const glm::vec3 q = glm::vec3(Eval(c, e.in[0]));
+        const bool born = c.follow_spawn && c.particle;
+        glm::vec3 forward = born ? glm::vec3(c.particle->spawn_camera[2]) : c.view->forward;
+        glm::vec3 up = born ? glm::vec3(c.particle->spawn_camera[1]) : c.view->up;
+        glm::vec3 right = born ? glm::vec3(c.particle->spawn_camera[0]) : c.view->right;
+        const glm::vec3 eye = born ? glm::vec3(c.particle->spawn_camera[3]) : c.view->position;
         if (e.flags & 1u) {
             forward.y = 0.0f;
             forward = glm::length(forward) > 1e-5f ? glm::normalize(forward) : glm::vec3(0.0f, 0.0f, -1.0f);
             up = glm::vec3(0.0f, 1.0f, 0.0f);
             right = glm::normalize(glm::cross(forward, up));
         }
-        return glm::vec4(c.view->position + right * q.x + up * q.y + forward * q.z, 0.0f);
+        const glm::vec3 center = eye + right * e.v0.x + up * e.v0.y + forward * e.v0.z;
+        const glm::vec3 input = (e.flags & 2u) ? right * q.x + up * q.y + forward * q.z : glm::mat3(c.world) * q;
+        return glm::vec4(center + input, 0.0f);
     }
     case ExprOp::CenterScroll: {
-        const glm::vec3 p = glm::vec3(Eval(c, e.in[0]));
+        glm::vec3 p;
+        if ((e.flags & 1u) && c.particle) {
+            ViewInfo birth = *c.view;
+            birth.right = glm::vec3(c.particle->spawn_camera[0]);
+            birth.up = glm::vec3(c.particle->spawn_camera[1]);
+            birth.forward = glm::vec3(c.particle->spawn_camera[2]);
+            birth.position = glm::vec3(c.particle->spawn_camera[3]);
+            EvalContext anchored = c;
+            anchored.view = &birth;
+            p = glm::vec3(Eval(anchored, e.in[0]));
+        } else {
+            p = glm::vec3(Eval(c, e.in[0]));
+        }
         const glm::vec3 center = c.view->position + c.view->right * e.v1.x + c.view->up * e.v1.y + c.view->forward * e.v1.z;
         const glm::vec3 range = glm::max(glm::vec3(e.v0), glm::vec3(1e-3f));
         glm::vec3 d = p - center + range;
@@ -916,6 +953,7 @@ glm::vec4 System::Eval(const EvalContext& c, int32_t index) const {
 void System::Build(const ViewInfo& view, const TextureResolver& textures, const TextureResolver& cubes, const LightingProbe& lighting,
                    RenderList& out, std::vector<LightOut>& lights, float blend) {
     out.near_plane = view.near_plane;
+    auto is_light = [](const ShapeDef& shape) { return shape.kind == ShapeKind::SpotLight || shape.kind == ShapeKind::PointLight; };
     for (auto& [key, inst] : instances_) {
         const EffectDef& def = *inst.def;
         if (!filter_.empty() && def.name.find(filter_) == std::string::npos) {
@@ -923,10 +961,28 @@ void System::Build(const ViewInfo& view, const TextureResolver& textures, const 
         }
         const glm::mat4 world = BlendTransform(inst.previous_world, inst.world, blend);
         for (size_t i = 0; i < def.shapes.size(); ++i) {
+            if (!is_light(def.shapes[i])) {
+                continue;
+            }
             const size_t first = lights.size();
             BuildShape(inst, world, def.shapes[i], inst.shapes[i], view, textures, cubes, lighting, out, lights);
             for (size_t k = first; k < lights.size(); ++k) {
                 lights[k].id = (key.owner * 0x9E3779B97F4A7C15ull) ^ (key.id << 12) ^ (uint64_t(i) << 6) ^ (k - first) ^ 0xFA00000000000000ull;
+            }
+        }
+    }
+    if (lights_ready_) {
+        lights_ready_(lights);
+    }
+    for (auto& [key, inst] : instances_) {
+        const EffectDef& def = *inst.def;
+        if (!filter_.empty() && def.name.find(filter_) == std::string::npos) {
+            continue;
+        }
+        const glm::mat4 world = BlendTransform(inst.previous_world, inst.world, blend);
+        for (size_t i = 0; i < def.shapes.size(); ++i) {
+            if (!is_light(def.shapes[i])) {
+                BuildShape(inst, world, def.shapes[i], inst.shapes[i], view, textures, cubes, lighting, out, lights);
             }
         }
         for (size_t i = 0; i < def.flares.size() && !inst.stopped; ++i) {
@@ -968,6 +1024,7 @@ void System::BuildShape(const Instance& inst, const glm::mat4& world, const Shap
             c.age = p.infinite ? std::fmod(p.age, p.life) : p.age;
             c.ratio = Saturate(c.age / p.life);
             c.world = shape.local_space ? world : p.spawn_world;
+            c.follow_spawn = !shape.local_space;
             LightOut l;
             l.spot = shape.kind == ShapeKind::SpotLight;
             const glm::vec3 pos = glm::vec3(Eval(c, shape.attr[kPosition]));
@@ -1081,6 +1138,8 @@ void System::BuildShape(const Instance& inst, const glm::mat4& world, const Shap
     std::vector<LitRef>& lit_refs = build_lit_refs_;
     lit_refs.clear();
     const bool block_lit = m.kind == MaterialKind::Lit && static_cast<bool>(light_block_);
+    const bool liquid_block = m.kind == MaterialKind::Liquid && static_cast<bool>(light_block_);
+    const bool any_block = block_lit || liquid_block;
     items.reserve(state.particles.size());
     for (size_t pi = 0; pi < state.particles.size(); ++pi) {
         const Particle& p = state.particles[pi];
@@ -1090,6 +1149,7 @@ void System::BuildShape(const Instance& inst, const glm::mat4& world, const Shap
         c.age = p.infinite ? std::fmod(p.age, p.life) : p.age;
         c.ratio = Saturate(c.age / p.life);
         c.world = shape.local_space ? world : p.spawn_world;
+        c.follow_spawn = !shape.local_space;
         const glm::vec3 local = glm::vec3(Eval(c, shape.attr[kPosition]));
         glm::vec3 world_pos = shape.world_position ? local : TransformPoint(c.world, local);
         c.position = world_pos;
@@ -1208,11 +1268,14 @@ void System::BuildShape(const Instance& inst, const glm::mat4& world, const Shap
             if (m.kind == MaterialKind::Liquid) {
                 quad_luminance.y = glm::dot(rgb, glm::vec3(0.2126f, 0.7152f, 0.0722f));
                 unlit = rgb;
-                rgb *= light.ambient * m.ambient_rate + light.point * (m.point_rate * (1.0f - m.transparency));
+                rgb *= light.ambient * m.ambient_rate + (liquid_block ? glm::vec3(0.0f) : light.point * (m.point_rate * (1.0f - m.transparency)));
+                if (liquid_block) {
+                    lit_refs.push_back({items.size(), items.size(), rgb, world_pos});
+                }
             } else {
                 rgb *= light.ambient * m.ambient_rate + light.directional * m.directional_rate + light.point * m.point_rate;
             }
-            static const bool debug = std::getenv("PT_VFX_DEBUG") != nullptr;
+            static const bool debug = std::getenv("PT_VFX_DEBUG") != nullptr || std::getenv("PT_VFX_TRACE_LOG") != nullptr;
             if (debug && pi == 0) {
                 LogDebug("vfx: {} lit at ({:.2f} {:.2f} {:.2f}) ambient ({:.3f} {:.3f} {:.3f}) point ({:.3f} {:.3f} {:.3f}) alpha {:.3f}", def.name,
                          world_pos.x, world_pos.y, world_pos.z, light.ambient.r, light.ambient.g, light.ambient.b, light.point.r, light.point.g,
@@ -1265,20 +1328,20 @@ void System::BuildShape(const Instance& inst, const glm::mat4& world, const Shap
                 q.uv_next = glm::vec4(texcoord(i1), texcoord(i1));
                 items.push_back({depth, q});
             }
-            if (block_lit) {
+            if (any_block) {
                 lit_refs.back().last = items.size();
             }
             continue;
         }
         items.push_back({depth, q});
-        if (block_lit) {
+        if (any_block) {
             lit_refs.back().last = items.size();
         }
     }
     if (items.empty()) {
         return;
     }
-    if (block_lit && !lit_refs.empty()) {
+    if (any_block && !lit_refs.empty()) {
         auto box_block = [&](size_t first, size_t last) {
             glm::vec3 lo(1e30f);
             glm::vec3 hi(-1e30f);
@@ -1291,26 +1354,36 @@ void System::BuildShape(const Instance& inst, const glm::mat4& world, const Shap
             return light_block_((lo + hi) * 0.5f, (hi - lo) * 0.5f);
         };
         const LightBlock shared = shape.separate_draw ? LightBlock{} : box_block(lit_refs.front().first, lit_refs.back().last);
-        static const bool debug = std::getenv("PT_VFX_DEBUG") != nullptr;
+        static const bool debug = std::getenv("PT_VFX_DEBUG") != nullptr || std::getenv("PT_VFX_TRACE_LOG") != nullptr;
         for (const LitRef& r : lit_refs) {
             const LightBlock block = shape.separate_draw ? box_block(r.first, r.last) : shared;
             if (debug && &r - lit_refs.data() < 4) {
                 LogDebug("vfx: {} light block at ({:.2f} {:.2f} {:.2f}): sky ({:.3f} {:.3f} {:.3f}), {} lights: ({:.2f} {:.2f} {:.2f}) "
-                         "({:.0f} {:.0f} {:.0f}), ({:.2f} {:.2f} {:.2f}) ({:.0f} {:.0f} {:.0f}), ({:.2f} {:.2f} {:.2f}) ({:.0f} {:.0f} {:.0f})",
+                         "({:.0f} {:.0f} {:.0f}; invR4 {:.7f}), ({:.2f} {:.2f} {:.2f}) ({:.0f} {:.0f} {:.0f}; invR4 {:.7f}), "
+                         "({:.2f} {:.2f} {:.2f}) ({:.0f} {:.0f} {:.0f}; invR4 {:.7f})",
                          def.name, r.position.x, r.position.y, r.position.z, block.sky.r, block.sky.g, block.sky.b, block.count,
                          block.position[0].x, block.position[0].y, block.position[0].z, block.color[0].r, block.color[0].g,
-                         block.color[0].b, block.position[1].x, block.position[1].y, block.position[1].z, block.color[1].r,
-                         block.color[1].g, block.color[1].b, block.position[2].x, block.position[2].y, block.position[2].z,
-                         block.color[2].r, block.color[2].g, block.color[2].b);
+                         block.color[0].b, block.inv_r4[0], block.position[1].x, block.position[1].y, block.position[1].z, block.color[1].r,
+                         block.color[1].g, block.color[1].b, block.inv_r4[1], block.position[2].x, block.position[2].y, block.position[2].z,
+                         block.color[2].r, block.color[2].g, block.color[2].b, block.inv_r4[2]);
             }
-            glm::vec3 point(0.0f);
-            for (uint32_t i = 0; i < block.count; ++i) {
-                const float d = std::max(0.01f, glm::length(block.position[i] - r.position));
-                point += block.color[i] * std::max(0.0f, 1.0f / (d * d) - block.inv_r4[i] * d * d);
-            }
-            const glm::vec3 rgb = r.unlit * (block.sky * m.ambient_rate + block.directional * m.directional_rate + point * m.point_rate);
             for (size_t k = r.first; k < r.last; ++k) {
-                items[k].quad.color = glm::vec4(rgb, items[k].quad.color.a);
+                Quad& q = items[k].quad;
+                if (liquid_block) {
+                    q.light_factors = glm::vec4(0.0f, 0.0f, 0.0f, m.point_rate);
+                    for (uint32_t i = 0; i < std::min(block.count, 2u); ++i) {
+                        q.light_position[i] = glm::vec4(block.position[i], block.inv_r4[i]);
+                        q.light_color[i] = glm::vec4(block.color[i], 0.0f);
+                    }
+                    continue;
+                }
+                q.color = glm::vec4(r.unlit, q.color.a);
+                q.info.y |= kQuadLit;
+                q.light_factors = glm::vec4(block.sky * m.ambient_rate + block.directional * m.directional_rate, m.point_rate);
+                for (uint32_t i = 0; i < std::min(block.count, m.point_lights); ++i) {
+                    q.light_position[i] = glm::vec4(block.position[i], block.inv_r4[i]);
+                    q.light_color[i] = glm::vec4(block.color[i], 0.0f);
+                }
             }
         }
     }

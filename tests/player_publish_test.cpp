@@ -116,7 +116,76 @@ int main(int argc, char** argv) {
         }
     }
     check("the published pitch is the previous frame's", pitch_lag && pitch_moved);
+    Player default_look;
+    Player fast_look;
+    Player dead_zone_look;
+    default_look.Warp(glm::vec3(0.0f), 0.0f);
+    fast_look.Warp(glm::vec3(0.0f), 0.0f);
+    dead_zone_look.Warp(glm::vec3(0.0f), 0.0f);
+    InputState default_input;
+    default_input.right_stick = glm::vec2(0.5f, 0.0f);
+    default_input.from_gamepad = true;
+    default_input.gamepad_sensitivity = 1.0f;
+    InputState fast_input = default_input;
+    fast_input.gamepad_sensitivity = 2.0f;
+    InputState dead_zone_input = default_input;
+    dead_zone_input.right_stick = glm::vec2(0.08f, 0.0f);
+    dead_zone_input.gamepad_sensitivity = 5.0f;
+    for (int tick = 0; tick < 120; ++tick) {
+        default_look.Update(1.0f / 60, default_input, world, context);
+        fast_look.Update(1.0f / 60, fast_input, world, context);
+        dead_zone_look.Update(1.0f / 60, dead_zone_input, world, context);
+        default_look.EndFrame();
+        fast_look.EndFrame();
+        dead_zone_look.EndFrame();
+    }
+    const float default_turn = std::abs(wrap(default_look.CameraFoxYaw()));
+    const float fast_turn = std::abs(wrap(fast_look.CameraFoxYaw()));
+    const float dead_zone_turn = std::abs(wrap(dead_zone_look.CameraFoxYaw()));
+    check("gamepad sensitivity 1 preserves the original turning response", default_turn > 0.1f);
+    check("higher gamepad sensitivity speeds up turning", fast_turn > default_turn);
+    check("sensitivity does not move the original stick dead zone", dead_zone_turn < 1e-5f);
+    check("sensitivity leaves the flashlight stick response unchanged", glm::length(default_look.LightStick() - fast_look.LightStick()) < 1e-5f);
     player.Warp(glm::vec3(5.0f, 0.0f, 5.0f), 1.0f);
     check("a warp is published at once", glm::length(player.PublishedFeet() - glm::vec3(5.0f, 0.0f, 5.0f)) < 1e-5f);
+    Player walker;
+    walker.Warp(glm::vec3(0.0f), 0.0f);
+    InputState push;
+    push.left_stick = glm::vec2(0.0f, 1.0f);
+    for (int tick = 0; tick < 8; ++tick) {
+        walker.Update(1.0f / 60, push, world, context);
+        walker.EndFrame();
+    }
+    check("walking into the door", walker.Walking());
+    bool held_walks = true;
+    for (int frame = 0; frame < 60; ++frame) {
+        walker.DemoWarp(glm::vec3(0.0f, 0.0f, 0.03f * static_cast<float>(frame)), 0.0f);
+        walker.DemoHeldFrame(push);
+        walker.EndFrame();
+        walker.EndFrame();
+        held_walks = held_walks && walker.Walking();
+    }
+    check("a demo holding the player keeps the walk while the stick is held", held_walks);
+    walker.DemoWarp(glm::vec3(0.0f, 0.0f, 2.0f), 0.0f);
+    check("the release keeps the walk", walker.Walking());
+    int stand_frame = -1;
+    const InputState released;
+    for (int frame = 0; frame < 6 && stand_frame < 0; ++frame) {
+        walker.DemoWarp(glm::vec3(0.0f, 0.0f, 2.0f), 0.0f);
+        walker.DemoHeldFrame(released);
+        walker.EndFrame();
+        walker.EndFrame();
+        if (walker.Standing()) {
+            stand_frame = frame;
+        }
+    }
+    std::printf("stick released under a demo: STAND on frame %d\n", stand_frame);
+    check("released under a demo, STAND after the 0.067 s debounce", stand_frame == 1);
+    walker.DemoHeldFrame(push);
+    walker.EndFrame();
+    walker.EndFrame();
+    check("pushed again under a demo, WALK", walker.Walking());
+    walker.Warp(glm::vec3(0.0f), 0.0f);
+    check("a plain warp stands the player up", walker.Standing());
     return failures ? 1 : 0;
 }

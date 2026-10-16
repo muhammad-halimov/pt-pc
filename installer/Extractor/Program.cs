@@ -80,6 +80,7 @@ public static class Extraction {
 }
 public static class Program {
     public static int Main(string[] args) {
+        Console.OutputEncoding=new UTF8Encoding(false);
         try{if(args.Length!=2)throw new ArgumentException("Usage: PT.PkgExtract <P.T. package> <empty output directory>");Extraction.Run(args[0],args[1],Console.WriteLine);return 0;}
         catch(Exception e){Console.Error.WriteLine(e.Message);return 1;}
     }

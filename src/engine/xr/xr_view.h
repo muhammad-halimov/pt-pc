@@ -92,6 +92,7 @@ public:
         center_ = head_position - glm::inverse(Rotation()) * (old_rotation * (head_position - center_));
     }
     float BaseYaw() const { return base_yaw_; }
+    void Shift(const glm::vec3& world) { center_ += glm::inverse(Rotation()) * world; }
     glm::quat Rotation() const { return YawRotation(WrapAngle(base_yaw_ - center_yaw_)); }
     glm::quat ToWorld(const glm::quat& local) const { return glm::normalize(Rotation() * local); }
     glm::vec3 Offset(const glm::vec3& local) const { return Rotation() * (local - center_); }

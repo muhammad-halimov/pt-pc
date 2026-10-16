@@ -16,6 +16,13 @@ bool Continuous(int step) {
     return step == 9 || step == 13 || step == 15 || step == 28 || step == 31 || step == 32 || step == 33;
 }
 
+void SkippedOpeningDoor(Game& g) {
+    if (!g.Floor().IsCurrentFloorName("f000")) return;
+    g.Messages().PostDemoMessage("gc_p01_100", "Play");
+    g.Messages().PostDemoMessage("gc_p01_100", "FinishMotion");
+    LogInfo("controller: start room door set ajar as the skipped opening leaves it (gc_p01_100)");
+}
+
 }
 
 void GameController::SetStep(int step) {
@@ -165,7 +172,7 @@ void GameController::RunStep(int step) {
         SetStep(5);
         return;
     case 5:
-        if (!g.Stages().IsLoadedInactive("next")) {
+        if (!g.Stages().IsLoadedInactive("next") || g.BootHold()) {
             return;
         }
         SetStep(6);
@@ -231,12 +238,14 @@ void GameController::RunStep(int step) {
         Lock(true);
         if (g.BrowseEntryPending()) {
             g.Messages().PostDemoMessage("gc_p00_020", "hideOcho");
+            SkippedOpeningDoor(g);
             LogInfo("controller: loop browser skips the opening demo");
             SetStep(14);
             return;
         }
         if (g.Config().theater && !g.Theater().opening) {
             g.Messages().PostDemoMessage("gc_p00_020", "hideOcho");
+            SkippedOpeningDoor(g);
             SetStep(14);
             return;
         }
@@ -248,6 +257,7 @@ void GameController::RunStep(int step) {
         return;
     case 14:
         if (g.Floor().IsCurrentFloorName("f000")) g.OnFloorReached("f000", 1);
+        g.LatchGamePlus();
         g.Scripts().CallStateFunction("OnPreGame");
         g.Floor().OnStartGame();
         g.SpeedrunStartGame();
@@ -293,6 +303,10 @@ void GameController::RunStep(int step) {
         if (g.Audio() && g.Audio()->IsEventPlaying("Set_state_game_over")) {
             return;
         }
+        if (release_after_ending_ || g.VideoMemoryTight()) {
+            g.ReleaseUnusedAssets(release_after_ending_ ? "reset after the ending" : "reset with the video memory short");
+            release_after_ending_ = false;
+        }
         if (restart_objects_pending_) {
             g.Demos().Gimmicks().ResetSession();
             g.Objects().Reset();
@@ -333,6 +347,8 @@ void GameController::RunStep(int step) {
         if (g.Audio() && g.Audio()->IsEventPlaying("Set_state_game_over")) {
             return;
         }
+        g.ReleaseUnusedAssets("ending load");
+        release_after_ending_ = true;
         SetStep(25);
         return;
     case 25:
@@ -346,6 +362,7 @@ void GameController::RunStep(int step) {
         SetStep(27);
         return;
     case 27:
+        g.FloorEnvironment();
         g.Effects().subtitles_enabled = true;
         g.Scripts().CallStateFunction("OnEnding");
         if (g.Floor().IsCurrentFloorName("ending") && !g.BrowseSaveSuppressed()) {

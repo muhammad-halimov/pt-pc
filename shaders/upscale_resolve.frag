@@ -50,7 +50,7 @@ void main() {
     if (pass.ids.z != 0u) {
         vec4 reflection = Reflection(uv);
         if (reflection.a > 0.0) {
-            color = min(color, vec3(1.0)) * (1.0 - reflection.a) + reflection.rgb;
+            color = SrgbDecode(SrgbEncode(min(color, vec3(1.0))) * (1.0 - reflection.a) + reflection.rgb);
         }
     }
     ivec2 size = ivec2(pass.f1.xy);

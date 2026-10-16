@@ -6,13 +6,16 @@
 #include <functional>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <span>
 #include <string>
 #include <string_view>
+#include <unordered_map>
 #include <unordered_set>
 #include <vector>
 
 #include "engine/audio/motion_generator.h"
+#include "engine/audio/controller_pcm_capture.h"
 #include "engine/audio/subtitles.h"
 #include "engine/audio/wwise_bank.h"
 
@@ -41,6 +44,7 @@ struct SoundSystemStats {
 
 class SoundEngine;
 class AudioOutput;
+class Media;
 
 class SoundSystem {
 public:
@@ -49,7 +53,7 @@ public:
     SoundSystem(const SoundSystem&) = delete;
     SoundSystem& operator=(const SoundSystem&) = delete;
 
-    bool Init(Vfs& vfs, bool open_device);
+    bool Init(Vfs& vfs, bool open_device, bool surround_output = false);
     void Shutdown();
 
     PlayingId PostEvent(std::string_view event_name, GameObjectId object = 0);
@@ -60,6 +64,7 @@ public:
     void StopPlayingId(PlayingId id, float fade_seconds = 0.0f, Interp curve = Interp::Linear);
     void SeekPlayingId(PlayingId id, float seconds);
     void StopAll(float fade_seconds = 0.0f);
+    void ResetSession();
     bool IsPlaying(PlayingId id) const;
     bool IsEventPlaying(std::string_view event_name) const;
     bool IsEventIdPlaying(uint32_t event_id) const;
@@ -80,11 +85,16 @@ public:
     void ResetRtpc(std::string_view name, GameObjectId object = 0);
 
     PlayingId PlayStream(std::vector<uint8_t> wem_riff, GameObjectId object = 0);
+    PlayingId PlayStreamAs(std::vector<uint8_t> wem_riff, std::string_view donor_event, GameObjectId object);
+    PlayingId PlayMedia(std::shared_ptr<const Media> media, GameObjectId object = 0);
+    std::shared_ptr<const Media> FindMedia(uint32_t media_id) const;
+    void SetPostObserver(std::function<void(uint32_t event_id, const std::optional<glm::vec3>& position)> observer);
     void SetMarkerCallback(std::function<void(PlayingId, std::string_view label)> callback);
     void SetEndCallback(std::function<void(PlayingId)> callback);
 
     void Update(float dt);
     void RenderOffline(float* interleaved_stereo, uint32_t frames);
+    void RenderOfflineChannels(float* interleaved, uint32_t frames, uint32_t channels);
 
     bool LoadSubtitles(std::string_view language);
     const SubtitleTable& Subtitles() const { return subtitles_; }
@@ -95,8 +105,14 @@ public:
     SoundSystemStats Stats() const;
     bool HasEvent(uint32_t event_id) const;
     bool DeviceOpen() const;
+    bool OpenDevice(bool surround_output);
     uint64_t RenderedFrames() const;
     MotionLevels Motion() const;
+    void SetControllerCaptureEvent(uint32_t event_id);
+    void SetControllerCaptureEvents(std::span<const uint32_t> event_ids);
+    void SetControllerHapticEvents(std::span<const uint32_t> event_ids);
+    bool TryReadControllerPcm(ControllerPcmBlock& block);
+    uint32_t ControllerPcmDroppedBlocks() const;
     void SetFrozen(bool frozen);
 
 private:
@@ -105,6 +121,9 @@ private:
     std::unique_ptr<AudioOutput> output_;
     std::function<void(PlayingId, std::string_view)> marker_callback_;
     std::function<void(PlayingId)> end_callback_;
+    std::function<void(uint32_t, const std::optional<glm::vec3>&)> post_observer_;
+    std::mutex position_mutex_;
+    std::unordered_map<GameObjectId, glm::vec3> positions_;
     SubtitleTable subtitles_;
     std::mutex warn_mutex_;
     std::unordered_set<uint32_t> warned_events_;

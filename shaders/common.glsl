@@ -52,8 +52,9 @@ struct Material {
     vec4 extra;
 };
 
-layout(set = 0, binding = 0) uniform sampler2D textures[];
-layout(set = 0, binding = 2) uniform samplerCube cube_textures[];
+#include "bindless.glsl"
+layout(set = 0, binding = 0) uniform PT_TEXTURE2D_ARRAY textures[];
+layout(set = 0, binding = 2) uniform PT_TEXTURECUBE_ARRAY cube_textures[];
 layout(std430, set = 0, binding = 1) readonly buffer Materials {
     Material materials[];
 };
@@ -70,8 +71,12 @@ layout(std430, set = 1, binding = 1) readonly buffer SkinData {
     mat4 skin[];
 };
 
-layout(set = 1, binding = 2) uniform texture2D images[56];
+layout(set = 1, binding = 2) uniform texture2D images[62];
+#ifdef PT_D3D12
+layout(set = 1, binding = 3) uniform sampler samplers[4];
+#else
 layout(set = 1, binding = 3) uniform sampler samplers[5];
+#endif
 layout(set = 1, binding = 4) uniform texture3D lut2_image;
 
 #define IMG_ALBEDO 0
@@ -95,9 +100,14 @@ layout(set = 1, binding = 4) uniform texture3D lut2_image;
 #define IMG_BLOOM_SUM 18
 #define IMG_REFMAP 19
 #define IMG_HDR_COPY 20
+#define IMG_NEURAL_IN 62
+#define IMG_NEURAL_OUT 63
 #define IMG_PARTICLES 46
 #define IMG_PROBE_ACC 54
 #define IMG_FLARE 47
+#define IMG_PARTICLES_NEAR 56
+#define IMG_PARTICLES_FAR 57
+#define IMG_NEAR_FAR_DEPTH 58
 #define RES_LUT1 24
 #define RES_MATERIAL 25
 #define RES_DITHER 26
@@ -135,6 +145,7 @@ layout(set = 1, binding = 4) uniform texture3D lut2_image;
 #define MAT_NORMAL_WAVE 2097152u
 #define MAT_REFLECTOR 4194304u
 #define MAT_ALBEDO_VIEW 8388608u
+#define MAT_GBUFFER_BASE2 16777216u
 
 #define KIND_DEFERRED 0u
 #define KIND_CONSTANT 1u

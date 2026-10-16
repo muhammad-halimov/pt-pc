@@ -44,6 +44,7 @@ enum QuadFlag : uint32_t {
     kQuadClip = 1u << 8,
     kQuadTriangle = 1u << 9,
     kQuadRain = 1u << 10,
+    kQuadLit = 1u << 11,
 };
 
 constexpr uint32_t kNoTexture = 0xFFFFFFFFu;
@@ -58,9 +59,12 @@ struct Quad {
     glm::vec4 extra{0.0f};
     glm::uvec4 info{0u};
     glm::vec4 rain_rotation{0.0f};
+    glm::vec4 light_position[3]{};
+    glm::vec4 light_color[3]{};
+    glm::vec4 light_factors{0.0f};
 };
 
-static_assert(sizeof(Quad) == 192, "Quad must match vfx_particle.vert's storage buffer stride");
+static_assert(sizeof(Quad) == 304, "Quad must match vfx_particle.vert's storage buffer stride");
 
 enum class Layer : uint8_t { World, Flare, Screen };
 
@@ -138,6 +142,7 @@ struct LightBlock {
     float inv_r4[3]{};
 };
 using LightBlockProbe = std::function<LightBlock(const glm::vec3& center, const glm::vec3& half)>;
+using LightsReady = std::function<void(const std::vector<LightOut>& lights)>;
 
 struct InstanceKey {
     uint64_t owner = 0;
@@ -161,7 +166,7 @@ public:
 
     bool Exists(const InstanceKey& key) const { return instances_.contains(key); }
     bool IsPlaying(const InstanceKey& key) const;
-    bool Spawn(const InstanceKey& key, const std::string& path, const glm::mat4& world, uint32_t seed);
+    bool Spawn(const InstanceKey& key, const std::string& path, const glm::mat4& world, std::optional<uint32_t> seed = std::nullopt);
     void SetTransform(const InstanceKey& key, const glm::mat4& world);
     void SnapshotWorlds();
     template <typename F>
@@ -188,10 +193,17 @@ public:
 
     void Update(float dt, const ViewInfo& view);
     void SetLightBlockProbe(LightBlockProbe probe) { light_block_ = std::move(probe); }
+    void SetLightsReady(LightsReady ready) { lights_ready_ = std::move(ready); }
     void Build(const ViewInfo& view, const TextureResolver& textures, const TextureResolver& cubes, const LightingProbe& lighting,
                RenderList& out, std::vector<LightOut>& lights, float blend = 1.0f);
 
     size_t InstanceCount() const { return instances_.size(); }
+    bool AnyLive(std::string_view part) const {
+        for (const auto& [key, inst] : instances_) {
+            if (inst.def && !inst.finished && inst.def->name.find(part) != std::string::npos) return true;
+        }
+        return false;
+    }
     size_t ParticleCount() const;
     std::vector<std::pair<std::string, size_t>> Stats() const;
 
@@ -204,6 +216,7 @@ private:
         uint32_t count = 1;
         uint16_t random = 0;
         glm::mat4 spawn_world{1.0f};
+        glm::mat4 spawn_camera{1.0f};
     };
 
     struct EmitState {
@@ -282,6 +295,7 @@ private:
         float effect_ratio = 0.0f;
         glm::mat4 world{1.0f};
         glm::vec3 position{0.0f};
+        bool follow_spawn = false;
     };
 
     int Emit(Instance& inst, ShapeState& state, const EffectDef& def, int32_t emit, float dframes, const ViewInfo& view);
@@ -308,9 +322,11 @@ private:
     std::set<std::string> missing_;
     std::string filter_;
     std::map<InstanceKey, Instance> instances_;
+    uint32_t creation_seed_counter_ = 0;
     std::optional<ViewInfo> last_view_;
     glm::vec3 wind_{0.0f};
     LightBlockProbe light_block_;
+    LightsReady lights_ready_;
     struct BuildItem {
         float depth;
         Quad quad;

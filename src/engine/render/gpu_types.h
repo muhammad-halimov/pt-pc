@@ -10,11 +10,12 @@ constexpr uint32_t kMaxViews = 64;
 constexpr uint32_t kMaxLights = 256;
 constexpr uint32_t kMaxProbes = 512;
 constexpr uint32_t kMaxSkinMatrices = 16384;
-constexpr uint32_t kImageSlots = 56;
+constexpr uint32_t kImageSlots = 64;
 constexpr uint32_t kInvalid = 0xFFFFFFFFu;
 constexpr uint32_t kLuminanceGroups = 16384;
 constexpr uint32_t kReflectionReadback = kLuminanceGroups;
 constexpr uint32_t kLuminanceEntries = kLuminanceGroups + 2;
+constexpr uint32_t kMeterTexels = 32 * 32;
 
 enum ViewKind : uint32_t { kViewCamera = 0, kViewSpotShadow = 1, kViewParaboloid = 2 };
 
@@ -131,6 +132,14 @@ enum Image : uint32_t {
     kImgReflectHistoryB = 53,
     kImgProbeAcc = 54,
     kImgHandyFactor = 55,
+    kImgParticlesNear = 56,
+    kImgParticlesFar = 57,
+    kImgNearFarDepth = 58,
+    kImgMbOriginalBake = 59,
+    kImgMbOriginalBlurA = 60,
+    kImgMbOriginalBlurB = 61,
+    kImgNeuralIn = 62,
+    kImgNeuralOut = 63,
 };
 
 enum Sampler : uint32_t {
@@ -166,6 +175,7 @@ enum MaterialFlag : uint32_t {
     kMatNormalWave = 1u << 21,
     kMatReflector = 1u << 22,
     kMatAlbedoView = 1u << 23,
+    kMatGBufferBase2 = 1u << 24,
 };
 
 enum MaterialKind : uint32_t {

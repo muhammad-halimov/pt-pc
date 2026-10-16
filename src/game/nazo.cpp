@@ -70,6 +70,16 @@ void NazoManager::RegisterStage(Stage& stage) {
             LogInfo("nazo: NazoManageData of stage {} ({}) registered", stage.id, stage.label);
         }
     }
+    const uint32_t xmark = word_[Index(NazoId::XMark)];
+    if (xmark != 0) {
+        ApplyVisuals(NazoId::XMark);
+        LogInfo("nazo: XMark state {:#x} applied to the registered stage {}", xmark, stage.id);
+    }
+    const uint32_t photo = word_[Index(NazoId::Photo)];
+    if (photo != 0) {
+        ApplyVisuals(NazoId::Photo);
+        LogInfo("nazo: Photo state {:#x} applied to the registered stage {}", photo, stage.id);
+    }
     const uint32_t hello = word_[Index(NazoId::Hello)];
     const bool hello_floor = game_.Floor().IsCurrentFloorName("f070") || game_.Floor().IsCurrentFloorName("f080") ||
                              game_.Floor().IsCurrentFloorName("f090") || game_.Floor().IsCurrentFloorName("f100");
@@ -130,6 +140,24 @@ void NazoManager::SetAssetEnable(std::string_view name, bool on) {
             body.enable = on;
         }
     }
+}
+
+bool NazoManager::PeepholeTransform(glm::mat4& out) const {
+    auto it = assets_.find("Peephole");
+    if (it == assets_.end()) {
+        return false;
+    }
+    for (const AssetRef& ref : it->second) {
+        Stage* stage = game_.Stages().FindById(ref.stage_id);
+        if (!stage || stage->label != "current") {
+            continue;
+        }
+        if (const StageData* file = stage->FileOf(ref.entity)) {
+            out = stage->ToWorld(file->file->WorldTransform(*ref.entity));
+            return true;
+        }
+    }
+    return false;
 }
 
 bool NazoManager::AssetPosition(std::string_view name, glm::vec3& out) const {
@@ -248,6 +276,15 @@ std::string NazoManager::DescribeSession() const {
         text += std::format(" {:#x}/{}", word_[i], cleared_[i]);
     }
     return text;
+}
+
+void NazoManager::DeactivateUnset() {
+    LogInfo("nazo: unset puzzles deactivated as a boot leaves them");
+    for (int i = 0; i < kCount; ++i) {
+        if (word_[i] == 0) {
+            Deactivate(static_cast<NazoId>(i));
+        }
+    }
 }
 
 void NazoManager::ResetAllStates() {
@@ -403,6 +440,12 @@ void NazoManager::SetCondition(std::string_view c, const glm::vec3& target) {
             game_.ShowCaption(kCaptionXMark);
         }
     } else if (c == "Hello") {
+        {
+            const glm::vec3 feet = game_.GetPlayer().Feet();
+            const glm::vec3 eye = game_.GetCamera().position;
+            LogInfo("nazo: Hello condition (active {}, word {:#x}) feet ({:.2f} {:.2f} {:.2f}) camera ({:.2f} {:.2f} {:.2f}) target ({:.2f} {:.2f} {:.2f})",
+                    IsActive(NazoId::Hello), w[1], feet.x, feet.y, feet.z, eye.x, eye.y, eye.z, target.x, target.y, target.z);
+        }
         if (IsActive(NazoId::Hello)) {
             HelloStep();
         }
@@ -641,8 +684,10 @@ void NazoManager::Update(float dt) {
         active_mask_ &= ~2u;
     }
     UpdatePeephole(dt);
-    if (IsActive(NazoId::Photo) && word_[3] == 0x1F8) {
+    if ((word_[3] & 0x1F8) == 0x1F8) {
         game_.NoteArchive("photo:complete");
+    }
+    if (IsActive(NazoId::Photo) && word_[3] == 0x1F8) {
         OnClear(NazoId::Photo);
         active_mask_ &= ~8u;
     }
@@ -660,7 +705,10 @@ void NazoManager::Update(float dt) {
         const float limit = armed_state_ == 2 ? kPeepholeHoldLimit : kHoldLimit;
         if (!holding) {
             action_armed_ = false;
+            LogInfo("nazo: action released after {:.2f} s, before the {:.0f} s hold (state {}, flag {:#x})", hold_timer_, limit, armed_state_,
+                    armed_flag_);
         } else if (hold_timer_ > limit) {
+            LogInfo("nazo: action held {:.2f} s, committed (state {}, flag {:#x})", hold_timer_, armed_state_, armed_flag_);
             Commit();
             action_armed_ = false;
         }

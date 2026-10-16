@@ -1,9 +1,13 @@
+#include "engine/platform/os.h"
+#include "engine/core/ascii.h"
 #include "game/input_script.h"
+#include "game/lisa_date/lisa_date.h"
 
 #include <algorithm>
 #include <cctype>
 #include <cmath>
 #include <format>
+#include <cstdio>
 #include <fstream>
 #include <sstream>
 #include <utility>
@@ -22,7 +26,7 @@ namespace pt::game {
 bool InputScript::Load(const std::filesystem::path& path) {
     std::ifstream in(path, std::ios::binary);
     if (!in) {
-        LogError("input script: cannot open {}", path.string());
+        LogError("input script: cannot open {}", pt::os::PathToUtf8(path));
         return false;
     }
     std::stringstream buffer;
@@ -101,6 +105,9 @@ const Stage* InputScript::NearestHallway(Game& game) const {
 }
 
 void InputScript::Apply(uint64_t frame, Game& game, InputState& input) {
+    if (pads_) {
+        pads_->PumpSensors(1.0f / 60.0f);
+    }
     for (size_t i = 0; i < releases_.size();) {
         if (releases_[i].frame <= frame) {
             if (pads_) {
@@ -156,7 +163,7 @@ void InputScript::Apply(uint64_t frame, Game& game, InputState& input) {
         const Command& c = commands_[next_++];
         auto arg = [&](size_t i) { return i < c.args.size() ? c.args[i] : 0.0f; };
         if (c.op == "pattach" || c.op == "pdetach" || c.op == "pbutton" || c.op == "ptap" || c.op == "paxis" || c.op == "ptouch" || c.op == "pbot" ||
-            c.op == "expect" || c.op == "sound") {
+            c.op == "pgyro" || c.op == "expect" || c.op == "sound") {
             PadCommand(c.op, c.words, c.args, frame, game, input);
         } else if (c.op == "slightstick") {
             if (c.text == "off") {
@@ -164,15 +171,22 @@ void InputScript::Apply(uint64_t frame, Game& game, InputState& input) {
             } else {
                 game.GetPlayer().SetLightStickOverride(glm::vec2(arg(0), arg(1)));
             }
-        } else if (c.op == "key" || c.op == "ktap" || c.op == "mbutton" || c.op == "mtap") {
+        } else if (c.op == "key" || c.op == "ktap" || c.op == "mbutton" || c.op == "mtap" || c.op == "mquick") {
             KeyCommand(c.op, c.words, c.args, frame);
-        } else if (c.op == "stap" || c.op == "sbutton" || c.op == "saxis" || c.op == "stouch" || c.op == "sexpect" || c.op == "ssound" ||
+        } else if (c.op == "stap" || c.op == "sbutton" || c.op == "saxis" || c.op == "stouch" || c.op == "sgyro" || c.op == "sexpect" || c.op == "ssound" ||
                    c.op == "smenu" || c.op == "spaused" || c.op == "sfocus" || c.op == "skey" || c.op == "sktap" || c.op == "smbutton" ||
-                   c.op == "smtap" || c.op == "sattach" || c.op == "sdetach") {
+                   c.op == "smtap" || c.op == "smquick" || c.op == "sattach" || c.op == "sdetach") {
             Waypoint item{glm::vec3(0.0f), false, false, c.op, 0, c.text};
             item.words = c.words;
             item.args = c.args;
             waypoints_.push_back(std::move(item));
+        } else if (c.op == "mmotion") {
+            if (device_) {
+                device_->InjectMouseMotion(arg(0), arg(1), static_cast<int>(arg(2)));
+                LogInfo("input script frame {}: mouse motion ({:.2f} {:.2f}) for {} drawn frames", frame, arg(0), arg(1), static_cast<int>(arg(2)));
+            } else {
+                LogWarn("input script frame {}: mmotion: no input device (--virtual-pads)", frame);
+            }
         } else if (c.op == "move") {
             move_ = glm::vec2(arg(0), arg(1));
         } else if (c.op == "look") {
@@ -256,6 +270,19 @@ void InputScript::Apply(uint64_t frame, Game& game, InputState& input) {
             Waypoint item{glm::vec3(0.0f), false, false, "playdemo", 0, c.words.empty() ? std::string() : c.words.front()};
             item.words = c.words;
             waypoints_.push_back(item);
+        } else if (c.op == "slisaexpr" || c.op == "slisatwitch") {
+            waypoints_.push_back({glm::vec3(0.0f), false, false, c.op.substr(1), 0, c.text});
+        } else if (c.op == "slisaline") {
+            waypoints_.push_back({glm::vec3(0.0f), false, false, "lisaline", 0, c.text});
+        } else if (c.op == "slisaselfie") {
+            auto value = [&](size_t i) { return i < c.args.size() ? static_cast<int>(c.args[i]) : 0; };
+            waypoints_.push_back({glm::vec3(0.0f), false, false, "lisaselfie", 0, std::format("{} {} {} {} {}", value(0), value(1), value(2), value(3), c.text)});
+        } else if (c.op == "slisadate" || c.op == "slisachoice" || c.op == "slisaadvance" || c.op == "slisawait" || c.op == "fportrait" ||
+                   c.op == "slisarushes") {
+            Waypoint item{glm::vec3(0.0f), false, false, c.op == "fportrait" ? "face_portrait" : c.op.substr(1), static_cast<int>(arg(0))};
+            waypoints_.push_back(item);
+        } else if (c.op == "sintercom") {
+            waypoints_.push_back({glm::vec3(0.0f), false, false, "intercom", 0, c.words.empty() ? std::string() : c.words.front()});
         } else if (c.op == "sgameplus") {
             waypoints_.push_back({glm::vec3(0.0f), false, false, "gameplus"});
         } else if (c.op == "soffer") {
@@ -264,6 +291,11 @@ void InputScript::Apply(uint64_t frame, Game& game, InputState& input) {
             waypoints_.push_back({glm::vec3(0.0f), false, false, "credits"});
         } else if (c.op == "squit") {
             waypoints_.push_back({glm::vec3(0.0f), false, false, "quit"});
+        } else if (c.op == "sallocfail") {
+            waypoints_.push_back({glm::vec3(0.0f), false, false, "allocfail", 0,
+                                  !c.words.empty() ? c.words.front() : c.args.empty() ? std::string("0") : std::format("{}", c.args.front())});
+        } else if (c.op == "svram") {
+            waypoints_.push_back({glm::vec3(0.0f), false, false, "vram"});
         } else if (c.op == "sev") {
             waypoints_.push_back({glm::vec3(0.0f), false, false, "ev", 0, c.text});
             waypoints_.back().point.x = arg(0);
@@ -277,6 +309,11 @@ void InputScript::Apply(uint64_t frame, Game& game, InputState& input) {
         } else if (c.op == "sstick" || c.op == "srstick" || c.op == "slook") {
             Waypoint item{glm::vec3(0.0f), false, false, c.op.substr(1), static_cast<int>(arg(2))};
             item.stick = glm::vec2(arg(0), arg(1));
+            waypoints_.push_back(item);
+        } else if (c.op == "sportraitjit") {
+            Waypoint item{glm::vec3(0.0f), false, false, "portrait_jitter", static_cast<int>(arg(3))};
+            item.stick = glm::vec2(arg(0), arg(1));
+            item.extra.x = arg(2);
             waypoints_.push_back(item);
         } else if (c.op == "strace") {
             waypoints_.push_back({glm::vec3(0.0f), false, false, "trace", static_cast<int>(arg(0))});
@@ -295,6 +332,7 @@ void InputScript::Apply(uint64_t frame, Game& game, InputState& input) {
         } else if (c.op == "sphotoset") {
             Waypoint item{glm::vec3(arg(0), arg(1), arg(2)), false, false, "photoset", static_cast<int>(arg(4))};
             item.extra = glm::vec4(arg(3), arg(5), c.args.size() > 6 ? arg(6) : 1.0f, 0.0f);
+            item.up.x = c.args.size() > 7 ? arg(7) : -1.0f;
             waypoints_.push_back(item);
         } else if (c.op == "sphotocam") {
             Waypoint item{glm::vec3(arg(0), arg(1), arg(2)), false, false, "photocam", 0};
@@ -311,6 +349,10 @@ void InputScript::Apply(uint64_t frame, Game& game, InputState& input) {
             waypoints_.push_back({glm::vec3(0.0f), false, false, "freeze", static_cast<int>(arg(0))});
         } else if (c.op == "sfreecam") {
             waypoints_.push_back({glm::vec3(0.0f), false, false, "freecam", static_cast<int>(c.args.empty() ? 1.0f : arg(0))});
+        } else if (c.op == "senhanced") {
+            waypoints_.push_back({glm::vec3(0.0f), false, false, "enhanced", static_cast<int>(c.args.empty() ? 1.0f : arg(0))});
+        } else if (c.op == "sneural") {
+            waypoints_.push_back({glm::vec3(0.0f), false, false, "neural", static_cast<int>(c.args.empty() ? 1.0f : arg(0))});
         } else if (c.op == "sthird") {
             waypoints_.push_back({glm::vec3(0.0f), false, false, "third", static_cast<int>(c.args.empty() ? 1.0f : arg(0))});
         } else if (c.op == "sstate") {
@@ -334,6 +376,10 @@ void InputScript::Apply(uint64_t frame, Game& game, InputState& input) {
         } else if (GameUi::ScriptCommand(game, c.op, c.text, c.args)) {
         } else if (c.op == "shot") {
             game.RequestScreenshot(c.text);
+        } else if (c.op == "pose") {
+            game.LogCapturePose(game.ViewCamera());
+        } else if (c.op == "inspect") {
+            game.LogModInspect(game.ViewCamera());
         } else if (c.op == "camera") {
             if (c.text == "off") {
                 game.SetCameraOverride(std::nullopt);
@@ -405,12 +451,12 @@ void InputScript::Apply(uint64_t frame, Game& game, InputState& input) {
             seq_focus_ = !item.args.empty() && item.args[0] != 0.0f;
             seq_focus_frame_ = frame;
             seq_focus_until_ = item.args.size() > 1 && item.args[1] > 0.0f ? frame + static_cast<uint64_t>(item.args[1]) : 0;
-        } else if (item.op == "stap" || item.op == "sbutton" || item.op == "saxis" || item.op == "stouch" || item.op == "sexpect" ||
+        } else if (item.op == "stap" || item.op == "sbutton" || item.op == "saxis" || item.op == "stouch" || item.op == "sgyro" || item.op == "sexpect" ||
                    item.op == "ssound") {
             PadCommand("p" + item.op.substr(1), item.words, item.args, frame, game, input);
         } else if (item.op == "sattach" || item.op == "sdetach") {
             PadCommand(item.op == "sattach" ? "pattach" : "pdetach", item.words, item.args, frame, game, input);
-        } else if (item.op == "skey" || item.op == "sktap" || item.op == "smbutton" || item.op == "smtap") {
+        } else if (item.op == "skey" || item.op == "sktap" || item.op == "smbutton" || item.op == "smtap" || item.op == "smquick") {
             KeyCommand(item.op.substr(1), item.words, item.args, frame);
         } else if (item.op == "wait") {
             if (--item.frames > 0) {
@@ -432,6 +478,18 @@ void InputScript::Apply(uint64_t frame, Game& game, InputState& input) {
         } else if (item.op == "look") {
             if (item.frames-- > 0) {
                 input.mouse_look += item.stick;
+                break;
+            }
+        } else if (item.op == "portrait_jitter") {
+            if (item.frames-- > 0) {
+                glm::vec3 portrait;
+                if (game.LisaPortraitPosition(portrait)) {
+                    Face(game, portrait);
+                    Player& player = game.GetPlayer();
+                    const float shake = (item.frames & 2) ? item.extra.x : -item.extra.x;
+                    player.yaw = player.target_yaw = player.yaw + glm::radians(item.stick.x + shake);
+                    player.SetScriptPitch(player.pitch + glm::radians(item.stick.y));
+                }
                 break;
             }
         } else if (item.op == "trace") {
@@ -514,9 +572,11 @@ void InputScript::Apply(uint64_t frame, Game& game, InputState& input) {
             LogInfo("input script frame {}: ChangeGameStep({})", frame, item.text);
             game.Controller().ChangeGameStep(item.text);
         } else if (item.op == "photoset") {
-            game.RequestPhotoSettings({static_cast<int>(item.point.x), static_cast<int>(item.point.y), static_cast<int>(item.point.z),
-                                       static_cast<int>(item.extra.x), item.frames, static_cast<int>(item.extra.y),
-                                       static_cast<int>(item.extra.z)});
+            std::vector<int> values{static_cast<int>(item.point.x), static_cast<int>(item.point.y), static_cast<int>(item.point.z),
+                                    static_cast<int>(item.extra.x), item.frames, static_cast<int>(item.extra.y),
+                                    static_cast<int>(item.extra.z)};
+            if (item.up.x >= 0.0f) values.push_back(static_cast<int>(item.up.x));
+            game.RequestPhotoSettings(values);
         } else if (item.op == "photocam") {
             game.RequestPhotoCamera(glm::vec4(item.point, item.extra.x));
             game.RequestPhotoTarget(glm::vec2(item.extra.y, item.extra.z));
@@ -529,6 +589,10 @@ void InputScript::Apply(uint64_t frame, Game& game, InputState& input) {
             LogInfo("input script: game clock {}", item.frames != 0 ? "frozen" : "running");
         } else if (item.op == "freecam") {
             game.RequestFreeCamera(item.frames != 0);
+        } else if (item.op == "enhanced") {
+            game.RequestEnhancedTextures(item.frames != 0);
+        } else if (item.op == "neural") {
+            game.RequestNeuralRendering(std::clamp(item.frames, 0, 3));
         } else if (item.op == "third") {
             game.SetThirdPerson(item.frames != 0);
         } else if (item.op == "state") {
@@ -537,6 +601,69 @@ void InputScript::Apply(uint64_t frame, Game& game, InputState& input) {
             LogInfo("input script: reset progress {}", game.ResetProgress() ? "accepted" : "refused (no save store)");
         } else if (item.op == "gameplus") {
             game.EnableGamePlus();
+        } else if (item.op == "intercom") {
+            game.IntercomScript(item.text);
+        } else if (item.op == "lisadate") {
+            game.RequestLisaDate("the input script");
+        } else if (item.op == "lisarushes") {
+            game.SetLisaRushesForTest(item.frames);
+        } else if (item.op == "lisaadvance") {
+            if (LisaDate* date = game.LisaDateScene()) date->SetSkip(true);
+        } else if (item.op == "lisaselfie") {
+            LisaDate* date = game.LisaDateScene();
+            if (!date || !date->SelfieUp()) {
+                if (date) date->SetSkip(true);
+                item.extra.x += 1.0f;
+                if (item.extra.x < 3600.0f) break;
+                LogWarn("input script frame {}: lisaselfie gave up, no selfie panel up", frame);
+            } else {
+                int v[4] = {0, 0, 0, 0};
+                char take[8] = {};
+                std::sscanf(item.text.c_str(), "%d %d %d %d %7s", &v[0], &v[1], &v[2], &v[3], take);
+                date->SetSelfie(v[0], v[1], v[2], v[3], std::string_view(take) == "take");
+                LogInfo("input script frame {}: lisaselfie {}", frame, item.text);
+            }
+        } else if (item.op == "lisachoice") {
+            LisaDate* date = game.LisaDateScene();
+            if (date && date->SelfieUp()) date->SetSelfie(0, 0, 0, 0, true);
+            if (!date || !date->ChoicesUp()) {
+                if (date) date->SetSkip(true);
+                item.extra.x += 1.0f;
+                if (item.extra.x < 3600.0f) break;
+                LogWarn("input script frame {}: lisachoice {} gave up, no choice up", frame, item.frames);
+            } else if (!date->Choose(item.frames - 1)) {
+                LogWarn("input script frame {}: lisachoice {} is not an option", frame, item.frames);
+            }
+        } else if (item.op == "lisaexpr" || item.op == "lisatwitch") {
+            if (LisaDate* date = game.LisaDateScene()) {
+                if (item.op == "lisaexpr") date->SetExpression(item.text);
+                else date->TwitchNow(item.text == "violent");
+                LogInfo("input script frame {}: {} {}", frame, item.op, item.text);
+            }
+        } else if (item.op == "lisaline") {
+            LisaDate* date = game.LisaDateScene();
+            if (date && date->SelfieUp()) date->SetSelfie(0, 0, 0, 0, true);
+            if (date && date->LineKey() != item.text) {
+                date->SkipTo(item.text);
+                break;
+            }
+            if (date) {
+                LogInfo("input script frame {}: lisaline {} reached", frame, item.text);
+            } else {
+                LogWarn("input script frame {}: lisaline {} without a date", frame, item.text);
+            }
+        } else if (item.op == "lisawait") {
+            if (game.LisaDateActive()) {
+                if (LisaDate* date = game.LisaDateScene()) {
+                    if (date->SelfieUp()) date->SetSelfie(0, 0, 0, 0, true);
+                    date->SetSkip(true);
+                }
+                break;
+            }
+        } else if (item.op == "face_portrait") {
+            glm::vec3 portrait;
+            if (game.LisaPortraitPosition(portrait)) Face(game, portrait);
+            else LogWarn("input script frame {}: no portrait to face", frame);
         } else if (item.op == "playdemo") {
             if (item.text.starts_with("?")) {
                 for (const PlayingDemo& demo : game.Demos().Playing()) {
@@ -606,6 +733,12 @@ void InputScript::Apply(uint64_t frame, Game& game, InputState& input) {
             }
         } else if (item.op == "quit") {
             game.RequestQuit();
+        } else if (item.op == "allocfail") {
+            if (!game.Models().Scene().Context().SetAllocFailure(item.text)) {
+                LogWarn("input script frame {}: sallocfail {} not understood", frame, item.text);
+            }
+        } else if (item.op == "vram") {
+            game.Models().Scene().Context().LogMemoryReport(std::format("input script frame {}", frame).c_str());
         } else if (item.op == "shot" && std::exchange(skip_next_shot_, false)) {
             LogWarn("input script: shot {} dropped, loop not reached", item.text);
         } else if (item.op == "shot") {
@@ -618,8 +751,16 @@ void InputScript::Apply(uint64_t frame, Game& game, InputState& input) {
             }
             game.RequestScreenshot(path);
         } else if (item.op == "camera") {
+            glm::vec3 eye(0.0f);
+            glm::vec3 target(0.0f);
             if (item.text == "off") {
                 game.SetCameraOverride(std::nullopt);
+            } else if (item.text == "tub") {
+                if (game.GamePlusTubView(eye, target)) {
+                    SetScriptCamera(game, eye, glm::vec4(target - eye, 80.0f), glm::vec3(0.0f));
+                } else {
+                    LogWarn("input script: scamera tub: the bathtub Lisa is not shown");
+                }
             } else {
                 SetScriptCamera(game, item.point, item.extra, item.up);
             }
@@ -699,7 +840,7 @@ void InputScript::Apply(uint64_t frame, Game& game, InputState& input) {
                     camera.position.y, camera.position.z, f.x, f.y, f.z, u.x, u.y, u.z, glm::degrees(camera.fov_y));
         }
         waypoints_.erase(waypoints_.begin());
-        if (item.op == "action" || item.op == "face" || item.op == "fent" || item.op == "fdir" || item.op == "face_lisa") {
+        if (item.op == "action" || item.op == "face" || item.op == "fent" || item.op == "fdir" || item.op == "face_lisa" || item.op == "face_portrait") {
             break;
         }
     }
@@ -947,6 +1088,8 @@ void InputScript::PadCommand(const std::string& op, const std::vector<std::strin
         pads_->SetAxis(slot, word(0), arg(1));
     } else if (op == "ptouch") {
         pads_->SetTouch(slot, arg(3) != 0.0f, arg(1), arg(2));
+    } else if (op == "pgyro") {
+        pads_->SetGyro(slot, arg(1), arg(2), arg(3));
     } else if (op == "pbot") {
         if (bot_slot_ >= 0 && slot < 0) {
             SendBot(BotOutput{});
@@ -959,11 +1102,17 @@ void InputScript::PadCommand(const std::string& op, const std::vector<std::strin
 
 bool InputScript::KeyCommand(const std::string& op, const std::vector<std::string>& words, const std::vector<float>& args, uint64_t frame) {
     const std::string name = words.empty() ? std::string() : words.front();
-    const bool mouse = op == "mbutton" || op == "mtap";
+    const bool mouse = op == "mbutton" || op == "mtap" || op == "mquick";
     const uint32_t code = mouse ? MouseButtonFromName(name) : ScancodeFromName(name);
     if (!device_ || code == 0) {
         LogWarn("input script frame {}: {} '{}': {}", frame, op, name, device_ ? "unknown name" : "no input device (--virtual-pads)");
         return false;
+    }
+    if (op == "mquick") {
+        device_->InjectMouseButton(static_cast<uint8_t>(code), true);
+        device_->InjectMouseButton(static_cast<uint8_t>(code), false);
+        LogInfo("input script frame {}: mouse button {} down and up in one frame", frame, name);
+        return true;
     }
     const bool tap = op == "ktap" || op == "mtap";
     const bool down = tap || (!args.empty() && args.front() != 0.0f);
@@ -1009,10 +1158,26 @@ bool InputScript::Expect(const std::vector<std::string>& words, const std::vecto
         ok = game.Objects().Ocho().State() == static_cast<int>(arg(0));
         got = std::format("ocho state {} visible {} killed {}", game.Objects().Ocho().State(), game.Objects().Ocho().Visible(),
                           game.Objects().Ocho().HasKilled());
+    } else if (what == "ocholook") {
+        ok = game.Objects().Ocho().LookPhase() == static_cast<int>(arg(0));
+        got = std::format("ocho look-back phase {}", game.Objects().Ocho().LookPhase());
+    } else if (what == "lisadate") {
+        ok = game.LisaDateActive() == (arg(0) != 0.0f);
+        got = std::format("lisa date {}", game.LisaDateActive() ? "running" : "not running");
+    } else if (what == "lisarushes") {
+        ok = game.LisaRushes() == static_cast<int>(arg(0));
+        got = std::format("lisa rushes {}", game.LisaRushes());
     } else if (what == "gameplus") {
         const bool shown = game.GamePlusTubShown();
         ok = shown == (arg(0) != 0.0f);
         got = std::format("game+ tub lisa {}", shown ? "shown" : "not shown");
+    } else if (what == "intercom") {
+        const bool shown = game.IntercomShown() > 0;
+        ok = shown == (arg(0) != 0.0f);
+        got = shown ? std::format("intercom shown in {} active stage(s)", game.IntercomShown()) : std::string("intercom not shown");
+    } else if (what == "intercomlit") {
+        ok = game.IntercomActive() == (arg(0) != 0.0f);
+        got = std::format("intercom {}", game.IntercomActive() ? "active" : "idle");
     } else if (what == "body") {
         int found = -1;
         game.Stages().ForEachStage([&](Stage& stage) {
@@ -1024,6 +1189,10 @@ bool InputScript::Expect(const std::vector<std::string>& words, const std::vecto
         });
         ok = found == static_cast<int>(arg(0));
         got = std::format("body {} {}", word(1), found < 0 ? std::string("missing") : found ? std::string("visible") : std::string("hidden"));
+    } else if (what == "hello") {
+        const uint32_t value = game.Nazo().Word(NazoId::Hello);
+        ok = value == static_cast<uint32_t>(arg(0));
+        got = std::format("hello word {}", value);
     } else if (what == "speech") {
         const bool shown = GameUi::Active() && GameUi::Active()->SpeechShown();
         ok = shown == (arg(0) != 0.0f);
@@ -1059,6 +1228,11 @@ bool InputScript::Expect(const std::vector<std::string>& words, const std::vecto
     } else if (what == "paused") {
         ok = game.Paused() == (arg(0) != 0.0f);
         got = std::format("paused {}", game.Paused() ? 1 : 0);
+    } else if (what == "dialog") {
+        int focus = 0;
+        const std::string kind = GameUi::Active() ? GameUi::Active()->DialogKind(&focus) : std::string("none");
+        ok = kind == word(1) && (args.empty() || focus == static_cast<int>(arg(0)));
+        got = std::format("dialog {} focus {}", kind, focus);
     } else if (what == "page") {
         const int page = GameUi::Active() && GameUi::Active()->Menu().CurrentPage() == OptionsMenu::Page::Pc ? 1 : 0;
         ok = page == static_cast<int>(arg(0));
@@ -1068,10 +1242,52 @@ bool InputScript::Expect(const std::vector<std::string>& words, const std::vecto
         const bool open = entry && game.ArchiveUnlocked(*entry);
         ok = entry && open == (arg(0) != 0.0f);
         got = std::format("archive entry {} {}", word(1), !entry ? "missing" : open ? "open" : "locked");
+    } else if (what == "bugfill") {
+        const bool filled = GameUi::Active() && GameUi::Active()->DemoGraphs().BugPillarColor().a > 0.0f;
+        ok = filled == (arg(0) != 0.0f);
+        got = std::format("bug picture side fill {}", filled ? "on" : "off");
+    } else if (what == "viewer") {
+        const bool active = game.ArchiveTheaterActive();
+        ok = active == (arg(0) != 0.0f);
+        got = std::format("archive viewer {}", active ? "open" : "closed");
     } else if (what == "unlocked") {
         const int index = static_cast<int>(arg(0));
         ok = game.BrowseUnlocked(index) == (arg(1) != 0.0f);
         got = std::format("loop browser entry {} {}", index, game.BrowseUnlocked(index) ? "unlocked" : "locked");
+    } else if (what == "gameplustier") {
+        ok = game.GamePlusTier() == static_cast<int>(arg(0));
+        got = std::format("game+ tier {}", game.GamePlusTier());
+    } else if (what == "pcabsent") {
+        const PcSettingRow* row = GameUi::Active() ? GameUi::Active()->Menu().PcPage().FindRow(word(1)) : nullptr;
+        ok = GameUi::Active() && !row;
+        got = std::format("PC setting {} {}", word(1), row ? "present" : "absent");
+    } else if (what == "pcvaluekey") {
+        const PcSettingRow* row = GameUi::Active() ? GameUi::Active()->Menu().PcPage().FindRow(word(1)) : nullptr;
+        const std::string key = row && row->value >= 0 && row->value < static_cast<int>(row->values.size()) ? row->values[row->value] : std::string("missing");
+        ok = row && key == word(2);
+        got = std::format("PC setting {} holds {}", word(1), key);
+    } else if (what == "pcdonate") {
+        const int n = GameUi::Active() ? GameUi::Active()->Menu().PcPage().Donations() : -1;
+        ok = n == static_cast<int>(arg(0));
+        got = std::format("PC settings donations {}", n);
+    } else if (what == "eventid") {
+        const uint32_t id = static_cast<uint32_t>(std::stoul(word(1), nullptr, 16));
+        const bool alive = game.Audio() && game.Audio()->IsEventIdPlaying(id);
+        ok = alive == (arg(0) != 0.0f);
+        got = std::format("event {:#x} {}", id, alive ? "alive" : "not alive");
+    } else if (what == "pccursor") {
+        const int n = GameUi::Active() ? GameUi::Active()->Menu().PcPage().CursorSounds() : -1;
+        ok = n >= static_cast<int>(arg(0)) && n <= static_cast<int>(arg(1));
+        got = std::format("PC settings selection sounds {}", n);
+    } else if (what == "pcscroll") {
+        const int flags = GameUi::Active() ? GameUi::Active()->Menu().PcPage().ScrollFlags() : -1;
+        ok = flags == static_cast<int>(arg(0));
+        got = std::format("PC settings scroll flags {}", flags);
+    } else if (what == "pctab") {
+        const PcSettingsPage* page = GameUi::Active() ? &GameUi::Active()->Menu().PcPage() : nullptr;
+        const std::string shown = page ? std::string(page->ShownTab()) : std::string();
+        ok = page && shown == word(1) && (args.empty() || page->StripFocused() == (arg(0) != 0.0f));
+        got = std::format("PC settings tab {}, strip {}", shown.empty() ? std::string("none") : shown, page && page->StripFocused() ? 1 : 0);
     } else if (what == "pcenabled") {
         const PcSettingRow* row = GameUi::Active() ? GameUi::Active()->Menu().PcPage().FindRow(word(1)) : nullptr;
         ok = row && row->enabled == (arg(0) != 0.0f);
@@ -1098,10 +1314,14 @@ bool InputScript::Expect(const std::vector<std::string>& words, const std::vecto
             got = std::format("PC setting {} = {} ({})", word(1), row ? row->value : -1,
                               row && !row->values.empty() ? row->values[shown] : std::string());
         }
+    } else if (what == "menulang") {
+        const int shown = GameUi::Active() ? GameUi::Active()->Menu().TextLanguage() : -1;
+        ok = shown == static_cast<int>(arg(0));
+        got = std::format("option menu text language {}", shown);
     } else if (what == "prompts") {
         const PromptDevice shown = GameUi::Active() ? GameUi::Active()->Menu().Prompts() : PromptDevice::Keyboard;
         std::string name = PromptDeviceName(shown);
-        std::transform(name.begin(), name.end(), name.begin(), [](char c) { return static_cast<char>(std::tolower(static_cast<unsigned char>(c))); });
+        std::transform(name.begin(), name.end(), name.begin(), [](char c) { return static_cast<char>(pt::AsciiLower(c)); });
         ok = name == word(1);
         got = std::format("option menu prompts {}", name);
     } else if (what == "invert") {
@@ -1404,7 +1624,7 @@ void InputScript::ApplyBot(uint64_t frame, Game& game, const InputState& input) 
             seq_focus_ = !item.args.empty() && item.args[0] != 0.0f;
             seq_focus_frame_ = frame;
             seq_focus_until_ = item.args.size() > 1 && item.args[1] > 0.0f ? frame + static_cast<uint64_t>(item.args[1]) : 0;
-        } else if (op == "stap" || op == "sbutton" || op == "saxis" || op == "stouch" || op == "sexpect" || op == "ssound") {
+        } else if (op == "stap" || op == "sbutton" || op == "saxis" || op == "stouch" || op == "sgyro" || op == "sexpect" || op == "ssound") {
             PadCommand("p" + op.substr(1), item.words, item.args, frame, game, input);
         } else if (op == "lisa") {
             if (!game.Objects().Ocho().Visible() && (item.frames <= 0 || --item.frames > 0)) {

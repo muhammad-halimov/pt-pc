@@ -16,6 +16,8 @@ float Inverse(float x) {
     return x != 0.0 ? 1.0 / x : 1.0e30;
 }
 
+const float kSwitchOn = 1.0623588e-03;
+
 void main() {
     uint image = pass.ids.x;
     uint vd = pass.ids.y;
@@ -23,28 +25,36 @@ void main() {
     vec2 uv = in_uv;
     vec4 center_vd = ImgLod(vd, SMP_POINT_CLAMP, uv, 0.0);
     vec2 dir = vec2(0.06666667 * lp.x * lp.w, 0.11851852 * lp.y * lp.w) * (2.0 * center_vd.zw - 1.0) * lp.z;
-    if (1.1286062e-06 > dot(dir, dir)) {
+    bool street = pass.ids.z != 0u;
+    float full = length(dir) / max(lp.z, 1.0e-6);
+    float kept = street ? full * smoothstep(0.5 * kSwitchOn, 1.5 * kSwitchOn, full) : full;
+    dir *= full > 0.0 ? kept / full : 0.0;
+    if ((street && kept <= 0.0) || (!street && dot(dir, dir) < 1.1286062e-06)) {
         vec4 c = ImgLod(image, SMP_POINT_CLAMP, uv, 0.0);
         out_color = vec4(c.rgb, lp.z >= 0.99 ? 0.0 : c.a);
         return;
     }
     vec4 center = ImgLod(image, SMP_POINT_CLAMP, uv, 0.0);
-    vec2 step = 0.16666667 * dir;
-    vec2 start = step * -3.0 + uv;
+    int kTaps = street ? 15 : 7;
+    int kCentre = kTaps / 2;
+    float jitter = street ? fract(52.9829189 * fract(0.06711056 * gl_FragCoord.x + 0.00583715 * gl_FragCoord.y)) - 0.5 : 0.0;
+    vec2 step = street ? dir / float(kTaps - 1) : 0.16666667 * dir;
+    vec2 start = step * (jitter - float(kCentre)) + uv;
     float d0 = 0.015625 * length((start - uv) * vec2(1920.0, 1080.0));
     float dstep = -0.015625 * length(step * vec2(1920.0, 1080.0));
     float zc = center_vd.y * center_vd.y;
     float inv_c = Inverse(center_vd.x);
-    vec3 sum = 4.0 * center.rgb;
-    float weight = 4.0;
-    for (int k = 0; k < 7; ++k) {
-        if (k == 3) {
+    float kCentreWeight = 4.0 * float(kTaps - 1) / 6.0;
+    vec3 sum = kCentreWeight * center.rgb;
+    float weight = kCentreWeight;
+    for (int k = 0; k < kTaps; ++k) {
+        if (k == kCentre) {
             continue;
         }
         float fk = float(k);
         vec2 suv = fk * step + start;
         vec4 s_vd = ImgLod(vd, SMP_POINT_CLAMP, suv, 0.0);
-        vec3 s = ImgLod(image, SMP_POINT_CLAMP, suv, 0.0).rgb;
+        vec3 s = ImgLod(image, street ? SMP_LINEAR_CLAMP : SMP_POINT_CLAMP, suv, 0.0).rgb;
         float d = abs(fk * dstep + d0);
         float zs = s_vd.y * s_vd.y;
         float cone_s = 1.0 - d * Inverse(s_vd.x);
@@ -56,5 +66,6 @@ void main() {
         weight += w;
     }
     vec3 c = sum * Inverse(weight);
-    out_color = vec4(c, lp.z >= 0.99 ? Saturate(0.25 * weight - 1.2) : center.a);
+    float alpha = street ? Saturate(0.25 * weight * 6.0 / float(kTaps - 1) - 1.2) : Saturate(0.25 * weight - 1.2);
+    out_color = vec4(c, lp.z >= 0.99 ? alpha : center.a);
 }

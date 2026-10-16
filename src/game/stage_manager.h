@@ -14,6 +14,7 @@
 
 #include "engine/assets/ftex.h"
 #include "engine/assets/geom.h"
+#include "engine/core/parallel_for.h"
 #include "engine/fs/vfs.h"
 #include "engine/physics/collision_world.h"
 #include "engine/render/model_cache.h"
@@ -63,6 +64,7 @@ struct Stage {
         glm::vec4 color{1.0f};
     };
     std::vector<Draw> draws;
+    std::vector<std::string> model_refs;
 
     struct CollisionPiece {
         const fox2::Entity* entity = nullptr;
@@ -87,6 +89,7 @@ struct Stage {
     };
     std::vector<CollisionPiece> collision;
     bool walk_detail_surfaces = false;
+    std::vector<std::pair<std::string, std::string>> swaps;
 
     glm::mat4 ToWorld(const glm::mat4& file_space) const { return file_to_world * file_space; }
     bool ConnectorWorld(const std::string& name, glm::mat4& out) const;
@@ -151,7 +154,7 @@ public:
                                CollisionWorld* reflections = nullptr) const;
     bool CollisionDeferrable() const { return collision_deferrable_; }
     void StartCollisionBuild();
-    bool CollisionBuildRunning() const { return pending_collision_ != nullptr; }
+    bool CollisionBuildRunning() const;
     void FinishCollisionBuild(CollisionWorld& world, std::vector<SurfaceTriangle>* surfaces, CollisionWorld& lines, CollisionWorld& reflections);
 
     std::function<void(Stage&)> on_loaded;
@@ -170,6 +173,7 @@ private:
     struct ParsedStage {
         std::unique_ptr<Stage> stage;
         std::vector<std::string> errors;
+        std::vector<std::string> notes;
         std::unordered_map<std::string, std::shared_ptr<const PreGeom>> geoms;
         std::unordered_map<std::string, std::shared_ptr<FmdlModel>> models;
         std::vector<std::pair<std::string, std::shared_ptr<FtexTexture>>> textures;
@@ -180,6 +184,7 @@ private:
         std::unordered_set<std::string> geoms;
     };
     static ParsedStage Parse(Vfs& vfs, const std::string& fpk_path, const KnownAssets* known = nullptr);
+    static void ApplyModLevel(Stage& stage, std::vector<std::string>& notes);
     uint32_t load_count_ = 0;
     std::string deferred_prefetch_;
     void StartPrefetch(const std::string& fpk_path);
@@ -205,6 +210,8 @@ private:
     void Place(Stage& stage, const glm::mat4& runtime_root);
     void Unload(std::unique_ptr<Stage> stage);
     void DropCollisionBuild();
+    void DropCollisionBuildReading(const Stage* stage);
+    void StartSwapBuild();
 
     struct CollisionOwners {
         const Stage* stage = nullptr;
@@ -252,7 +259,11 @@ private:
     bool collision_deferrable_ = false;
     bool prefetch_allowed_ = true;
     std::string prefetch_path_;
-    std::future<ParsedStage> prefetch_;
+    struct Prefetch {
+        ParsedStage parsed;
+        std::unique_ptr<ParallelTask> task;
+    };
+    std::unique_ptr<Prefetch> prefetch_;
 };
 
 }

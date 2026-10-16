@@ -1,4 +1,5 @@
 #include "game/game.h"
+#include "game/outro_input.h"
 #include "game/archive.h"
 #include "game/loop_browser.h"
 
@@ -13,6 +14,8 @@
 #include <glm/gtc/matrix_transform.hpp>
 
 #include "engine/core/log.h"
+#include "engine/render/model_cache.h"
+#include "engine/render/vk_context.h"
 #include "engine/core/strcode.h"
 #include "engine/fs/fox_crypt.h"
 #include "engine/fs/mods.h"
@@ -25,7 +28,7 @@ namespace {
 
 constexpr double kGameFrame = 1.0 / 30.0;
 constexpr float kBrowseFadeSeconds = 0.5f;
-constexpr double kStreetSceneryFrame = 5760.0;
+constexpr double kStreetSceneryFrame = 2900.0;
 const glm::vec3 kStreetSpawn(-1.15f, 0.05f, 27.0f);
 constexpr glm::vec2 kStreetMin(-19.5f, -12.5f);
 constexpr glm::vec2 kStreetMax(13.5f, 190.0f);
@@ -49,6 +52,10 @@ Game::Game(Vfs& vfs, ModelCache& models)
 Game::~Game() {
     stages_.on_loaded = nullptr;
     stages_.on_unloading = nullptr;
+    if (handy_lens_mesh_) {
+        models_.Scene().Destroy(*handy_lens_mesh_);
+        handy_lens_mesh_.reset();
+    }
 }
 
 bool Game::Init(const GameConfig& config) {
@@ -182,7 +189,7 @@ void Game::SpawnPlayer(Stage& stage) {
 
 void Game::Update(float dt, const InputState& pad_input) {
     static const InputState kNoInput{};
-    const InputState& input = save_dialog_ ? kNoInput : pad_input;
+    const InputState& input = save_dialog_ || EndingOutroInputBlocked(controller_.Step()) ? kNoInput : pad_input;
     if (loop_reload_pending_) {
         browse_fade_wait_ -= dt;
         if (browse_fade_wait_ <= 0.0f) {
@@ -227,6 +234,7 @@ void Game::Update(float dt, const InputState& pad_input) {
     UpdateGamePlus();
     UpdateGamePlusSounds();
     UpdateGamePlusDemos();
+    UpdateGamePlusIntercom(dt);
     messages_.Dispatch();
     demos_.Update(dt);
     messages_.Dispatch();
@@ -263,11 +271,25 @@ void Game::Update(float dt, const InputState& pad_input) {
         }
         PlayerFrameContext context;
         context.nazo_action_armed = nazo_.IsActionArmed();
-        context.big_zoom = traps_.big_zoom;
+        const bool lisa_portrait = UpdateLisaPortrait(dt);
+        UpdateLisaHints(dt);
+        context.big_zoom = traps_.big_zoom || lisa_portrait;
         context.full_screen_blur = effects_.full_screen_blur;
         context.invert_x = options_.invert_x;
         context.invert_y = options_.invert_y;
         context.peephole_theater = nazo_.IsPeepholeTheaterActive();
+        if (glm::mat4 hole; context.peephole_theater && nazo_.PeepholeTransform(hole)) {
+            const glm::vec3 axis = glm::normalize(glm::vec3(hole[2].x, 0.0f, hole[2].z));
+            constexpr float pi = 3.14159265f;
+            const auto wrap = [](float a) { return std::remainder(a, 2.0f * pi); };
+            float center = wrap(std::atan2(axis.x, axis.z) - pi);
+            if (std::abs(wrap(center - player_.yaw)) > pi / 2) center = wrap(center + pi);
+            context.peephole_center_valid = true;
+            context.peephole_center_yaw = center;
+        }
+        if (demo_control && game_frame_tick_) {
+            player_.DemoHeldFrame(input);
+        }
         if (!demo_control) {
             player_.Update(dt, input, collision_, context);
             zoom_fell_ = zoom_fell_ || player_.ZoomFalling();
@@ -342,6 +364,34 @@ uint32_t Game::SurfaceMaterial(const glm::vec3& feet) const {
             material = t.material;
         }
     }
+    if (material == 0) {
+        const glm::vec2 p(feet.x, feet.z);
+        float nearest = 0.15f;
+        float nearest_y = feet.y - 0.6f;
+        bool found = false;
+        for (const SurfaceTriangle& t : surfaces_) {
+            const glm::vec3 corners[3] = {t.a, t.b, t.c};
+            for (int e = 0; e < 3; ++e) {
+                const glm::vec3& from = corners[e];
+                const glm::vec3& to = corners[(e + 1) % 3];
+                const glm::vec2 a(from.x, from.z);
+                const glm::vec2 ab = glm::vec2(to.x, to.z) - a;
+                const float length2 = glm::dot(ab, ab);
+                const float k = length2 > 1e-10f ? std::clamp(glm::dot(p - a, ab) / length2, 0.0f, 1.0f) : 0.0f;
+                const float distance = glm::length(p - (a + ab * k));
+                const float y = from.y + (to.y - from.y) * k;
+                if (distance > nearest + 1e-4f || y <= feet.y - 0.6f || y >= feet.y + 0.4f) {
+                    continue;
+                }
+                if (!found || distance < nearest - 1e-4f || y > nearest_y) {
+                    nearest = std::min(distance, nearest);
+                    nearest_y = y;
+                    material = t.material;
+                    found = true;
+                }
+            }
+        }
+    }
     if (material == 0 && street_walk_) {
         material = 0x5F263606;
     }
@@ -368,6 +418,7 @@ void Game::CollectDraws(std::vector<DrawItem>& out) {
             out.push_back(item);
         }
     }
+    AddIntercomDraw(out);
     if (GamePlusTier() >= 2 && game_plus_arm_.Prepare(models_)) {
         game_plus_arm_.Apply(out);
     }
@@ -378,8 +429,10 @@ void Game::AddMirrorBody(std::vector<DrawItem>& out) {
         const char* off = std::getenv("PT_MIRROR_BODY");
         return off && *off == '0';
     }();
-    if (body_off || !player_.spawned || (!BodyShown() && (!effects_.mirror_capture || mirror_viewport_bits_ == 0 || demos_.ControlsPlayer() ||
-        nazo_.IsPeepholeTheaterActive()))) {
+    const bool third_person_transition = third_person_ && !FreeView() && third_person_weight_ > 0.0f && player_.handy_light.enable;
+    if (floor_.CurrentFloorName() == "ending" && !street_walk_) return;
+    if (body_off || !player_.spawned || (!BodyShown() && !third_person_transition && ((!traced_body_ && (!effects_.mirror_capture || mirror_viewport_bits_ == 0)) ||
+        demos_.ControlsPlayer() || nazo_.IsPeepholeTheaterActive()))) {
         static const bool trace = std::getenv("PT_MIRROR_TRACE") != nullptr;
         if (trace) {
             LogInfo("mirror trace: body skipped spawned {} capture {} bits {:#x} demo_controls {} peephole {}", player_.spawned,
@@ -397,7 +450,7 @@ void Game::AddMirrorBody(std::vector<DrawItem>& out) {
     bool gripped = false;
     const PlayerBody::HandReach reach = [&](const glm::mat4& hand_model, glm::mat4& target_model) {
         constexpr float kGripPitch = -15.0f;
-        constexpr glm::vec3 kFist{0.095f, -0.013f, -0.005f};
+        constexpr glm::vec3 kFist{0.077f, -0.016f, -0.005f};
         constexpr float kHoldAt = 0.06f;
         constexpr float kGripRaise = 25.0f;
         const auto frame = [](const glm::vec3& r, const glm::vec3& u, const glm::vec3& d, const glm::vec3& o) {
@@ -418,7 +471,7 @@ void Game::AddMirrorBody(std::vector<DrawItem>& out) {
         HandyLightPose(reference, reference.position + reference.Forward() * 5.0f, 0.0f, 0.0f, ref_flash, ref_dir, &ref_right, &ref_up);
         glm::vec3 flash, dir, right, up;
         const glm::vec3 aim = own.position + glm::angleAxis(yaw_back, glm::vec3(0.0f, 1.0f, 0.0f)) * (light_aim_ - own.position);
-        HandyLightPose(own, aim, handy_hold_, handy_demo_, flash, dir, &right, &up);
+        HandyLightPose(own, aim, 0.0f, handy_demo_, flash, dir, &right, &up);
         const glm::mat4 aim_reference = glm::inverse(frame(ref_right, ref_up, ref_dir, ref_flash));
         grip_hand = frame(right, up, dir, flash) * aim_reference * hand_world;
         const glm::vec3 fist(aim_reference * hand_world * glm::vec4(kFist, 1.0f));
@@ -456,7 +509,7 @@ void Game::AddMirrorBody(std::vector<DrawItem>& out) {
         gripped = true;
         return true;
     };
-    const bool grip = DetachedView() && player_.handy_light.enable && glm::length(light_aim_) > 0.0f;
+    const bool grip = (DetachedView() || third_person_transition) && player_.handy_light.enable && glm::length(light_aim_) > 0.0f;
     if (!entry || !entry->mesh || !player_.BodySkin(help.get(), player_skin_, player_.handy_light.enable, sim.get(), grip ? &reach : nullptr)) {
         return;
     }
@@ -639,7 +692,17 @@ void Game::UpdateHandyTarget(float dt) {
     glm::vec3 right = glm::cross(forward, glm::vec3(0.0f, 1.0f, 0.0f));
     right = glm::length(right) > 1e-4f ? glm::normalize(right) * (glm::dot(right, camera.Right()) < 0.0f ? -1.0f : 1.0f) : camera.Right();
     const glm::vec3 up = glm::normalize(glm::cross(right, forward));
-    const glm::vec2 s = demos_.ControlsPlayer() ? glm::vec2(0.0f) : player_.LightStick() * (demo_camera ? 0.2f : 1.0f);
+    if (demo_camera && demos_.ControlsPlayer()) {
+        const float decay = std::exp(-std::max(dt, 0.0f) / 0.15f);
+        demo_light_mouse_ = demo_light_mouse_ * decay + last_input_.mouse_look * 25.0f;
+        demo_light_mouse_ = glm::clamp(demo_light_mouse_, glm::vec2(-1.0f), glm::vec2(1.0f));
+    } else {
+        demo_light_mouse_ = glm::vec2(0.0f);
+    }
+    const glm::vec2 demo_stick =
+        glm::clamp(player_.DemoLightStick(last_input_, options_.invert_x, options_.invert_y) + demo_light_mouse_, glm::vec2(-1.0f), glm::vec2(1.0f));
+    const glm::vec2 s = EndingOutroInputBlocked(controller_.Step()) ? glm::vec2(0.0f)
+                        : (demos_.ControlsPlayer() ? demo_stick : player_.LightStick()) * (demo_camera ? 0.2f : 1.0f);
     const float a = 0.28125f * s.y;
     const float b = 0.375f * s.x;
     const float n2 = 1.0f + a * a + b * b;
@@ -711,7 +774,8 @@ void Game::UpdateHandyReflection(float dt) {
     }
     glm::vec3 position = origin + direction * (outer + 0.02f);
     RayHit hit;
-    if (reflection_collision_.Raycast(origin, direction, outer, hit, true)) {
+    const bool axis_hit = reflection_collision_.Raycast(origin, direction, outer, hit, true);
+    if (axis_hit) {
         position = hit.point - hit.normal * 0.02f;
         normal_sum += hit.normal;
     } else {
@@ -753,8 +817,42 @@ void Game::UpdateHandyReflection(float dt) {
         const glm::vec3 eased = r.normal * keep + average * (1.0f - keep);
         r.normal = glm::length(eased) > 1.0e-6f ? glm::normalize(eased) : average;
     }
+    bool kind0 = false;
+    bool kind1 = false;
+    static const float trap_extent = [] {
+        const char* e = std::getenv("PT_REFLECT_TRAP_EXTENT");
+        return e ? static_cast<float>(std::atof(e)) : 1.0f;
+    }();
+    const glm::vec3 raw_hit = axis_hit ? hit.point : origin + direction * outer;
+    if (trap_extent > 0.0f) {
+        stages_.ForEachStage(
+            [&](Stage& stage) {
+                if (!stage.active) {
+                    return;
+                }
+                for (const auto& data : stage.files) {
+                    const fox2::DataSetFile& f = *data->file;
+                    for (const fox2::Entity& e : f.Entities()) {
+                        if (e.class_name != "ShSpotLightReflectionTrap") {
+                            continue;
+                        }
+                        const glm::mat4 world = stage.ToWorld(f.WorldTransform(e));
+                        const glm::vec3 local(glm::inverse(world) * glm::vec4(raw_hit, 1.0f));
+                        const bool inside = std::abs(local.x) <= trap_extent && std::abs(local.y) <= trap_extent && std::abs(local.z) <= trap_extent;
+                        if (std::getenv("PT_REFLECT_LOG")) {
+                            LogInfo("reflect trap {} kind {} centre ({:.3f} {:.3f} {:.3f}) local ({:.2f} {:.2f} {:.2f}){}", f.GetString(e, "name"), f.GetInt(e, "trapKind"),
+                                    world[3].x, world[3].y, world[3].z, local.x, local.y, local.z, inside ? " inside" : "");
+                        }
+                        if (inside) {
+                            (f.GetInt(e, "trapKind") == 0 ? kind0 : kind1) = true;
+                        }
+                    }
+                }
+            },
+            false);
+    }
     if (glm::distance(position, r.previous) <= outer * 1.01f) {
-        if (std::abs(depth(position) - depth(r.previous)) > 1.0f) {
+        if (std::abs(depth(position) - depth(r.previous)) > (kind1 ? 0.3f : 1.0f)) {
             if (!r.fading) {
                 r.second = r.previous;
                 r.first_weight = 0.0f;
@@ -776,39 +874,6 @@ void Game::UpdateHandyReflection(float dt) {
         if (r.first_weight >= 1.0f && r.second_weight <= 0.0f) {
             r.fading = false;
         }
-    }
-    bool kind0 = false;
-    bool kind1 = false;
-    static const float trap_extent = [] {
-        const char* e = std::getenv("PT_REFLECT_TRAP_EXTENT");
-        return e ? static_cast<float>(std::atof(e)) : 0.0f;
-    }();
-    if (trap_extent > 0.0f) {
-        stages_.ForEachStage(
-            [&](Stage& stage) {
-                if (!stage.active) {
-                    return;
-                }
-                for (const auto& data : stage.files) {
-                    const fox2::DataSetFile& f = *data->file;
-                    for (const fox2::Entity& e : f.Entities()) {
-                        if (e.class_name != "ShSpotLightReflectionTrap") {
-                            continue;
-                        }
-                        const glm::mat4 world = stage.ToWorld(f.WorldTransform(e));
-                        const glm::vec3 local(glm::inverse(world) * glm::vec4(position, 1.0f));
-                        const bool inside = std::abs(local.x) <= trap_extent && std::abs(local.y) <= trap_extent && std::abs(local.z) <= trap_extent;
-                        if (std::getenv("PT_REFLECT_LOG")) {
-                            LogInfo("reflect trap {} kind {} centre ({:.3f} {:.3f} {:.3f}) local ({:.2f} {:.2f} {:.2f}){}", f.GetString(e, "name"), f.GetInt(e, "trapKind"),
-                                    world[3].x, world[3].y, world[3].z, local.x, local.y, local.z, inside ? " inside" : "");
-                        }
-                        if (inside) {
-                            (f.GetInt(e, "trapKind") == 0 ? kind0 : kind1) = true;
-                        }
-                    }
-                }
-            },
-            false);
     }
     r.spot_share = std::clamp(r.spot_share + (kind0 ? 0.05f : -0.05f) * dt * 30.0f, 0.0f, 1.0f);
     if (std::getenv("PT_REFLECT_LOG")) {
@@ -918,13 +983,44 @@ glm::vec3 Game::ThirdPersonPosition(float yaw, float pitch) const {
            LookForward(yaw, pitch) * third_person_distance_;
 }
 
-Camera Game::ViewCamera() const {
+float Game::FovOffsetNow() const {
+    if (fov_offset_ == 0.0f || camera_override_ || nazo_.IsPeepholeTheaterActive()) {
+        return 0.0f;
+    }
+    glm::vec3 demo_position(0.0f);
+    glm::quat demo_rotation(1.0f, 0.0f, 0.0f, 0.0f);
+    float demo_fov = 0.0f;
+    if (demos_.CameraWorld(demo_position, demo_rotation, demo_fov)) {
+        return 0.0f;
+    }
+    const float open = std::clamp((Player::kZoomHeld - player_.zoom) / (Player::kZoomHeld - 1.0f), 0.0f, 1.0f);
+    return glm::radians(fov_offset_) * open;
+}
+
+namespace {
+void WidenFov(Camera& camera, float offset) {
+    if (offset != 0.0f) {
+        camera.fov_y = std::clamp(camera.fov_y + offset, glm::radians(20.0f), glm::radians(120.0f));
+    }
+}
+}
+
+Camera Game::PlayerViewCamera() const {
+    Camera camera = player_.MakeCamera();
+    WidenFov(camera, FovOffsetNow());
+    return camera;
+}
+
+Camera Game::ViewCamera(bool fov_offset) const {
     Camera camera = GetCamera();
+    float widen = fov_offset ? FovOffsetNow() : 0.0f;
     if (!third_person_ || camera_override_ || third_person_weight_ <= 0.0f) {
+        WidenFov(camera, widen);
         return camera;
     }
     const float w = third_person_weight_;
     const float s = w * w * (3.0f - 2.0f * w);
+    WidenFov(camera, widen * (1.0f - s));
     const glm::vec3 aim = camera.position + camera.Forward() * third_person_aim_;
     camera.position = glm::mix(camera.position, ThirdPersonPosition(camera.yaw, camera.pitch), s);
     camera.roll *= 1.0f - s;
@@ -1171,7 +1267,28 @@ void Game::ShowCaption(uint32_t message_id) {
     effects_.caption_time = 0.0f;
 }
 
+void Game::SetAudio(GameAudio* audio) {
+    if (audio_ && audio_ != audio) {
+        audio_->SetPostObserver({});
+    }
+    audio_ = audio;
+    SetSoundCaptions(captions_.Enabled());
+}
+
+void Game::SetSoundCaptions(bool on) {
+    captions_.SetEnabled(on);
+    if (!audio_) {
+        return;
+    }
+    if (on) {
+        audio_->SetPostObserver([this](uint32_t event, const std::optional<glm::vec3>& position) { captions_.Post(event, position); });
+    } else {
+        audio_->SetPostObserver({});
+    }
+}
+
 void Game::ClearPendingSubtitles() {
+    captions_.Clear();
     subtitle_requests_.clear();
     effects_.caption_id = 0;
     effects_.caption_time = 0.0f;
@@ -1180,13 +1297,15 @@ void Game::ClearPendingSubtitles() {
 
 bool Game::InViewNdc(const glm::vec3& position, float area) const {
     const Camera camera = player_.MakeCamera();
-    const glm::mat4 projection = glm::perspectiveRH_NO(camera.fov_y, 16.0f / 9.0f, camera.near_plane, 2000.0f);
-    const glm::vec4 clip = projection * camera.View() * glm::vec4(position, 1.0f);
-    if (clip.w == 0.0f) {
+    const glm::vec3 offset = position - camera.position;
+    const float depth = glm::dot(offset, camera.Forward());
+    if (!(depth > 0.0f && depth < camera.far_plane)) {
         return false;
     }
-    const glm::vec3 ndc = glm::vec3(clip) / clip.w;
-    return ndc.z > -1.0f && ndc.x > -area && ndc.x < area && ndc.y > -area && ndc.y < area;
+    const float tan_half = std::tan(camera.fov_y * 0.5f);
+    const float ndc_y = glm::dot(offset, camera.Up()) / (depth * tan_half);
+    const float ndc_x = glm::dot(offset, camera.Right()) / (depth * tan_half * (16.0f / 9.0f));
+    return ndc_x > -area && ndc_x < area && ndc_y > -area && ndc_y < area;
 }
 
 void Game::SetMirrorViewportBit(int bit, bool on) {
@@ -1323,6 +1442,13 @@ bool Game::StartStreetWalk() {
     controller_.SetStep(31);
     LogInfo("street: walk started at ({:.2f} {:.2f} {:.2f})", player_.Feet().x, player_.Feet().y, player_.Feet().z);
     return true;
+}
+
+void Game::ToggleStreetFlashlight() {
+    if (!street_walk_ || !demos_.SceneryReady()) return;
+    player_.handy_light.enable = !player_.handy_light.enable;
+    if (audio_) audio_->PostEvent(player_.handy_light.enable ? "Play_sfx_light_on_01" : "Play_sfx_light_off_01", nullptr);
+    LogInfo("street: flashlight {}", player_.handy_light.enable ? "on" : "off");
 }
 
 void Game::UpdateStreetWalk(float dt) {
@@ -1534,7 +1660,26 @@ bool Game::GamePlusTubShown() const {
         if (!stage.active) return;
         for (const Stage::Draw& d : stage.draws) shown = shown || (d.entity == nullptr && d.mesh && d.mesh == tub_lisa_mesh_);
     });
-    return shown;
+    return shown && models_.Holds(tub_lisa_mesh_);
+}
+
+bool Game::GamePlusTubView(glm::vec3& eye, glm::vec3& target) const {
+    bool found = false;
+    const_cast<StageManager&>(stages_).ForEachStage([&](Stage& stage) {
+        if (found || !stage.active) return;
+        for (const Stage::Draw& d : stage.draws) {
+            if (d.entity != nullptr || !d.mesh || d.mesh != tub_lisa_mesh_) continue;
+            target = glm::vec3(stage.file_to_world * d.file_transform * kTubLisaMiddle);
+            found = true;
+            break;
+        }
+    });
+    if (!found) return false;
+    const glm::vec3 baby(objects_.Gimmicks()[static_cast<size_t>(GimmickType::Baby)].world[3]);
+    glm::vec3 side(baby.x - target.x, 0.0f, baby.z - target.z);
+    side = glm::length(side) > 0.01f ? glm::normalize(side) : glm::vec3(0.0f);
+    eye = target + glm::vec3(0.0f, 1.45f, 0.0f) + side * 0.25f;
+    return true;
 }
 
 void Game::StopGamePlusSound(uint32_t& id, float fade) {
@@ -1604,8 +1749,6 @@ void Game::UpdateGamePlusSounds() {
                 gp_radio_line_ = PostSound(kLines[gp_radio_stage_], radio, true);
                 LogInfo("game+: radio line {} after the broadcast ({} pass {}, frame {})", kLines[gp_radio_stage_], floor, pass, frame_);
                 ++gp_radio_stage_;
-            } else {
-                gp_radio_stage_ = 3;
             }
         }
     }
@@ -1686,6 +1829,7 @@ int Game::GamePlusTier() const {
         const char* v = std::getenv("PT_GAMEPLUS_TIER");
         return v && *v ? std::atoi(v) : -1;
     }();
+    if (!game_plus_active_) return 0;
     if (forced >= 0) return forced;
     return game_plus_ ? static_cast<int>(finishes_) : 0;
 #else
@@ -1693,13 +1837,107 @@ int Game::GamePlusTier() const {
 #endif
 }
 
+int Game::GamePlusNoticeDue() {
+    if (controller_.Step() != 15 || street_walk_) {
+        gameplus_door_seen_ = false;
+        return 0;
+    }
+    if (demos_.IsPlaying("gc_p00_010") || demos_.IsPlaying("gc_p00_160")) gameplus_door_seen_ = true;
+    const int tier = std::min(GamePlusTier(), 4);
+    if (tier <= 0 || static_cast<uint32_t>(tier) <= gameplus_announced_ || !gameplus_door_seen_) return 0;
+    const std::string& floor = floor_.CurrentFloorName();
+    if (floor.size() != 4 || floor[0] != 'f') return 0;
+    return tier;
+}
+
+void Game::TakeGamePlusNotice(int tier) {
+    gameplus_announced_ = std::max<uint32_t>(gameplus_announced_, static_cast<uint32_t>(tier));
+    LogInfo("game+: notice for tier {} given", tier);
+}
+
+void Game::SetGamePlusSetting(bool on, bool now) {
+    game_plus_setting_ = on;
+    if (now) {
+        game_plus_active_ = on;
+    }
+}
+
+void Game::LatchGamePlus() {
+    if (game_plus_active_ == game_plus_setting_) return;
+    game_plus_active_ = game_plus_setting_;
+    LogInfo("game+: setting {} from this loop (tier {})", game_plus_active_ ? "on" : "off", GamePlusTier());
+}
+
 void Game::EnableGamePlus() {
     if (!game_plus_) {
         LogInfo("game+: finished flag set (save tag)");
     }
     game_plus_ = true;
-    ++finishes_;
-    LogInfo("game+: finish {} counted", finishes_);
+    if (game_plus_active_ || finishes_ == 0) {
+        ++finishes_;
+        LogInfo("game+: finish {} counted", finishes_);
+    } else {
+        LogInfo("game+: finish not counted toward the tier (Game+ off), finishes stay {}", finishes_);
+    }
+}
+
+void Game::ReleaseUnusedAssets(std::string_view why) {
+    gpu::Device& ctx = models_.Scene().Gpu();
+    double before = 0.0;
+    double budget = 0.0;
+    ctx.DeviceLocalUsage(before, budget);
+    if (tub_lisa_mesh_) {
+        stages_.ForEachStage([&](Stage& stage) {
+            std::erase_if(stage.draws, [&](const Stage::Draw& d) { return d.entity == nullptr && d.mesh == tub_lisa_mesh_; });
+        });
+        stages_.MarkVisualsDirty();
+        tub_lisa_mesh_ = nullptr;
+        LogInfo("game+: tub Lisa taken out of the stages before the unused models are released");
+    }
+    const ModelCache::Released released = models_.ReleaseUnused();
+    double after = 0.0;
+    ctx.DeviceLocalUsage(after, budget);
+    LogInfo("models: {}: released {} models ({:.0f} MB of meshes) and {} textures ({:.0f} MB); device local {:.0f} -> {:.0f} of {:.0f} MB", why,
+            released.models, static_cast<double>(released.mesh_bytes) / 1048576.0, released.textures,
+            static_cast<double>(released.texture_bytes) / 1048576.0, before / 1048576.0, after / 1048576.0, budget / 1048576.0);
+}
+
+void Game::UpdateEndingSkip(bool pressed, bool held, float dt, bool blocked) {
+    constexpr const char* kEnding = "gc_p06_010_final";
+    const bool ending = controller_.Step() == 28 && !street_walk_ && !Paused() && demos_.IsPlaying(kEnding);
+    if (!ending || blocked) {
+        ending_skip_armed_ = false;
+        ending_skip_hold_ = 0.0f;
+        ending_skip_alpha_ = ending ? std::max(0.0f, ending_skip_alpha_ - dt / 0.3f) : 0.0f;
+        return;
+    }
+    if (pressed) ending_skip_armed_ = true;
+    if (ending_skip_armed_ && held) {
+        if (ending_skip_hold_ == 0.0f) LogInfo("ending: skip hold started at demo frame {:.1f}", demos_.PlayTime(kEnding) * 59.94);
+        ending_skip_hold_ += dt;
+        ending_skip_alpha_ = std::min(1.0f, ending_skip_alpha_ + dt / 0.15f);
+    } else {
+        if (ending_skip_hold_ > 0.0f) LogInfo("ending: skip hold released after {:.2f} s", ending_skip_hold_);
+        ending_skip_armed_ = false;
+        ending_skip_hold_ = 0.0f;
+        ending_skip_alpha_ = std::max(0.0f, ending_skip_alpha_ - dt / 0.3f);
+    }
+    if (ending_skip_hold_ >= kEndingSkipHold) {
+        LogInfo("ending: skipped by the player after a {:.2f} s hold", ending_skip_hold_);
+        demos_.SkipToEnd(kEnding, 0.5f);
+        ending_skip_armed_ = false;
+        ending_skip_hold_ = 0.0f;
+        ending_skip_alpha_ = 0.0f;
+    }
+}
+
+bool Game::VideoMemoryTight() {
+    static const bool test_tight = std::getenv("PT_TEST_VRAM_TIGHT") != nullptr;
+    if (test_tight) return true;
+    double used = 0.0;
+    double budget = 0.0;
+    models_.Scene().Gpu().DeviceLocalUsage(used, budget);
+    return budget > 0.0 && used > budget * 0.8;
 }
 
 void Game::NoteGameFinished() {
@@ -1713,10 +1951,90 @@ void Game::NoteGameFinished() {
 
 void Game::OnFloorReached(std::string_view floor, int pass) {
     NoteArchive("floor:" + std::string(floor));
+    current_loop_index_ = BrowseIndexOf(floor, pass);
     if (browse_save_suppressed_ || browse_waiting_entry_) {
         return;
     }
     NoteBrowseReached(BrowseIndexOf(floor, pass));
+}
+
+void Game::LogModInspect(const Camera& camera) {
+    const glm::vec3 origin = camera.position;
+    const glm::vec3 dir = camera.Forward();
+    float best = 1e30f;
+    const Stage* best_stage = nullptr;
+    const Stage::Draw* best_draw = nullptr;
+    stages_.ForEachStage(
+        [&](Stage& stage) {
+            if (!stage.active) return;
+            for (const Stage::Draw& draw : stage.draws) {
+                if (!draw.mesh) continue;
+                if (const BodyState* body = stage.FindBody(draw.entity); body && !body->visible) continue;
+                const glm::mat4 inverse = glm::inverse(stage.file_to_world * draw.file_transform);
+                const glm::vec3 o = glm::vec3(inverse * glm::vec4(origin, 1.0f));
+                const glm::vec3 d = glm::vec3(inverse * glm::vec4(dir, 0.0f));
+                float t0 = 0.0f, t1 = 1e30f;
+                bool hit = true;
+                for (int a = 0; a < 3 && hit; ++a) {
+                    if (std::abs(d[a]) < 1e-9f) {
+                        hit = o[a] >= draw.mesh->bounds_min[a] && o[a] <= draw.mesh->bounds_max[a];
+                        continue;
+                    }
+                    float n = (draw.mesh->bounds_min[a] - o[a]) / d[a], f = (draw.mesh->bounds_max[a] - o[a]) / d[a];
+                    if (n > f) std::swap(n, f);
+                    t0 = std::max(t0, n);
+                    t1 = std::min(t1, f);
+                    hit = t0 <= t1;
+                }
+                if (!hit || t0 <= 0.0f) continue;
+                if (t0 < best) {
+                    best = t0;
+                    best_stage = &stage;
+                    best_draw = &draw;
+                }
+            }
+        },
+        false);
+    LogInfo("mods inspector: ---- (F8) ----");
+    if (Stage* current = stages_.Find("current")) {
+        const glm::vec3 feet = glm::vec3(glm::inverse(current->file_to_world) * glm::vec4(player_.Feet(), 1.0f));
+        LogInfo("mods inspector: you stand in stage {} at [{:.2f}, {:.2f}, {:.2f}] (stage space, for level.json \"at\"), floor {}",
+                current->package_path, feet.x, feet.y, feet.z, floor_.CurrentFloorName());
+    }
+    if (!best_draw) {
+        LogInfo("mods inspector: no model in front of the camera");
+        return;
+    }
+    const glm::vec3 at = glm::vec3(best_draw->file_transform[3]);
+    const std::string name = best_draw->entity && best_draw->file ? best_draw->file->file->EntityName(*best_draw->entity) : "(a mod's added model)";
+    const std::string model = best_draw->entity && best_draw->file ? best_draw->file->file->GetString(*best_draw->entity, "modelFile") : std::string();
+    const size_t bar = name.find_last_of('|');
+    LogInfo("mods inspector: looking at model \"{}\" ({:.1f} m away) in stage {}", bar == std::string::npos ? name : name.substr(bar + 1), best,
+            best_stage->package_path);
+    LogInfo("mods inspector:   full name {}, model file {}, at [{:.2f}, {:.2f}, {:.2f}]", name, model.empty() ? "-" : model, at.x, at.y, at.z);
+    const glm::vec3 point = origin + dir * best;
+    std::vector<std::pair<float, std::string>> lights;
+    for (const auto& file : best_stage->files) {
+        for (const LightPlacement& l : file->lights) {
+            const glm::vec3 p = glm::vec3(best_stage->file_to_world * l.world[3]);
+            const size_t b = l.name.find_last_of('|');
+            lights.emplace_back(glm::distance(p, point), (b == std::string::npos ? l.name : l.name.substr(b + 1)) + " (" + l.class_name + ")");
+        }
+    }
+    std::sort(lights.begin(), lights.end());
+    for (size_t i = 0; i < lights.size() && i < 4; ++i) {
+        LogInfo("mods inspector:   light \"{}\" {:.1f} m from that point", lights[i].second, lights[i].first);
+    }
+}
+
+void Game::LogCapturePose(const Camera& camera) {
+    const glm::vec3 feet = player_.Feet();
+    const glm::vec3 target = camera.position + camera.Forward() * 3.0f;
+    LogInfo("capture pose: floor {} loop {} step {}, camera ({:.3f} {:.3f} {:.3f}) yaw {:.2f} pitch {:.2f}, feet ({:.3f} {:.3f} {:.3f})",
+            floor_.CurrentFloorName(), floor_.LoopCount(), controller_.Step(), camera.position.x, camera.position.y, camera.position.z,
+            glm::degrees(camera.yaw), glm::degrees(camera.pitch), feet.x, feet.y, feet.z);
+    LogInfo("capture route: goto {:.3f} {:.3f} 240 0.1", feet.x, feet.z);
+    LogInfo("capture route: lookat {:.3f} {:.3f} {:.3f} 60", target.x, target.y, target.z);
 }
 
 void Game::NoteArchive(std::string_view key) {
@@ -1732,11 +2050,35 @@ bool Game::ArchiveUnlocked(const ArchiveEntry& entry) const {
     if (!config_.release_locks) {
         return true;
     }
+    if (entry.unlock == "lisa_date") return archive_seen_.contains("lisa_date");
     if (!game_finished_) {
         return false;
     }
     const std::string key = ArchiveUnlockKey(entry);
-    return archive_seen_.contains(key) || key == "finished" || entry.section == ArchiveSection::Unused;
+    if (key == "photo:complete") {
+        bool all = true;
+        for (const char* piece : {"photo:PhotoLisa", "photo:PhotoTree", "photo:PhotoGap", "photo:PhotoBath", "photo:PhotoStair",
+                                  "photo:PhotoOption"}) {
+            all = all && archive_seen_.contains(piece);
+        }
+        if (all) return true;
+    }
+    return archive_seen_.contains(key) || key == "finished" || entry.unused;
+}
+
+std::vector<std::string> Game::BackfillArchive(uint32_t finishes) {
+    std::vector<std::string> granted;
+    if (finishes == 0) return granted;
+    for (const std::string_view key : ArchiveFinishKeys()) {
+        if (archive_seen_.insert(std::string(key)).second) granted.emplace_back(key);
+    }
+    std::sort(granted.begin(), granted.end());
+    std::string list;
+    for (const std::string& key : granted) list += (list.empty() ? "" : ", ") + key;
+    LogInfo("archive: retroactive unlock for a profile finished {} time(s) (Game+ tier {}): {} of {} keys every finished game reaches "
+            "granted{}{}", finishes, std::min<uint32_t>(finishes, 4), granted.size(), ArchiveFinishKeys().size(), granted.empty() ? "" : ": ", list);
+    if (!granted.empty()) ++archive_generation_;
+    return granted;
 }
 
 bool Game::ResetProgress() {
@@ -1746,6 +2088,7 @@ bool Game::ResetProgress() {
         save_store_.SetDirectory(config_.save_path.parent_path(),"PT_Save_Data");
         game_plus_=false;
         finishes_ = 0;
+        gameplus_announced_ = 0;
         floor_.SetSaveFloorName("f000");
         browse_save_suppressed_ = browse_waiting_entry_ = browse_door_placed_ = false;
         browse_arrived_ = true;
@@ -1762,7 +2105,7 @@ void Game::TearDownSession() {
     demos_.StopAll();
     nazo_.StopVoiceRecognition();
     if (audio_) {
-        audio_->StopAll();
+        audio_->ResetSession();
     }
     ClearPendingSubtitles();
     PostSound("Set_state_none", glm::vec3(0.0f), false);
@@ -1792,6 +2135,13 @@ void Game::ResetSessionState() {
     subtitle_requests_.clear();
     clear_subtitles_pending_ = true;
     EndStreetWalk();
+    if (lisa_rushes_ > 0) LogInfo("lisa date: rush count cleared (new session)");
+    lisa_rushes_ = 0;
+    LisaHintsOff("new session", false);
+    lisa_glint_ = 0.0f;
+    lisa_vignette_ = 0.0f;
+    lisa_rush_counted_ = false;
+    lisa_portrait_time_ = 0.0f;
     LogInfo("game: session state reset as at boot");
 }
 
@@ -1856,6 +2206,7 @@ void Game::ResetSaveBlocks() {
             options_.subtitle_language);
     game_plus_ = false;
     finishes_ = 0;
+    gameplus_announced_ = 0;
 }
 
 bool Game::BrowseLoop(int index) {
@@ -1890,7 +2241,7 @@ void Game::PrepareTheaterLoop(int index) {
     browse_arrived_ = index == 0;
     floor_.SetFloorLevel(loop.previous);
     floor_.ResetLoopCount();
-    if (index >= 9) nazo_.ForceClear(NazoId::XMark);
+    if (index >= BrowseIndexOf("f070", 1)) nazo_.ForceClear(NazoId::XMark);
     if (index >= 12) nazo_.ForceClear(NazoId::Hello);
     if (index >= 14) nazo_.ForceClear(NazoId::Peephole);
     nazo_.CancelPendingClearSound();
@@ -1906,7 +2257,7 @@ bool Game::ApplyBrowseReload() {
     nazo_.ResetAllStates();
     floor_.SetFloorLevel(loop.previous);
     floor_.ResetLoopCount();
-    if (browse_loop_ >= 9) nazo_.ForceClear(NazoId::XMark);
+    if (browse_loop_ >= BrowseIndexOf("f070", 1)) nazo_.ForceClear(NazoId::XMark);
     if (browse_loop_ >= 12) nazo_.ForceClear(NazoId::Hello);
     if (browse_loop_ >= 14) nazo_.ForceClear(NazoId::Peephole);
     nazo_.CancelPendingClearSound();
@@ -1932,6 +2283,7 @@ void Game::OnBrowseFloorEntered() {
     const auto& loop = kBrowseLoops[browse_loop_];
     floor_.SetFloorLevel(loop.floor);
     floor_.SetLoopCount(loop.pass);
+    nazo_.DeactivateUnset();
     browse_waiting_entry_ = false;
     browse_arrived_ = true;
     if (loop.floor == "f160") {
@@ -2013,6 +2365,11 @@ void Game::BrowseEnterHallway() {
 }
 
 void Game::RequestSave() {
+    if (saves_held_) {
+        save_deferred_ = true;
+        LogInfo("save: held while the date runs");
+        return;
+    }
     if (browse_save_suppressed_) {
         LogInfo("loop browser: save request suppressed until basement progression");
         return;
@@ -2027,6 +2384,7 @@ void Game::RequestSave() {
     file.progress.photo_word = nazo_.PhotoWord();
     file.progress.game_plus = game_plus_;
     file.progress.finishes = finishes_;
+    file.progress.gameplus_announced = gameplus_announced_;
     saved_progress_ = file.progress;
     ++save_io_count_;
     save_io_loading_ = false;
@@ -2068,6 +2426,11 @@ void Game::CloseSaveDialog() {
 }
 
 void Game::RequestOptionsSave() {
+    if (saves_held_) {
+        options_save_deferred_ = true;
+        LogInfo("save: options save held while the date runs");
+        return;
+    }
     if (!saved_progress_) {
         RequestSave();
         return;
@@ -2095,6 +2458,7 @@ void Game::RequestLoad() {
         options_ = file->options;
         game_plus_ = file->progress.game_plus;
         finishes_ = file->progress.finishes;
+        gameplus_announced_ = file->progress.gameplus_announced;
         floor_.SetFloorLevel(file->progress.floor);
         for (int i = 0; i < NazoManager::kCount; ++i) {
             const NazoId id = static_cast<NazoId>(i);
@@ -2130,6 +2494,7 @@ void Game::RequestLoad() {
         controller_.first_boot = false;
     }
     floor_.ResetLoopCount();
+    ++save_loads_;
 }
 
 }

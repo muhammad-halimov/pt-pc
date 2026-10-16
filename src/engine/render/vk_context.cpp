@@ -1,14 +1,34 @@
+#if defined(__APPLE__)
+#define VK_USE_PLATFORM_METAL_EXT 1
+#endif
+
 #include "engine/render/vk_context.h"
 
 #include <SDL3/SDL.h>
 #include <SDL3/SDL_vulkan.h>
 
 #include <algorithm>
+#include <chrono>
+#include <cstdlib>
 #include <cstring>
+#include <format>
 #include <string>
+
+#ifdef __APPLE__
+#include <dlfcn.h>
+
+#include <cstdlib>
+#include <filesystem>
+
+#include "engine/core/resource_path.h"
+#endif
 
 #include "engine/core/crash_report.h"
 #include "engine/core/log.h"
+#include "engine/platform/os.h"
+#include "engine/render/hdr_output.h"
+#include "engine/render/pipeline_cache_store.h"
+#include "engine/render/upscale/streamline.h"
 
 namespace pt {
 extern bool g_checkpoints;
@@ -16,6 +36,8 @@ extern bool g_checkpoints;
 
 namespace pt::vk {
 namespace {
+
+thread_local const char* g_alloc_tag = "other";
 
 VKAPI_ATTR VkBool32 VKAPI_CALL DebugCallback(VkDebugUtilsMessageSeverityFlagBitsEXT severity, VkDebugUtilsMessageTypeFlagsEXT,
                                              const VkDebugUtilsMessengerCallbackDataEXT* data, void*) {
@@ -68,9 +90,79 @@ bool HasLayer(const char* name) {
     return std::any_of(layers.begin(), layers.end(), [&](const VkLayerProperties& l) { return std::strcmp(l.layerName, name) == 0; });
 }
 
+#ifdef __APPLE__
+PFN_vkGetInstanceProcAddr LoadVulkanLibrary(SDL_Window* window) {
+    if (window) {
+        /* SDL loaded it for the window (SDL_HINT_VULKAN_LIBRARY): the same library, or the surface belongs to another instance */
+        if (auto proc = reinterpret_cast<PFN_vkGetInstanceProcAddr>(SDL_Vulkan_GetVkGetInstanceProcAddr())) return proc;
+    }
+    const std::string path = VulkanLibraryPath();
+    if (path.empty()) return nullptr;
+    void* library = dlopen(path.c_str(), RTLD_NOW | RTLD_LOCAL);
+    if (!library) {
+        LogError("vulkan: cannot load {} ({})", path, dlerror());
+        return nullptr;
+    }
+    return reinterpret_cast<PFN_vkGetInstanceProcAddr>(dlsym(library, "vkGetInstanceProcAddr"));
+}
+#endif
+
+bool HasInstanceExtension(const char* name) {
+    uint32_t count = 0;
+    vkEnumerateInstanceExtensionProperties(nullptr, &count, nullptr);
+    std::vector<VkExtensionProperties> available(count);
+    vkEnumerateInstanceExtensionProperties(nullptr, &count, available.data());
+    return std::any_of(available.begin(), available.end(), [&](const VkExtensionProperties& e) { return std::strcmp(e.extensionName, name) == 0; });
 }
 
-bool Context::Init(SDL_Window* window, bool validation) {
+#ifdef _WIN32
+void DisableCrashingImplicitLayers() {
+    if (const char* allow = std::getenv("PT_ALLOW_RTSS"); allow && *allow && *allow != '0') {
+        return;
+    }
+    const char* current = std::getenv("VK_LOADER_LAYERS_DISABLE");
+    std::string list = current ? current : "";
+    if (list.find("RTSS") == std::string::npos) {
+        list += list.empty() ? "*RTSS*" : ",*RTSS*";
+        _putenv_s("VK_LOADER_LAYERS_DISABLE", list.c_str());
+    }
+    _putenv_s("DISABLE_RTSS_LAYER", "1");
+}
+#endif
+
+}
+
+std::string VulkanLibraryPath() {
+#ifdef __APPLE__
+    /* the app bundle's Contents/Frameworks (ExecutableDir() is Contents/Resources there), or next to pt in a build folder;
+       PT_VULKAN_LIBRARY picks another one, such as the Vulkan SDK's loader for the validation layers */
+    static const std::string path = [] {
+        /* MoltenVK lists all its extensions at every start otherwise; MVK_CONFIG_LOG_LEVEL set by the user still wins */
+        setenv("MVK_CONFIG_LOG_LEVEL", "2", 0);
+        if (const char* env = std::getenv("PT_VULKAN_LIBRARY"); env && *env) return std::string(env);
+        const std::filesystem::path base = ExecutableDir();
+        std::error_code ec;
+        for (const std::filesystem::path& candidate :
+             {base / ".." / "Frameworks" / "libMoltenVK.dylib", base / "libMoltenVK.dylib", std::filesystem::path("/opt/homebrew/lib/libMoltenVK.dylib"),
+              std::filesystem::path("/usr/local/lib/libMoltenVK.dylib"), std::filesystem::path("/usr/local/lib/libvulkan.1.dylib")}) {
+            if (std::filesystem::is_regular_file(candidate, ec)) return std::filesystem::weakly_canonical(candidate, ec).string();
+        }
+        return std::string();
+    }();
+    return path;
+#else
+    return {};
+#endif
+}
+
+bool Context::Init(SDL_Window* window, bool validation, bool want_hdr) {
+    window_ = window;
+#ifdef __APPLE__
+    if (!loader) {
+        loader = LoadVulkanLibrary(window);
+        if (loader) LogInfo("vulkan: {}", VulkanLibraryPath());
+    }
+#endif
     if (loader) {
         /* With Streamline loaded, instance, device and swapchain must come from its proxies, so volk takes the interposer's loader instead of vulkan-1.dll. */
         volkInitializeCustom(loader);
@@ -92,6 +184,9 @@ bool Context::Init(SDL_Window* window, bool validation) {
         const char* const* names = SDL_Vulkan_GetInstanceExtensions(&count);
         extensions.assign(names, names + count);
     }
+    if (window && want_hdr && HasInstanceExtension(VK_EXT_SWAPCHAIN_COLOR_SPACE_EXTENSION_NAME)) {
+        extensions.push_back(VK_EXT_SWAPCHAIN_COLOR_SPACE_EXTENSION_NAME);
+    }
     std::vector<const char*> layers;
     if (validation && HasLayer("VK_LAYER_KHRONOS_validation")) {
         layers.push_back("VK_LAYER_KHRONOS_validation");
@@ -100,12 +195,24 @@ bool Context::Init(SDL_Window* window, bool validation) {
         validation = false;
     }
 
+#ifdef _WIN32
+    DisableCrashingImplicitLayers();
+#endif
     VkApplicationInfo app{VK_STRUCTURE_TYPE_APPLICATION_INFO};
     app.pApplicationName = "pt-port";
     app.pEngineName = "pt-port";
     app.apiVersion = VK_API_VERSION_1_3;
     VkInstanceCreateInfo instance_info{VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO};
     instance_info.pApplicationInfo = &app;
+#ifdef __APPLE__
+    /* MoltenVK is a portability driver: a Vulkan loader lists it only when asked to (SDL already names the extension for a window) */
+    if (HasInstanceExtension(VK_KHR_PORTABILITY_ENUMERATION_EXTENSION_NAME)) {
+        if (std::none_of(extensions.begin(), extensions.end(), [](const char* e) { return std::strcmp(e, VK_KHR_PORTABILITY_ENUMERATION_EXTENSION_NAME) == 0; })) {
+            extensions.push_back(VK_KHR_PORTABILITY_ENUMERATION_EXTENSION_NAME);
+        }
+        instance_info.flags |= VK_INSTANCE_CREATE_ENUMERATE_PORTABILITY_BIT_KHR;
+    }
+#endif
     instance_info.enabledExtensionCount = static_cast<uint32_t>(extensions.size());
     instance_info.ppEnabledExtensionNames = extensions.data();
     instance_info.enabledLayerCount = static_cast<uint32_t>(layers.size());
@@ -115,6 +222,12 @@ bool Context::Init(SDL_Window* window, bool validation) {
         instance_info.enabledExtensionCount = static_cast<uint32_t>(extensions.size());
         instance_info.ppEnabledExtensionNames = extensions.data();
     }
+#if defined(__APPLE__)
+    VkExportMetalObjectCreateInfoEXT export_device_info{VK_STRUCTURE_TYPE_EXPORT_METAL_OBJECT_CREATE_INFO_EXT};
+    export_device_info.exportObjectType = VK_EXPORT_METAL_OBJECT_TYPE_METAL_DEVICE_BIT_EXT;
+    export_device_info.pNext = instance_info.pNext;
+    instance_info.pNext = &export_device_info;
+#endif
     const VkResult instance_result = creator ? creator->CreateInstance(instance_info, instance) : vkCreateInstance(&instance_info, nullptr, &instance);
     if (!Check(instance_result, "vkCreateInstance")) {
         return false;
@@ -203,6 +316,41 @@ bool Context::Init(SDL_Window* window, bool validation) {
     }
     LogInfo("vulkan: using {} (driver {:X})", properties.deviceName, properties.driverVersion);
 
+#ifdef __APPLE__
+    {
+        /* MoltenVK on an older GPU (an Intel Mac's) can lack what the renderer needs, above all the bindless image array (Metal
+           argument buffers tier 2): say which feature, not just that the device could not be created (docs/macos.md) */
+        VkPhysicalDeviceVulkan13Features have13{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES};
+        VkPhysicalDeviceVulkan12Features have12{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES};
+        have12.pNext = &have13;
+        VkPhysicalDeviceFeatures2 have2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
+        have2.pNext = &have12;
+        vkGetPhysicalDeviceFeatures2(physical, &have2);
+        const struct { const char* name; VkBool32 value; } needed[] = {
+            {"dynamicRendering", have13.dynamicRendering}, {"synchronization2", have13.synchronization2},
+            {"shaderDemoteToHelperInvocation", have13.shaderDemoteToHelperInvocation},
+            {"descriptorIndexing", have12.descriptorIndexing}, {"runtimeDescriptorArray", have12.runtimeDescriptorArray},
+            {"shaderSampledImageArrayNonUniformIndexing", have12.shaderSampledImageArrayNonUniformIndexing},
+            {"descriptorBindingPartiallyBound", have12.descriptorBindingPartiallyBound},
+            {"descriptorBindingVariableDescriptorCount", have12.descriptorBindingVariableDescriptorCount},
+            {"descriptorBindingSampledImageUpdateAfterBind", have12.descriptorBindingSampledImageUpdateAfterBind},
+            {"timelineSemaphore", have12.timelineSemaphore},
+            {"descriptorBindingUpdateUnusedWhilePending", have12.descriptorBindingUpdateUnusedWhilePending},
+            {"descriptorBindingStorageBufferUpdateAfterBind", have12.descriptorBindingStorageBufferUpdateAfterBind},
+            {"scalarBlockLayout", have12.scalarBlockLayout}, {"samplerAnisotropy", have2.features.samplerAnisotropy},
+            {"textureCompressionBC", have2.features.textureCompressionBC}, {"fillModeNonSolid", have2.features.fillModeNonSolid},
+            {"shaderInt16", have2.features.shaderInt16}, {"shaderClipDistance", have2.features.shaderClipDistance},
+        };
+        bool complete = true;
+        for (const auto& feature : needed) {
+            if (!feature.value) {
+                LogError("vulkan: required feature {} is not available on {}", feature.name, properties.deviceName);
+                complete = false;
+            }
+        }
+        if (!complete) return false;
+    }
+#endif
     VkPhysicalDeviceVulkan13Features features13{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES};
     features13.dynamicRendering = VK_TRUE;
     features13.synchronization2 = VK_TRUE;
@@ -229,6 +377,8 @@ bool Context::Init(SDL_Window* window, bool validation) {
     VkPhysicalDeviceFeatures supported{};
     vkGetPhysicalDeviceFeatures(physical, &supported);
     features.features.independentBlend = supported.independentBlend;
+    features.features.depthBounds = supported.depthBounds;
+    depth_bounds = supported.depthBounds == VK_TRUE;
 
     const float priority = 1.0f;
     VkDeviceQueueCreateInfo queue_info{VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO};
@@ -246,6 +396,9 @@ bool Context::Init(SDL_Window* window, bool validation) {
     }
     ray_query_supported = RayQuerySupport(physical, ray_query_missing);
     VkPhysicalDeviceFaultFeaturesEXT fault_features{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FAULT_FEATURES_EXT};
+#ifdef __APPLE__
+    VkPhysicalDevicePortabilitySubsetFeaturesKHR portability{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PORTABILITY_SUBSET_FEATURES_KHR};
+#endif
     {
         uint32_t count = 0;
         vkEnumerateDeviceExtensionProperties(physical, nullptr, &count, nullptr);
@@ -259,13 +412,36 @@ bool Context::Init(SDL_Window* window, bool validation) {
                 device_extensions.push_back(name);
             }
         };
-        if (has(VK_EXT_MEMORY_BUDGET_EXTENSION_NAME)) {
+        /* a device that implements only part of Vulkan (MoltenVK on macOS) must be created with the extension that says so */
+        if (has("VK_KHR_portability_subset")) {
+            add("VK_KHR_portability_subset");
+#ifdef __APPLE__
+            /* the optional parts of the subset the device has (triangle fans, mip LOD bias, ...) are switched on, as the spec asks */
+            VkPhysicalDeviceFeatures2 query{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
+            query.pNext = &portability;
+            vkGetPhysicalDeviceFeatures2(physical, &query);
+            portability.pNext = features.pNext;
+            features.pNext = &portability;
+#endif
+        }
+#ifdef __APPLE__
+        /* Apple MetalFX (upscale/metalfx_backend.mm) exports the Vulkan targets' Metal textures through this extension */
+        if (has("VK_EXT_metal_objects")) {
+            add("VK_EXT_metal_objects");
+        }
+#endif
+        static const bool no_budget = [] { const char* v = std::getenv("PT_VK_NO_MEMORY_BUDGET"); return v && *v == '1'; }();
+        if (!no_budget && has(VK_EXT_MEMORY_BUDGET_EXTENSION_NAME)) {
             add(VK_EXT_MEMORY_BUDGET_EXTENSION_NAME);
             memory_budget = true;
         }
         if (has(VK_NV_DEVICE_DIAGNOSTIC_CHECKPOINTS_EXTENSION_NAME)) {
             add(VK_NV_DEVICE_DIAGNOSTIC_CHECKPOINTS_EXTENSION_NAME);
             checkpoints = true;
+        }
+        if (surface && has(VK_EXT_HDR_METADATA_EXTENSION_NAME)) {
+            add(VK_EXT_HDR_METADATA_EXTENSION_NAME);
+            hdr_metadata = true;
         }
         if (has(VK_EXT_DEVICE_FAULT_EXTENSION_NAME)) {
             VkPhysicalDeviceFaultFeaturesEXT query{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FAULT_FEATURES_EXT};
@@ -321,6 +497,44 @@ bool Context::Init(SDL_Window* window, bool validation) {
     vkGetDeviceQueue(device, queue_family, 0, &queue);
     g_checkpoints = checkpoints && vkCmdSetCheckpointNV;
 
+    const PipelineCacheIdentity cache_identity = PipelineCacheIdentityFor(properties);
+    const std::filesystem::path cache_path = pipeline_cache_dir.empty() ? std::filesystem::path{} : PipelineCacheFilePath(pipeline_cache_dir, cache_identity);
+    std::vector<uint8_t> initial_cache_data;
+    std::string cache_status;
+    const auto cache_load_start = std::chrono::steady_clock::now();
+    const bool cache_loaded = !cache_path.empty() && ReadPipelineCacheFile(cache_path, cache_identity, initial_cache_data, cache_status);
+    if (!cache_path.empty()) {
+        if (cache_loaded) {
+            LogInfo("vulkan: pipeline cache loaded {} bytes", initial_cache_data.size());
+        } else {
+            LogInfo("vulkan: pipeline cache cold start ({})", cache_status);
+        }
+    }
+    VkPipelineCacheCreateInfo cache_info{VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO};
+    cache_info.initialDataSize = cache_loaded ? initial_cache_data.size() : 0;
+    cache_info.pInitialData = cache_loaded && !initial_cache_data.empty() ? initial_cache_data.data() : nullptr;
+    VkResult cache_result = vkCreatePipelineCache(device, &cache_info, nullptr, &pipeline_cache);
+    if (cache_result != VK_SUCCESS && cache_loaded) {
+        LogWarn("vulkan: cached pipeline data was rejected by the driver ({})", vk::ResultName(cache_result));
+        cache_info.initialDataSize = 0;
+        cache_info.pInitialData = nullptr;
+        cache_result = vkCreatePipelineCache(device, &cache_info, nullptr, &pipeline_cache);
+    }
+    pipeline_cache_cold = !cache_path.empty() && (!cache_loaded || cache_info.initialDataSize == 0);
+    if (cache_result == VK_SUCCESS) {
+        RegisterPipelineCache(device, pipeline_cache);
+        if (!cache_path.empty()) {
+            pipeline_saver.Configure(device, pipeline_cache, cache_path, cache_identity,
+                                     cache_info.initialDataSize ? std::span<const uint8_t>(initial_cache_data) : std::span<const uint8_t>());
+        }
+    } else {
+        LogWarn("vulkan: pipeline cache unavailable ({})", vk::ResultName(cache_result));
+    }
+    if (!cache_path.empty()) {
+        const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - cache_load_start).count();
+        LogInfo("vulkan: pipeline cache initialization {} ms", elapsed);
+    }
+
     VmaVulkanFunctions functions{};
     functions.vkGetInstanceProcAddr = vkGetInstanceProcAddr;
     functions.vkGetDeviceProcAddr = vkGetDeviceProcAddr;
@@ -332,8 +546,26 @@ bool Context::Init(SDL_Window* window, bool validation) {
     allocator_info.device = device;
     allocator_info.instance = instance;
     allocator_info.pVulkanFunctions = &functions;
+    VkDeviceSize heap_limits[VK_MAX_MEMORY_HEAPS];
+    if (const char* budget = std::getenv("PT_VRAM_BUDGET_MB"); budget && std::atoi(budget) > 0) {
+        vram_budget_mb = static_cast<uint32_t>(std::atoi(budget));
+        VkPhysicalDeviceMemoryProperties memory{};
+        vkGetPhysicalDeviceMemoryProperties(physical, &memory);
+        for (uint32_t h = 0; h < VK_MAX_MEMORY_HEAPS; ++h) {
+            heap_limits[h] = h < memory.memoryHeapCount && (memory.memoryHeaps[h].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT)
+                                 ? VkDeviceSize(vram_budget_mb) * 1024 * 1024
+                                 : VK_WHOLE_SIZE;
+        }
+        allocator_info.pHeapSizeLimit = heap_limits;
+        LogWarn("vulkan: test video memory budget {} MB (PT_VRAM_BUDGET_MB): device local heaps limited", vram_budget_mb);
+    }
     if (!Check(vmaCreateAllocator(&allocator_info, &allocator), "vmaCreateAllocator")) {
         return false;
+    }
+    if (const char* fail = std::getenv("PT_ALLOC_FAIL"); fail && *fail) {
+        if (!SetAllocFailure(fail)) {
+            LogWarn("vulkan: PT_ALLOC_FAIL={} not understood (<n>, <n>+ or a probability)", fail);
+        }
     }
 
     VkCommandPoolCreateInfo pool_info{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
@@ -351,7 +583,46 @@ bool Context::Init(SDL_Window* window, bool validation) {
 void Context::Shutdown() {
     if (device) {
         vkDeviceWaitIdle(device);
+        if (pipeline_cache) {
+            pipeline_saver.Join();
+            if (!pipeline_cache_dir.empty()) {
+                std::vector<uint8_t> data;
+                VkResult result;
+                {
+                    std::lock_guard lock(PipelineCacheCreationMutex());
+                    size_t size = 0;
+                    result = vkGetPipelineCacheData(device, pipeline_cache, &size, nullptr);
+                    if (result == VK_SUCCESS && size <= kMaxPipelineCacheBytes) {
+                        data.resize(size);
+                        result = vkGetPipelineCacheData(device, pipeline_cache, &size, data.data());
+                        if (result == VK_SUCCESS) data.resize(size);
+                    } else if (result == VK_SUCCESS) {
+                        result = VK_ERROR_OUT_OF_HOST_MEMORY;
+                        LogWarn("vulkan: pipeline cache is larger than 64 MiB; previous file kept");
+                    }
+                }
+                if (result == VK_SUCCESS) {
+                    std::string status;
+                    const PipelineCacheIdentity identity = PipelineCacheIdentityFor(properties);
+                    const std::filesystem::path path = PipelineCacheFilePath(pipeline_cache_dir, identity);
+                    if (WritePipelineCacheFileAtomic(path, identity, data, status)) {
+                        LogInfo("vulkan: pipeline cache saved {} bytes", data.size());
+                    } else {
+                        LogWarn("vulkan: pipeline cache not saved ({})", status);
+                    }
+                } else {
+                    LogWarn("vulkan: could not read pipeline cache ({})", vk::ResultName(result));
+                }
+            }
+            const PipelineCreationStats stats = PipelineStats(device);
+            LogInfo("vulkan: pipeline creation took {:.2f} s ({} graphics, {} compute)", stats.duration_ns / 1.0e9,
+                    stats.graphics_count, stats.compute_count);
+            UnregisterPipelineCache(device);
+            vkDestroyPipelineCache(device, pipeline_cache, nullptr);
+            pipeline_cache = VK_NULL_HANDLE;
+        }
         DestroySwapchain();
+        ReapDeferred(true);
         if (upload_pool_) {
             vkDestroyCommandPool(device, upload_pool_, nullptr);
         }
@@ -376,22 +647,55 @@ void Context::Shutdown() {
     instance = VK_NULL_HANDLE;
 }
 
-bool Context::CreateSwapchain(uint32_t width, uint32_t height, bool vsync) {
+bool Context::CreateSwapchain(uint32_t width, uint32_t height, bool vsync, bool want_hdr) {
     vkDeviceWaitIdle(device);
-    vsync = vsync && !force_vsync_off;
+    swapchain_refused = false;
+    vsync = force_vsync ? true : (vsync && !force_vsync_off);
     VkSurfaceCapabilitiesKHR caps;
     vkGetPhysicalDeviceSurfaceCapabilitiesKHR(physical, surface, &caps);
     uint32_t format_count = 0;
     vkGetPhysicalDeviceSurfaceFormatsKHR(physical, surface, &format_count, nullptr);
     std::vector<VkSurfaceFormatKHR> formats(format_count);
-    vkGetPhysicalDeviceSurfaceFormatsKHR(physical, surface, &format_count, formats.data());
-    VkSurfaceFormatKHR chosen = formats[0];
-    for (const auto& f : formats) {
-        if ((f.format == VK_FORMAT_B8G8R8A8_UNORM || f.format == VK_FORMAT_R8G8B8A8_UNORM) && f.colorSpace == VK_COLOR_SPACE_SRGB_NONLINEAR_KHR) {
-            chosen = f;
-            break;
+    if (format_count > 0) vkGetPhysicalDeviceSurfaceFormatsKHR(physical, surface, &format_count, formats.data());
+    VkSurfaceFormatKHR chosen{};
+    bool hdr_selected = false;
+    if (want_hdr) {
+        std::string offered;
+        for (const VkSurfaceFormatKHR& f : formats) {
+            offered += std::format(" {}/{}", static_cast<int>(f.format), static_cast<int>(f.colorSpace));
+        }
+        LogInfo("vulkan: HDR requested{}; surface formats (format/color space):{}", swapchain_hooks ? ", but frame generation's swapchain is SDR only" : "",
+                offered);
+    }
+#ifdef _WIN32
+    static const bool ignore_display = std::getenv("PT_HDR_IGNORE_DISPLAY") != nullptr;
+    if (want_hdr && window_ && !ignore_display) {
+        void* hwnd = SDL_GetPointerProperty(SDL_GetWindowProperties(window_), SDL_PROP_WINDOW_WIN32_HWND_POINTER, nullptr);
+        const std::optional<pt::os::DisplayHdrInfo> display_info = pt::os::WindowDisplayHdrInfo(hwnd);
+        const std::optional<bool> display_hdr = display_info ? std::optional<bool>(display_info->hdr) : std::nullopt;
+        if (display_info) {
+            display_peak_nits = display_info->max_luminance;
+            hdr_min_nits = display_info->min_luminance;
+        }
+        if (display_hdr && !*display_hdr) {
+            if (!hdr_off_logged_) {
+                LogWarn("vulkan: HDR is on in the game but off for this display in Windows (Settings > Display > Use HDR): SDR is used");
+                hdr_off_logged_ = true;
+            }
+            want_hdr = false;
+        } else {
+            LogInfo("vulkan: Windows HDR for this display: {}, it reports {:.0f} nits at most", display_hdr ? "on" : "unknown", display_peak_nits);
         }
     }
+#endif
+    bool dlss_fg_loaded = false;
+    const bool allow_scrgb = !streamline::Active() || (streamline::IsFrameGenLoaded(dlss_fg_loaded) && !dlss_fg_loaded);
+    if (!ChooseSwapchainSurfaceFormat(formats, want_hdr, !swapchain_hooks, chosen, hdr_selected, allow_scrgb)) {
+        LogError("vulkan: surface has no supported SDR or HDR color format");
+        return false;
+    }
+    LogInfo("vulkan: swapchain format {} color space {}{}", static_cast<int>(chosen.format), static_cast<int>(chosen.colorSpace),
+            hdr_selected ? " (HDR)" : " (SDR)");
     uint32_t mode_count = 0;
     vkGetPhysicalDeviceSurfacePresentModesKHR(physical, surface, &mode_count, nullptr);
     std::vector<VkPresentModeKHR> modes(mode_count);
@@ -439,19 +743,23 @@ bool Context::CreateSwapchain(uint32_t width, uint32_t height, bool vsync) {
         const VkResult result =
             swapchain_hooks ? swapchain_hooks->CreateSwapchain(info, handle) : vkCreateSwapchainKHR(device, &info, nullptr, &handle);
         if (!Check(result, "vkCreateSwapchainKHR")) {
+            swapchain_refused = true;
             return false;
         }
         swapchain_owner_ = swapchain_hooks;
     } else {
         if (!Check(vkCreateSwapchainKHR(device, &info, nullptr, &handle), "vkCreateSwapchainKHR")) {
+            swapchain_refused = true;
             return false;
         }
         DestroySwapchain();
     }
     swapchain.handle = handle;
     swapchain.format = chosen.format;
+    swapchain.color_space = chosen.colorSpace;
     swapchain.extent = extent;
     swapchain.min_image_count = image_count;
+    SetHdrMetadata();
     uint32_t count = 0;
     if (swapchain_owner_) {
         swapchain_owner_->SwapchainImages(handle, &count, nullptr);
@@ -477,6 +785,37 @@ bool Context::CreateSwapchain(uint32_t width, uint32_t height, bool vsync) {
         swapchain.render_finished.push_back(semaphore);
     }
     return true;
+}
+
+float Context::HdrPeakNits() const {
+    return render::ResolveHdrPeak(static_cast<float>(hdr_peak_setting), display_peak_nits);
+}
+
+void Context::SetHdrMetadata() {
+    const bool scrgb = swapchain.color_space == VK_COLOR_SPACE_EXTENDED_SRGB_LINEAR_EXT;
+    const bool hdr10 = swapchain.color_space == VK_COLOR_SPACE_HDR10_ST2084_EXT;
+    if (!hdr_metadata || !vkSetHdrMetadataEXT || !swapchain.handle || swapchain_owner_ || !(scrgb || hdr10)) {
+        return;
+    }
+    VkHdrMetadataEXT metadata{VK_STRUCTURE_TYPE_HDR_METADATA_EXT};
+    if (hdr10) {
+        metadata.displayPrimaryRed = {0.708f, 0.292f};
+        metadata.displayPrimaryGreen = {0.170f, 0.797f};
+        metadata.displayPrimaryBlue = {0.131f, 0.046f};
+    } else {
+        metadata.displayPrimaryRed = {0.640f, 0.330f};
+        metadata.displayPrimaryGreen = {0.300f, 0.600f};
+        metadata.displayPrimaryBlue = {0.150f, 0.060f};
+    }
+    metadata.whitePoint = {0.3127f, 0.3290f};
+    const float peak = HdrPeakNits();
+    metadata.maxLuminance = peak;
+    metadata.minLuminance = hdr_min_nits;
+    metadata.maxContentLightLevel = peak;
+    metadata.maxFrameAverageLightLevel = hdr_paper_nits;
+    vkSetHdrMetadataEXT(device, 1, &swapchain.handle, &metadata);
+    LogInfo("vulkan: HDR metadata set: peak {:.0f} nits (display reports {:.0f}), paper white {:.0f} nits ({})", peak, display_peak_nits,
+            hdr_paper_nits, hdr10 ? "HDR10" : "scRGB");
 }
 
 void Context::DestroySwapchain() {
@@ -568,11 +907,27 @@ bool Context::CreateImage(Image& out, VkFormat format, VkExtent3D extent, VkImag
     info.tiling = VK_IMAGE_TILING_OPTIMAL;
     info.usage = usage;
     info.flags = cube ? VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT : 0;
+#if defined(__APPLE__)
+    VkExportMetalObjectCreateInfoEXT export_info{VK_STRUCTURE_TYPE_EXPORT_METAL_OBJECT_CREATE_INFO_EXT};
+    export_info.exportObjectType = VK_EXPORT_METAL_OBJECT_TYPE_METAL_TEXTURE_BIT_EXT;
+    export_info.pNext = info.pNext;
+    info.pNext = &export_info;
+#endif
     VmaAllocationCreateInfo alloc{};
     alloc.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE;
-    if (!Check(vmaCreateImage(allocator, &info, &alloc, &out.image, &out.allocation, nullptr), "vmaCreateImage")) {
+    if (vram_budget_mb) alloc.requiredFlags = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
+    out = Image{};
+    if (InjectFailure("vmaCreateImage")) {
         return false;
     }
+    if (const VkResult r = vmaCreateImage(allocator, &info, &alloc, &out.image, &out.allocation, nullptr); r != VK_SUCCESS) {
+        out = Image{};
+        LogAllocationFailure("vmaCreateImage", r,
+                             std::format("{}x{}x{} format {} mips {} layers {}", extent.width, extent.height, extent.depth,
+                                         static_cast<int>(format), mip_levels, layers));
+        return false;
+    }
+    TrackAllocation(out.allocation);
     VkImageViewCreateInfo view_info{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
     view_info.image = out.image;
     view_info.viewType = cube ? VK_IMAGE_VIEW_TYPE_CUBE
@@ -584,7 +939,12 @@ bool Context::CreateImage(Image& out, VkFormat format, VkExtent3D extent, VkImag
     out.mip_levels = mip_levels;
     out.layers = layers;
     out.usage = usage;
-    return Check(vkCreateImageView(device, &view_info, nullptr, &out.view), "vkCreateImageView");
+    if (!Check(vkCreateImageView(device, &view_info, nullptr, &out.view), "vkCreateImageView")) {
+        out.view = VK_NULL_HANDLE;
+        DestroyImage(out);
+        return false;
+    }
+    return true;
 }
 
 void Context::DestroyImage(Image& image) {
@@ -592,9 +952,24 @@ void Context::DestroyImage(Image& image) {
         vkDestroyImageView(device, image.view, nullptr);
     }
     if (image.image) {
+        UntrackAllocation(image.allocation);
         vmaDestroyImage(allocator, image.image, image.allocation);
     }
     image = Image{};
+}
+
+bool Context::CreateImage(gpu::ImageResource& out, VkFormat format, VkExtent3D extent, VkImageUsageFlags usage, uint32_t mip_levels,
+                          uint32_t layers, VkImageAspectFlags aspect, bool cube) {
+    Image image;
+    const bool ok = CreateImage(image, format, extent, usage, mip_levels, layers, aspect, cube);
+    out = image;
+    return ok;
+}
+
+void Context::DestroyImage(gpu::ImageResource& image) {
+    Image native = FromGpu(image);
+    DestroyImage(native);
+    image = native;
 }
 
 bool Context::CreateBuffer(Buffer& out, VkDeviceSize size, VkBufferUsageFlags usage, bool host_visible) {
@@ -605,21 +980,182 @@ bool Context::CreateBuffer(Buffer& out, VkDeviceSize size, VkBufferUsageFlags us
     alloc.usage = VMA_MEMORY_USAGE_AUTO;
     if (host_visible) {
         alloc.flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT | VMA_ALLOCATION_CREATE_MAPPED_BIT;
+    } else if (vram_budget_mb) {
+        alloc.requiredFlags = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
     }
-    VmaAllocationInfo result{};
-    if (!Check(vmaCreateBuffer(allocator, &info, &alloc, &out.buffer, &out.allocation, &result), "vmaCreateBuffer")) {
+    out = Buffer{};
+    if (InjectFailure("vmaCreateBuffer")) {
         return false;
     }
+    VmaAllocationInfo result{};
+    if (const VkResult r = vmaCreateBuffer(allocator, &info, &alloc, &out.buffer, &out.allocation, &result); r != VK_SUCCESS) {
+        out = Buffer{};
+        LogAllocationFailure("vmaCreateBuffer", r,
+                             std::format("{:.2f} MB usage {:#x}{}", static_cast<double>(size) / 1048576.0, usage, host_visible ? " host visible" : ""));
+        return false;
+    }
+    TrackAllocation(out.allocation);
     out.mapped = result.pMappedData;
     out.size = size;
+    if (host_visible && !out.mapped) {
+        LogError("vulkan: host visible buffer of {} bytes is not mapped", size);
+        DestroyBuffer(out);
+        return false;
+    }
     return true;
 }
 
 void Context::DestroyBuffer(Buffer& buffer) {
     if (buffer.buffer) {
+        UntrackAllocation(buffer.allocation);
         vmaDestroyBuffer(allocator, buffer.buffer, buffer.allocation);
     }
     buffer = Buffer{};
+}
+
+AllocTag::AllocTag(const char* tag) : previous_(g_alloc_tag) {
+    g_alloc_tag = tag;
+}
+
+AllocTag::~AllocTag() {
+    g_alloc_tag = previous_;
+}
+
+bool Context::SetAllocFailure(std::string_view spec) {
+    std::lock_guard lock(alloc_mutex_);
+    fail_at_ = 0;
+    fail_after_ = false;
+    fail_rate_ = 0.0;
+    if (spec.empty() || spec == "0") {
+        LogInfo("vulkan: allocation failure injection off");
+        return true;
+    }
+    const std::string text(spec);
+    char* end = nullptr;
+    if (text.find('.') != std::string::npos) {
+        const double rate = std::strtod(text.c_str(), &end);
+        if (end == text.c_str() || *end || rate <= 0.0 || rate > 1.0) return false;
+        fail_rate_ = rate;
+        LogWarn("vulkan: allocation failure injection: each allocation fails with probability {}", rate);
+        return true;
+    }
+    const unsigned long long n = std::strtoull(text.c_str(), &end, 10);
+    if (end == text.c_str() || n == 0 || (*end && !(end[0] == '+' && end[1] == 0))) return false;
+    fail_at_ = alloc_calls_ + n;
+    fail_after_ = *end == '+';
+    LogWarn("vulkan: allocation failure injection: allocation {}{} from now (call {}) fails", n, fail_after_ ? " and every later one" : "",
+            fail_at_);
+    return true;
+}
+
+bool Context::InjectFailure(const char* what) {
+    std::lock_guard lock(alloc_mutex_);
+    const uint64_t call = ++alloc_calls_;
+    bool fail = false;
+    if (fail_at_) {
+        fail = fail_after_ ? call >= fail_at_ : call == fail_at_;
+    } else if (fail_rate_ > 0.0) {
+        fail_rng_ ^= fail_rng_ >> 12;
+        fail_rng_ ^= fail_rng_ << 25;
+        fail_rng_ ^= fail_rng_ >> 27;
+        const double u = static_cast<double>((fail_rng_ * 0x2545F4914F6CDD1Dull) >> 11) / 9007199254740992.0;
+        fail = u < fail_rate_;
+    }
+    if (fail) {
+        LogWarn("vulkan: {} call {} failed on purpose (allocation failure injection, tag {})", what, call, g_alloc_tag);
+    }
+    return fail;
+}
+
+void Context::TrackAllocation(VmaAllocation allocation) {
+    VmaAllocationInfo info{};
+    vmaGetAllocationInfo(allocator, allocation, &info);
+    std::lock_guard lock(alloc_mutex_);
+    tracked_[allocation] = Tracked{g_alloc_tag, info.size, info.memoryType};
+}
+
+void Context::UntrackAllocation(VmaAllocation allocation) {
+    std::lock_guard lock(alloc_mutex_);
+    tracked_.erase(allocation);
+}
+
+VkDeviceSize Context::DeviceLocalBytes() const {
+    const VkPhysicalDeviceMemoryProperties* memory = nullptr;
+    vmaGetMemoryProperties(allocator, &memory);
+    VkDeviceSize local = 0;
+    for (uint32_t h = 0; memory && h < memory->memoryHeapCount; ++h) {
+        if (memory->memoryHeaps[h].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) local = std::max(local, memory->memoryHeaps[h].size);
+    }
+    return local;
+}
+
+void Context::DeviceLocalUsage(double& used, double& budget) const {
+    used = budget = 0.0;
+    if (!allocator) return;
+    VmaBudget budgets[VK_MAX_MEMORY_HEAPS] = {};
+    vmaGetHeapBudgets(allocator, budgets);
+    const VkPhysicalDeviceMemoryProperties* memory = nullptr;
+    vmaGetMemoryProperties(allocator, &memory);
+    for (uint32_t h = 0; memory && h < memory->memoryHeapCount; ++h) {
+        if (memory->memoryHeaps[h].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) {
+            used += static_cast<double>(budgets[h].usage);
+            budget += static_cast<double>(budgets[h].budget);
+        }
+    }
+}
+
+void Context::LogMemoryReport(const char* reason) {
+    if (!allocator) return;
+    const VkPhysicalDeviceMemoryProperties* memory = nullptr;
+    vmaGetMemoryProperties(allocator, &memory);
+    double used = 0.0;
+    double budget = 0.0;
+    DeviceLocalUsage(used, budget);
+    struct Sum {
+        double local = 0.0;
+        double system = 0.0;
+        uint32_t count = 0;
+    };
+    std::vector<std::pair<std::string, Sum>> sums;
+    {
+        std::lock_guard lock(alloc_mutex_);
+        for (const auto& [allocation, t] : tracked_) {
+            auto it = std::find_if(sums.begin(), sums.end(), [&](const auto& s) { return s.first == t.tag; });
+            if (it == sums.end()) {
+                sums.emplace_back(t.tag, Sum{});
+                it = sums.end() - 1;
+            }
+            const bool local = memory && t.memory_type < memory->memoryTypeCount &&
+                               (memory->memoryHeaps[memory->memoryTypes[t.memory_type].heapIndex].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT);
+            (local ? it->second.local : it->second.system) += static_cast<double>(t.size) / 1048576.0;
+            ++it->second.count;
+        }
+    }
+    std::sort(sums.begin(), sums.end(), [](const auto& a, const auto& b) { return a.second.local > b.second.local; });
+    std::string parts;
+    for (const auto& [tag, sum] : sums) {
+        parts += std::format("{}{} {:.0f} MB ({}{})", parts.empty() ? "" : ", ", tag, sum.local, sum.count,
+                             sum.system >= 0.5 ? std::format(", {:.0f} MB system", sum.system) : std::string());
+    }
+    LogInfo("vulkan: video memory ({}): device local {:.0f} of {:.0f} MB budget; allocations in video memory: {}", reason, used / 1048576.0,
+            budget / 1048576.0, parts);
+}
+
+void Context::LogAllocationFailure(const char* what, VkResult result, const std::string& detail) {
+    const auto now = std::chrono::steady_clock::now();
+    ++failures_logged_;
+    if (failures_logged_ <= 64 || now - last_failure_line_ >= std::chrono::seconds(1)) {
+        LogError("vulkan: {} failed: {} ({}) for {} (tag {}){}", what, ResultName(result), static_cast<int>(result), detail, g_alloc_tag,
+                 failures_hidden_ ? std::format(", {} more failures since the last line", failures_hidden_) : std::string());
+        last_failure_line_ = now;
+        failures_hidden_ = 0;
+    } else {
+        ++failures_hidden_;
+    }
+    if (last_failure_report_.time_since_epoch().count() == 0 || now - last_failure_report_ > std::chrono::seconds(10)) {
+        last_failure_report_ = now;
+        LogMemoryReport("allocation failed");
+    }
 }
 
 void Context::Submit(const std::function<void(VkCommandBuffer)>& record) {
@@ -646,6 +1182,52 @@ void Context::Submit(const std::function<void(VkCommandBuffer)>& record) {
     CheckDeviceLost(vkWaitForFences(device, 1, &fence, VK_TRUE, UINT64_MAX), "one-time submit wait");
     vkDestroyFence(device, fence, nullptr);
     vkFreeCommandBuffers(device, upload_pool_, 1, &cmd);
+}
+
+void Context::SubmitDeferred(const std::function<void(VkCommandBuffer)>& record, Buffer staging) {
+    ReapDeferred(false);
+    while (!deferred_.empty() && deferred_bytes_ + staging.size > kDeferredStagingLimit) {
+        DeferredSubmit& oldest = deferred_.front();
+        CheckDeviceLost(vkWaitForFences(device, 1, &oldest.fence, VK_TRUE, UINT64_MAX), "deferred submit wait");
+        ReapDeferred(false);
+    }
+    VkCommandBufferAllocateInfo alloc{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
+    alloc.commandPool = upload_pool_;
+    alloc.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+    alloc.commandBufferCount = 1;
+    DeferredSubmit pending;
+    pending.staging = staging;
+    vkAllocateCommandBuffers(device, &alloc, &pending.cmd);
+    VkCommandBufferBeginInfo begin{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+    begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    vkBeginCommandBuffer(pending.cmd, &begin);
+    record(pending.cmd);
+    vkEndCommandBuffer(pending.cmd);
+    VkCommandBufferSubmitInfo cmd_info{VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO};
+    cmd_info.commandBuffer = pending.cmd;
+    VkSubmitInfo2 submit{VK_STRUCTURE_TYPE_SUBMIT_INFO_2};
+    submit.commandBufferInfoCount = 1;
+    submit.pCommandBufferInfos = &cmd_info;
+    VkFenceCreateInfo fence_info{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
+    vkCreateFence(device, &fence_info, nullptr, &pending.fence);
+    CheckDeviceLost(vkQueueSubmit2(queue, 1, &submit, pending.fence), "deferred submit");
+    deferred_bytes_ += staging.size;
+    deferred_.push_back(pending);
+}
+
+void Context::ReapDeferred(bool wait) {
+    std::erase_if(deferred_, [&](DeferredSubmit& pending) {
+        if (wait) {
+            CheckDeviceLost(vkWaitForFences(device, 1, &pending.fence, VK_TRUE, UINT64_MAX), "deferred submit wait");
+        } else if (vkGetFenceStatus(device, pending.fence) != VK_SUCCESS) {
+            return false;
+        }
+        vkDestroyFence(device, pending.fence, nullptr);
+        vkFreeCommandBuffers(device, upload_pool_, 1, &pending.cmd);
+        deferred_bytes_ -= std::min(deferred_bytes_, pending.staging.size);
+        DestroyBuffer(pending.staging);
+        return true;
+    });
 }
 
 bool Context::Upload(Buffer& dst, const void* data, VkDeviceSize size) {

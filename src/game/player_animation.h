@@ -124,6 +124,8 @@ private:
 };
 
 bool LoadPlayerAnimation(Vfs& vfs);
+using PlayerPoseEdit = std::function<void(const anim::Skeleton& skeleton, std::vector<glm::mat4>& world)>;
+bool PlayerPoseSkin(const anim::HelpBones* help, float frame, const PlayerPoseEdit& edit, std::vector<glm::mat4>& skin);
 const PlayerLocomotion& PlayerLocomotionData();
 int WalkDirection(float heading_delta);
 bool LastFootLeft(bool fallback);

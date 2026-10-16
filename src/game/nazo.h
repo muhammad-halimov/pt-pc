@@ -45,6 +45,7 @@ public:
     uint32_t Word(NazoId id) const { return word_[Index(id)]; }
     NazoState State(NazoId id) const;
     void ResetAllStates();
+    void DeactivateUnset();
     void ResetSession();
     std::string DescribeSession() const;
     void CancelPendingClearSound() { clear_sound_pending_ = false; }
@@ -53,6 +54,7 @@ public:
     bool IsPeepholeTheaterActive() const { return (word_[2] & 8) != 0; }
     void AbortPeephole();
     bool PeepholePosition(glm::vec3& out) const { return AssetPosition("Peephole", out); }
+    bool PeepholeTransform(glm::mat4& out) const;
     bool ControlAssetPosition(std::string_view name, glm::vec3& out) const { return AssetPosition(name, out); }
     bool PeepholeEye(glm::vec3& out) const {
         if (!peephole_eye_valid_ || !IsPeepholeTheaterActive()) return false;

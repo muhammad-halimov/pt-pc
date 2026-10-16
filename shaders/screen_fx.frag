@@ -47,6 +47,10 @@ void main() {
         vec3 sharpened=color+(color-(a+b+c+d)*.25)*pass.f1.x;
         color=clamp(sharpened,max(vec3(0),lo-(mx-lo)*.1),min(vec3(1),mx+(mx-lo)*.1));
     }
+    if(pass.f1.y<=0.0) {
+        out_color=vec4(color,1.0);
+        return;
+    }
     vec3 seed = fract(vec3(gl_FragCoord.xyx) * vec3(0.1031, 0.1030, 0.0973));
     seed += dot(seed, seed.yxz + 33.33);
     float noise = fract((seed.x + seed.y) * seed.z) - 0.5;

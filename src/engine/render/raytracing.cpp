@@ -1,7 +1,9 @@
 #include "engine/render/raytracing.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cstring>
+#include <unordered_set>
 
 #include "engine/core/log.h"
 #include "engine/render/render_util.h"
@@ -47,29 +49,56 @@ void MemoryBarrier(VkCommandBuffer cmd, VkPipelineStageFlags2 src_stage, VkAcces
     vkCmdPipelineBarrier2(cmd, &dependency);
 }
 
+RayTracingFactory g_d3d12_factory = nullptr;
+
 }
 
-bool RayTracing::Init(vk::Context& ctx, VkDescriptorSetLayout textures_layout, VkDescriptorSetLayout frame_layout) {
+void SetD3D12RayTracingFactory(RayTracingFactory factory) {
+    g_d3d12_factory = factory;
+}
+
+bool D3D12RayTracingAvailable() {
+    return g_d3d12_factory != nullptr;
+}
+
+std::unique_ptr<RayTracing> CreateRayTracing(gpu::Device& device) {
+    if (device.Info().backend == gpu::Backend::Vulkan) {
+        return std::make_unique<VkRayTracing>();
+    }
+    return g_d3d12_factory ? g_d3d12_factory(device) : nullptr;
+}
+
+bool VkRayTracing::Init(gpu::Device& device, gpu::BindingLayoutHandle textures_set_layout, gpu::BindingLayoutHandle frame_set_layout) {
+    vk::Context& ctx = static_cast<gpu::vk::Device&>(device).Context();
+    const VkDescriptorSetLayout textures_layout = gpu::vk::Native(textures_set_layout);
+    const VkDescriptorSetLayout frame_layout = gpu::vk::Native(frame_set_layout);
     ctx_ = &ctx;
     device_ = ctx.device;
     constexpr VkShaderStageFlags kStages = VK_SHADER_STAGE_FRAGMENT_BIT | VK_SHADER_STAGE_COMPUTE_BIT;
-    VkDescriptorSetLayoutBinding bindings[3 + kAoImages]{};
+    constexpr uint32_t kBindings = 4 + kAoImages + 2 + 3;
+    VkDescriptorSetLayoutBinding bindings[kBindings]{};
     bindings[0] = {0, VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, 1, kStages, nullptr};
     bindings[1] = {1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, kStages, nullptr};
     bindings[2] = {2, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr};
     for (uint32_t i = 0; i < kAoImages; ++i) {
         bindings[3 + i] = {3 + i, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, kStages, nullptr};
     }
+    bindings[3 + kAoImages] = {3 + kAoImages, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, kStages, nullptr};
+    bindings[4 + kAoImages] = {4 + kAoImages, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, kFullImages - kFullDepthImages, kStages, nullptr};
+    bindings[5 + kAoImages] = {5 + kAoImages, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, kFullDepthImages, kStages, nullptr};
+    bindings[6 + kAoImages] = {6 + kAoImages, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, kPathImages32, kStages, nullptr};
+    bindings[7 + kAoImages] = {7 + kAoImages, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, kPathImages16, kStages, nullptr};
+    bindings[8 + kAoImages] = {8 + kAoImages, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, kStages, nullptr};
     VkDescriptorSetLayoutCreateInfo layout_info{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
-    layout_info.bindingCount = 3 + kAoImages;
+    layout_info.bindingCount = kBindings;
     layout_info.pBindings = bindings;
     if (!vk::Check(vkCreateDescriptorSetLayout(device_, &layout_info, nullptr, &set_layout_), "ray tracing set layout")) {
         return false;
     }
     const VkDescriptorPoolSize sizes[4] = {{VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, Renderer::kFramesInFlight},
-                                           {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, Renderer::kFramesInFlight},
+                                           {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 3 * Renderer::kFramesInFlight},
                                            {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, Renderer::kFramesInFlight},
-                                           {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, kAoImages * Renderer::kFramesInFlight}};
+                                           {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, (kAoImages + kFullImages + kPathImages32 + kPathImages16) * Renderer::kFramesInFlight}};
     VkDescriptorPoolCreateInfo pool_info{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
     pool_info.maxSets = Renderer::kFramesInFlight;
     pool_info.poolSizeCount = 4;
@@ -85,6 +114,26 @@ bool RayTracing::Init(vk::Context& ctx, VkDescriptorSetLayout textures_layout, V
         if (!vk::Check(vkAllocateDescriptorSets(device_, &alloc, &slot.set), "ray tracing descriptor set")) {
             return false;
         }
+        const vk::AllocTag tag("ray tracing");
+        if (!ctx.CreateBuffer(slot.light_state, sizeof(glm::vec4) * gpu::kMaxLights, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT, false)) {
+            return false;
+        }
+        VkDescriptorBufferInfo state{slot.light_state.buffer, 0, VK_WHOLE_SIZE};
+        VkWriteDescriptorSet write{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+        write.dstSet = slot.set;
+        write.dstBinding = 3 + kAoImages;
+        write.descriptorCount = 1;
+        write.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        write.pBufferInfo = &state;
+        vkUpdateDescriptorSets(device_, 1, &write, 0, nullptr);
+        if (!ctx.CreateBuffer(slot.path_remap, sizeof(uint32_t) * gpu::kMaxLights, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, true)) {
+            return false;
+        }
+        std::fill_n(static_cast<uint32_t*>(slot.path_remap.mapped), gpu::kMaxLights, ~0u);
+        VkDescriptorBufferInfo remap{slot.path_remap.buffer, 0, VK_WHOLE_SIZE};
+        write.dstBinding = 8 + kAoImages;
+        write.pBufferInfo = &remap;
+        vkUpdateDescriptorSets(device_, 1, &write, 0, nullptr);
     }
     const VkDescriptorSetLayout sets[3] = {textures_layout, frame_layout, set_layout_};
     const VkPushConstantRange push{kPushStages, 0, 128};
@@ -104,7 +153,7 @@ bool RayTracing::Init(vk::Context& ctx, VkDescriptorSetLayout textures_layout, V
     return true;
 }
 
-void RayTracing::Shutdown() {
+void VkRayTracing::Shutdown() {
     if (!device_) {
         return;
     }
@@ -126,7 +175,8 @@ void RayTracing::Shutdown() {
         if (slot.tlas) {
             vkDestroyAccelerationStructureKHR(device_, slot.tlas, nullptr);
         }
-        vk::Buffer* buffers[] = {&slot.instances, &slot.records, &slot.tlas_buffer, &slot.scratch, &slot.positions, &slot.dynamic_storage};
+        vk::Buffer* buffers[] = {&slot.instances, &slot.records, &slot.tlas_buffer, &slot.scratch, &slot.positions, &slot.dynamic_storage,
+                                 &slot.light_state, &slot.path_remap};
         for (vk::Buffer* b : buffers) {
             ctx_->DestroyBuffer(*b);
         }
@@ -148,7 +198,7 @@ void RayTracing::Shutdown() {
     device_ = VK_NULL_HANDLE;
 }
 
-void RayTracing::Forget(const GpuMesh& mesh) {
+void VkRayTracing::Forget(const GpuMesh& mesh) {
     auto it = static_.find(&mesh);
     if (it == static_.end()) {
         return;
@@ -163,7 +213,8 @@ void RayTracing::Forget(const GpuMesh& mesh) {
     static_.erase(it);
 }
 
-bool RayTracing::EnsureBuffer(Slot& slot, vk::Buffer& buffer, VkDeviceSize size, VkBufferUsageFlags usage, bool host_visible) {
+bool VkRayTracing::EnsureBuffer(Slot& slot, vk::Buffer& buffer, VkDeviceSize size, VkBufferUsageFlags usage, bool host_visible) {
+    const vk::AllocTag tag("ray tracing");
     if (buffer.buffer && buffer.size >= size) {
         return true;
     }
@@ -174,13 +225,23 @@ bool RayTracing::EnsureBuffer(Slot& slot, vk::Buffer& buffer, VkDeviceSize size,
     return ctx_->CreateBuffer(buffer, std::max<VkDeviceSize>(size + size / 2, 4096), usage, host_visible);
 }
 
-VkDeviceAddress RayTracing::Address(const vk::Buffer& buffer) const {
+bool VkRayTracing::Ready(uint32_t slot) const {
+    return slots_[slot].valid || std::chrono::steady_clock::now() >= retry_after_;
+}
+
+void VkRayTracing::BackOff(const char* what) {
+    const bool first = std::chrono::steady_clock::now() >= retry_after_;
+    retry_after_ = std::chrono::steady_clock::now() + std::chrono::seconds(1);
+    if (first) LogWarn("ray tracing: {} not allocated (out of video memory), tried again in 1 s", what);
+}
+
+VkDeviceAddress VkRayTracing::Address(const vk::Buffer& buffer) const {
     VkBufferDeviceAddressInfo info{VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO};
     info.buffer = buffer.buffer;
     return vkGetBufferDeviceAddress(device_, &info);
 }
 
-VkAccelerationStructureGeometryKHR RayTracing::Triangles(VkDeviceAddress vertices, VkDeviceSize stride, uint32_t vertex_count,
+VkAccelerationStructureGeometryKHR VkRayTracing::Triangles(VkDeviceAddress vertices, VkDeviceSize stride, uint32_t vertex_count,
                                                          VkDeviceAddress indices) const {
     VkAccelerationStructureGeometryKHR geometry{VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_KHR};
     geometry.geometryType = VK_GEOMETRY_TYPE_TRIANGLES_KHR;
@@ -196,7 +257,8 @@ VkAccelerationStructureGeometryKHR RayTracing::Triangles(VkDeviceAddress vertice
     return geometry;
 }
 
-const RayTracing::Blas* RayTracing::StaticBlas(const GpuMesh& mesh, uint32_t submesh, std::vector<BuildJob>& jobs) {
+const VkRayTracing::Blas* VkRayTracing::StaticBlas(const GpuMesh& mesh, uint32_t submesh, std::vector<BuildJob>& jobs) {
+    const vk::AllocTag tag("ray tracing");
     std::vector<Blas>& list = static_[&mesh];
     if (list.size() < mesh.submeshes.size()) {
         list.resize(mesh.submeshes.size());
@@ -215,6 +277,9 @@ const RayTracing::Blas* RayTracing::StaticBlas(const GpuMesh& mesh, uint32_t sub
         b.empty = true;
         return nullptr;
     }
+    if (std::chrono::steady_clock::now() < retry_after_) {
+        return nullptr;
+    }
     BuildJob job;
     job.geometry = Triangles(Address(mesh.vertices), sizeof(Vertex), vertex_count, Address(mesh.indices));
     job.range = {primitives, sub.first_index * static_cast<uint32_t>(sizeof(uint32_t)), static_cast<uint32_t>(sub.vertex_offset), 0};
@@ -227,7 +292,7 @@ const RayTracing::Blas* RayTracing::StaticBlas(const GpuMesh& mesh, uint32_t sub
     vkGetAccelerationStructureBuildSizesKHR(device_, VK_ACCELERATION_STRUCTURE_BUILD_TYPE_DEVICE_KHR, &job.info, &primitives, &sizes);
     if (!ctx_->CreateBuffer(b.buffer, sizes.accelerationStructureSize,
                             VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_STORAGE_BIT_KHR | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT, false)) {
-        b.empty = true;
+        BackOff("a static BLAS");
         return nullptr;
     }
     VkAccelerationStructureCreateInfoKHR create{VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_CREATE_INFO_KHR};
@@ -244,6 +309,7 @@ const RayTracing::Blas* RayTracing::StaticBlas(const GpuMesh& mesh, uint32_t sub
     b.address = vkGetAccelerationStructureDeviceAddressKHR(device_, &address);
     job.info.dstAccelerationStructure = b.handle;
     job.scratch = sizes.buildScratchSize;
+    job.owner = &b;
     jobs.push_back(job);
     ++stats_.static_blas;
     stats_.static_triangles += primitives;
@@ -251,9 +317,9 @@ const RayTracing::Blas* RayTracing::StaticBlas(const GpuMesh& mesh, uint32_t sub
     return &b;
 }
 
-void RayTracing::RunJobs(VkCommandBuffer cmd, Slot& slot, std::vector<BuildJob>& jobs) {
+bool VkRayTracing::RunJobs(VkCommandBuffer cmd, Slot& slot, std::vector<BuildJob>& jobs) {
     if (jobs.empty()) {
-        return;
+        return true;
     }
     const VkDeviceSize align = std::max<VkDeviceSize>(ctx_->scratch_alignment, 1);
     VkDeviceSize total = 0;
@@ -264,8 +330,8 @@ void RayTracing::RunJobs(VkCommandBuffer cmd, Slot& slot, std::vector<BuildJob>&
     }
     const VkDeviceSize capacity = std::max(largest, std::min(total, kMaxScratch));
     if (!EnsureBuffer(slot, slot.scratch, capacity + align, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT, false)) {
-        jobs.clear();
-        return;
+        BackOff("the build scratch buffer");
+        return false;
     }
     const VkDeviceAddress scratch = AlignUp(Address(slot.scratch), align);
     std::vector<VkAccelerationStructureBuildGeometryInfoKHR> infos;
@@ -290,10 +356,11 @@ void RayTracing::RunJobs(VkCommandBuffer cmd, Slot& slot, std::vector<BuildJob>&
     }
     stats_.built_this_frame += static_cast<uint32_t>(jobs.size());
     jobs.clear();
+    return true;
 }
 
-void RayTracing::SetReflectionImage(VkImageView view, VkSampler sampler) {
-    VkDescriptorImageInfo image{sampler, view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
+void VkRayTracing::SetReflectionImage(gpu::ImageViewHandle view, gpu::SamplerHandle sampler) {
+    VkDescriptorImageInfo image{gpu::vk::Native(sampler), gpu::vk::Native(view), VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
     for (Slot& slot : slots_) {
         VkWriteDescriptorSet write{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
         write.dstSet = slot.set;
@@ -305,13 +372,13 @@ void RayTracing::SetReflectionImage(VkImageView view, VkSampler sampler) {
     }
 }
 
-void RayTracing::SetAoImages(std::span<const VkImageView> views) {
+void VkRayTracing::SetAoImages(std::span<const gpu::ImageViewHandle> views) {
     VkDescriptorImageInfo images[kAoImages]{};
     VkWriteDescriptorSet writes[kAoImages]{};
     const uint32_t count = std::min<uint32_t>(static_cast<uint32_t>(views.size()), kAoImages);
     for (Slot& slot : slots_) {
         for (uint32_t i = 0; i < count; ++i) {
-            images[i] = {VK_NULL_HANDLE, views[i], VK_IMAGE_LAYOUT_GENERAL};
+            images[i] = {VK_NULL_HANDLE, gpu::vk::Native(views[i]), VK_IMAGE_LAYOUT_GENERAL};
             writes[i] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
             writes[i].dstSet = slot.set;
             writes[i].dstBinding = 3 + i;
@@ -323,7 +390,53 @@ void RayTracing::SetAoImages(std::span<const VkImageView> views) {
     }
 }
 
-void RayTracing::WriteSet(Slot& slot) {
+void VkRayTracing::SetFullImages(std::span<const gpu::ImageViewHandle> views) {
+    VkDescriptorImageInfo images[kFullImages]{};
+    VkWriteDescriptorSet writes[kFullImages]{};
+    const uint32_t count = std::min<uint32_t>(static_cast<uint32_t>(views.size()), kFullImages);
+    for (Slot& slot : slots_) {
+        for (uint32_t i = 0; i < count; ++i) {
+            const bool depth = i >= kFullDepthFirst && i < kFullDepthFirst + kFullDepthImages;
+            images[i] = {VK_NULL_HANDLE, gpu::vk::Native(views[i]), VK_IMAGE_LAYOUT_GENERAL};
+            writes[i] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+            writes[i].dstSet = slot.set;
+            writes[i].dstBinding = depth ? 5 + kAoImages : 4 + kAoImages;
+            writes[i].dstArrayElement = depth ? i - kFullDepthFirst : i < kFullDepthFirst ? i : i - kFullDepthImages;
+            writes[i].descriptorCount = 1;
+            writes[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+            writes[i].pImageInfo = &images[i];
+        }
+        vkUpdateDescriptorSets(device_, count, writes, 0, nullptr);
+    }
+}
+
+void VkRayTracing::SetPathImages(std::span<const gpu::ImageViewHandle> views32, std::span<const gpu::ImageViewHandle> views16) {
+    std::vector<VkDescriptorImageInfo> images(kPathImages32 + kPathImages16);
+    std::vector<VkWriteDescriptorSet> writes;
+    for (Slot& slot : slots_) {
+        writes.clear();
+        for (uint32_t i = 0; i < kPathImages32 + kPathImages16; ++i) {
+            const bool wide = i < kPathImages32;
+            const uint32_t element = wide ? i : i - kPathImages32;
+            const std::span<const gpu::ImageViewHandle> views = wide ? views32 : views16;
+            if (element >= views.size()) {
+                continue;
+            }
+            images[i] = {VK_NULL_HANDLE, gpu::vk::Native(views[element]), VK_IMAGE_LAYOUT_GENERAL};
+            VkWriteDescriptorSet w{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+            w.dstSet = slot.set;
+            w.dstBinding = wide ? 6 + kAoImages : 7 + kAoImages;
+            w.dstArrayElement = element;
+            w.descriptorCount = 1;
+            w.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+            w.pImageInfo = &images[i];
+            writes.push_back(w);
+        }
+        vkUpdateDescriptorSets(device_, static_cast<uint32_t>(writes.size()), writes.data(), 0, nullptr);
+    }
+}
+
+void VkRayTracing::WriteSet(Slot& slot) {
     VkWriteDescriptorSetAccelerationStructureKHR as_info{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET_ACCELERATION_STRUCTURE_KHR};
     as_info.accelerationStructureCount = 1;
     as_info.pAccelerationStructures = &slot.tlas;
@@ -345,8 +458,11 @@ void RayTracing::WriteSet(Slot& slot) {
     slot.written = true;
 }
 
-void RayTracing::Build(VkCommandBuffer cmd, uint32_t slot_index, std::span<const RtCaster> casters) {
+bool VkRayTracing::Build(gpu::CommandList& list, uint32_t slot_index, std::span<const RtCaster> casters) {
+    const VkCommandBuffer cmd = gpu::vk::Native(list);
+    const vk::AllocTag tag("ray tracing");
     Slot& slot = slots_[slot_index];
+    slot.valid = false;
     for (VkAccelerationStructureKHR as : slot.dynamic) {
         vkDestroyAccelerationStructureKHR(device_, as, nullptr);
     }
@@ -368,7 +484,20 @@ void RayTracing::Build(VkCommandBuffer cmd, uint32_t slot_index, std::span<const
             }
         }
     }
-    RunJobs(cmd, slot, jobs);
+    if (!RunJobs(cmd, slot, jobs)) {
+        std::unordered_set<VkDeviceAddress> dropped;
+        for (BuildJob& job : jobs) {
+            if (!job.owner) continue;
+            dropped.insert(job.owner->address);
+            vkDestroyAccelerationStructureKHR(device_, job.owner->handle, nullptr);
+            ctx_->DestroyBuffer(job.owner->buffer);
+            *job.owner = Blas{};
+        }
+        jobs.clear();
+        for (VkDeviceAddress& address : blas) {
+            if (dropped.contains(address)) address = 0;
+        }
+    }
 
     struct SkinGroup {
         const GpuMesh* mesh = nullptr;
@@ -474,7 +603,10 @@ void RayTracing::Build(VkCommandBuffer cmd, uint32_t slot_index, std::span<const
                 jobs.push_back(p.job);
                 ++stats_.skinned_instances;
             }
-            RunJobs(cmd, slot, jobs);
+            if (!RunJobs(cmd, slot, jobs)) {
+                for (const Pending& p : pending) blas[p.caster] = 0;
+                jobs.clear();
+            }
         }
     }
 
@@ -484,17 +616,21 @@ void RayTracing::Build(VkCommandBuffer cmd, uint32_t slot_index, std::span<const
         while (capacity < count) {
             capacity *= 2;
         }
-        slot.retired.push_back(slot.instances);
-        slot.retired.push_back(slot.records);
-        slot.instances = vk::Buffer{};
-        slot.records = vk::Buffer{};
-        if (!ctx_->CreateBuffer(slot.instances, sizeof(VkAccelerationStructureInstanceKHR) * capacity,
+        vk::Buffer instances_buffer;
+        vk::Buffer records_buffer;
+        if (!ctx_->CreateBuffer(instances_buffer, sizeof(VkAccelerationStructureInstanceKHR) * capacity,
                                 VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT | VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR, true) ||
-            !ctx_->CreateBuffer(slot.records, sizeof(RtRecord) * capacity, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, true)) {
-            slot.capacity = 0;
+            !ctx_->CreateBuffer(records_buffer, sizeof(RtRecord) * capacity, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, true)) {
+            ctx_->DestroyBuffer(instances_buffer);
+            ctx_->DestroyBuffer(records_buffer);
+            BackOff("the TLAS instance buffers");
             EndLabel(cmd);
-            return;
+            return false;
         }
+        if (slot.instances.buffer) slot.retired.push_back(slot.instances);
+        if (slot.records.buffer) slot.retired.push_back(slot.records);
+        slot.instances = instances_buffer;
+        slot.records = records_buffer;
         slot.capacity = capacity;
         slot.written = false;
     }
@@ -515,7 +651,7 @@ void RayTracing::Build(VkCommandBuffer cmd, uint32_t slot_index, std::span<const
         inst.instanceCustomIndex = used;
         inst.mask = c.mask;
         inst.instanceShaderBindingTableRecordOffset = 0;
-        VkGeometryInstanceFlagsKHR flags = c.alpha_test ? VK_GEOMETRY_INSTANCE_FORCE_NO_OPAQUE_BIT_KHR : VK_GEOMETRY_INSTANCE_FORCE_OPAQUE_BIT_KHR;
+        VkGeometryInstanceFlagsKHR flags = c.alpha_test || c.fitting ? VK_GEOMETRY_INSTANCE_FORCE_NO_OPAQUE_BIT_KHR : VK_GEOMETRY_INSTANCE_FORCE_OPAQUE_BIT_KHR;
         if (c.double_sided) {
             flags |= VK_GEOMETRY_INSTANCE_TRIANGLE_FACING_CULL_DISABLE_BIT_KHR;
         }
@@ -532,6 +668,7 @@ void RayTracing::Build(VkCommandBuffer cmd, uint32_t slot_index, std::span<const
         rec.first_index = sub.first_index;
         rec.vertex_offset = sub.vertex_offset;
         rec.material = c.material;
+        rec.flags = (c.fitting ? 1u | (c.alpha_test ? 2u : 0u) : 0u) | (c.skin_base != gpu::kInvalid ? 4u : 0u) | (c.alpha_test ? 8u : 0u);
         ++used;
     }
     vmaFlushAllocation(ctx_->allocator, slot.instances.allocation, 0, VK_WHOLE_SIZE);
@@ -553,27 +690,31 @@ void RayTracing::Build(VkCommandBuffer cmd, uint32_t slot_index, std::span<const
         uint32_t max_count = slot.capacity;
         VkAccelerationStructureBuildSizesInfoKHR sizes{VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_BUILD_SIZES_INFO_KHR};
         vkGetAccelerationStructureBuildSizesKHR(device_, VK_ACCELERATION_STRUCTURE_BUILD_TYPE_DEVICE_KHR, &tlas.info, &max_count, &sizes);
+        vk::Buffer tlas_buffer;
+        VkAccelerationStructureKHR tlas_handle = VK_NULL_HANDLE;
+        if (!ctx_->CreateBuffer(tlas_buffer, sizes.accelerationStructureSize,
+                                VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_STORAGE_BIT_KHR | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT, false)) {
+            BackOff("the TLAS");
+            EndLabel(cmd);
+            return false;
+        }
+        VkAccelerationStructureCreateInfoKHR create{VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_CREATE_INFO_KHR};
+        create.buffer = tlas_buffer.buffer;
+        create.size = sizes.accelerationStructureSize;
+        create.type = VK_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL_KHR;
+        if (!vk::Check(vkCreateAccelerationStructureKHR(device_, &create, nullptr, &tlas_handle), "vkCreateAccelerationStructureKHR (TLAS)")) {
+            ctx_->DestroyBuffer(tlas_buffer);
+            EndLabel(cmd);
+            return false;
+        }
         if (slot.tlas) {
             vkDestroyAccelerationStructureKHR(device_, slot.tlas, nullptr);
-            slot.tlas = VK_NULL_HANDLE;
         }
         if (slot.tlas_buffer.buffer) {
             slot.retired.push_back(slot.tlas_buffer);
-            slot.tlas_buffer = vk::Buffer{};
         }
-        if (!ctx_->CreateBuffer(slot.tlas_buffer, sizes.accelerationStructureSize,
-                                VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_STORAGE_BIT_KHR | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT, false)) {
-            EndLabel(cmd);
-            return;
-        }
-        VkAccelerationStructureCreateInfoKHR create{VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_CREATE_INFO_KHR};
-        create.buffer = slot.tlas_buffer.buffer;
-        create.size = sizes.accelerationStructureSize;
-        create.type = VK_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL_KHR;
-        if (!vk::Check(vkCreateAccelerationStructureKHR(device_, &create, nullptr, &slot.tlas), "vkCreateAccelerationStructureKHR (TLAS)")) {
-            EndLabel(cmd);
-            return;
-        }
+        slot.tlas = tlas_handle;
+        slot.tlas_buffer = tlas_buffer;
         slot.tlas_capacity = slot.capacity;
         slot.written = false;
     }
@@ -584,13 +725,19 @@ void RayTracing::Build(VkCommandBuffer cmd, uint32_t slot_index, std::span<const
     tlas.range = {used, 0, 0, 0};
     tlas.scratch = sizes.buildScratchSize;
     jobs.push_back(tlas);
-    RunJobs(cmd, slot, jobs);
+    if (!RunJobs(cmd, slot, jobs)) {
+        jobs.clear();
+        EndLabel(cmd);
+        return false;
+    }
     MemoryBarrier(cmd, VK_PIPELINE_STAGE_2_ACCELERATION_STRUCTURE_BUILD_BIT_KHR, VK_ACCESS_2_ACCELERATION_STRUCTURE_WRITE_BIT_KHR,
                   VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_ACCELERATION_STRUCTURE_READ_BIT_KHR);
     if (!slot.written) {
         WriteSet(slot);
     }
+    slot.valid = true;
     EndLabel(cmd);
+    return true;
 }
 
 }

@@ -1,3 +1,4 @@
+#include "engine/core/ascii.h"
 #include "game/ui/subtitle_player.h"
 
 #include <algorithm>
@@ -11,7 +12,7 @@
 namespace pt::game {
 namespace {
 
-constexpr const char* kSubtitleLanguages[SubtitlePlayer::kLanguageCount] = {"Eng", "Fre", "Ger", "Spa", "Jpn", "Ita", "Por", "Tur", "Zhs", "Ara", "Rus", "Ukr"};
+constexpr const char* kSubtitleLanguages[SubtitlePlayer::kLanguageCount] = {"Eng", "Fre", "Ger", "Spa", "Jpn", "Ita", "Por", "Tur", "Zhs", "Ara", "Rus", "Ukr", "Ces", "Pol"};
 
 constexpr int kPlayingPriority[8] = {255, 0, 0, 10, 20, 30, 40, 0};
 constexpr float kRangeRadius[4] = {0.0f, 20.0f, 40.0f, 70.0f};
@@ -116,7 +117,7 @@ bool SubtitlePlayer::InRange(const Playing& playing, const audio::SubtitleEntry&
 
 bool SubtitlePlayer::Play(std::string_view subtitle_id, float offset_seconds, std::optional<glm::vec3> source, uint32_t sound) {
     std::string id(subtitle_id);
-    std::transform(id.begin(), id.end(), id.begin(), [](char c) { return static_cast<char>(std::tolower(static_cast<unsigned char>(c))); });
+    std::transform(id.begin(), id.end(), id.begin(), [](char c) { return static_cast<char>(pt::AsciiLower(c)); });
     const uint32_t key = audio::SubtitleTable::SubtitleKey(id);
     if (!PlayKey(key, offset_seconds, source, sound)) {
         return false;
@@ -131,6 +132,10 @@ bool SubtitlePlayer::PlayKey(uint32_t key, float offset_seconds, std::optional<g
     const audio::SubtitleEntry* entry = Entry(key);
     if (!entry || entry->lines.empty()) {
         LogWarn("ui: subtitle {:#x} not found", key);
+        return false;
+    }
+    if (key == 0x7980630Bu || entry->id == "tria1000_1g1010") {
+        LogInfo("ui: subtitle {:#x} tria1000_1g1010 not shown (the PS4 shows the radio's line there)", key);
         return false;
     }
     active_.erase(std::remove_if(active_.begin(), active_.end(), [&](const Playing& p) { return p.key == key; }), active_.end());
@@ -180,7 +185,7 @@ void SubtitlePlayer::Update(float dt) {
 
 std::vector<SubtitlePlayer::TranscriptLine> SubtitlePlayer::Transcript(std::string_view subtitle_id, int language) {
     std::string id(subtitle_id);
-    std::transform(id.begin(), id.end(), id.begin(), [](char c) { return static_cast<char>(std::tolower(static_cast<unsigned char>(c))); });
+    std::transform(id.begin(), id.end(), id.begin(), [](char c) { return static_cast<char>(pt::AsciiLower(c)); });
     const uint32_t key = audio::SubtitleTable::SubtitleKey(id);
     const audio::SubtitleEntry* entry = nullptr;
     for (const int l : {language, 0}) {
@@ -207,8 +212,12 @@ bool SubtitlePlayer::Current(std::string_view hidden_id, SubtitleView& out) cons
         if (!candidate || !InRange(p, *candidate)) {
             continue;
         }
+        if (std::none_of(candidate->lines.begin(), candidate->lines.end(),
+                         [&](const audio::SubtitleLine& line) { return p.time < line.end_seconds; })) {
+            continue;
+        }
         const int priority = PlayingPriority(candidate->category);
-        if (!best || priority < best_priority || (priority == best_priority && p.order > best->order)) {
+        if (!best || priority < best_priority || (priority == best_priority && p.order < best->order)) {
             best = &p;
             best_priority = priority;
         }

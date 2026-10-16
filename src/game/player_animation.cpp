@@ -248,6 +248,34 @@ bool LoadPlayerAnimation(Vfs& vfs) {
     return g_locomotion.loaded;
 }
 
+bool PlayerPoseSkin(const anim::HelpBones* help, float frame, const PlayerPoseEdit& edit, std::vector<glm::mat4>& skin) {
+    const BodyClip& stand = g_locomotion.clips[kClipStand];
+    if (!g_rig_ready || !stand.motion) {
+        return false;
+    }
+    anim::RigPose pose;
+    anim::RigOutput out;
+    const double at = stand.frames > 0.0f ? std::fmod(static_cast<double>(std::max(frame, 0.0f)), static_cast<double>(stand.frames)) : 0.0;
+    anim::SampleRigPose(g_rig, *stand.motion, at, pose, true);
+    anim::EvaluateRig(g_rig, g_binding, g_skeleton, pose, out);
+    const size_t n = std::min({g_skeleton.Size(), out.position.size(), out.rotation.size()});
+    if (n == 0) {
+        return false;
+    }
+    std::vector<glm::mat4> world(n);
+    for (size_t i = 0; i < n; ++i) {
+        world[i] = glm::translate(glm::mat4(1.0f), out.position[i]) * glm::mat4_cast(out.rotation[i]);
+    }
+    if (edit) {
+        edit(g_skeleton, world);
+    }
+    if (help) {
+        help->Apply(g_skeleton, world);
+    }
+    anim::ComputeSkin(g_skeleton, world, skin);
+    return true;
+}
+
 int WalkDirection(float heading_delta) {
     const float t = heading_delta + kPi;
     const float d = t >= 0.0f ? std::fmod(t, 2.0f * kPi) - kPi : kPi - std::fmod(-t, 2.0f * kPi);

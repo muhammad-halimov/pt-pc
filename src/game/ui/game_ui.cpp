@@ -1,4 +1,6 @@
+#include "engine/core/ascii.h"
 #include "game/ui/game_ui.h"
+#include "game/lisa_date/lisa_date.h"
 
 #include <algorithm>
 #include <cctype>
@@ -15,6 +17,7 @@
 #include "game/game.h"
 #include "game/ui/pc_settings.h"
 #include "game/ui/port_credits.h"
+#include "game/ui/prompt_hint.h"
 
 namespace pt::game {
 namespace {
@@ -29,7 +32,7 @@ constexpr const char* kSubtitleFont = "sbt-sys-M";
 
 std::string Lower(std::string_view text) {
     std::string out(text);
-    std::transform(out.begin(), out.end(), out.begin(), [](char c) { return static_cast<char>(std::tolower(static_cast<unsigned char>(c))); });
+    std::transform(out.begin(), out.end(), out.begin(), [](char c) { return static_cast<char>(pt::AsciiLower(c)); });
     return out;
 }
 
@@ -92,6 +95,14 @@ bool GameUi::ScriptCommand(Game& game, std::string_view op, std::string_view tex
         if (ui && !ui->MenuOpen()) {
             ui->OpenMenu(game, false, text == "pc" ? OptionsMenu::Page::Pc : OptionsMenu::Page::Original);
         }
+    } else if (op == "pcset") {
+        if (!ui || !ui->menu_.PcPageForScript().SetValue(text, static_cast<int>(arg(0)))) {
+            LogWarn("input script: sui pcset {} found no PC settings row", text);
+        }
+    } else if (op == "pcfocus") {
+        if (!ui || !ui->menu_.PcPageForScript().Focus(text)) {
+            LogWarn("input script: sui pcfocus {} found no PC settings row", text);
+        }
     } else if (op == "menukey") {
         MenuInput input;
         input.subtitle_up = text == "up";
@@ -107,6 +118,31 @@ bool GameUi::ScriptCommand(Game& game, std::string_view op, std::string_view tex
         input.zoom_pressed = text == "zoom";
         input.zoom_released = text == "unzoom";
         input.close = text == "close";
+        input.tab_prev = text == "tabprev";
+        input.tab_next = text == "tabnext";
+        input.donate = text == "donate";
+        input.music = text == "musicback" ? kMenuMusicBack : text == "musicforward" ? kMenuMusicForward : text == "musicrestart" ? kMenuMusicRestart
+                    : text == "musicloop" ? kMenuMusicLoop : 0u;
+        if (ui) {
+            ui->QueueMenuInput(input);
+        }
+    } else if (op == "notice") {
+        if (ui) {
+            ui->ShowNotice(args.empty() ? std::string(text) : std::format("{}{}{}", text, kPcNoteArgument, static_cast<int>(arg(0))));
+        }
+    } else if (op == "streetlight") {
+        game.ToggleStreetFlashlight();
+    } else if (op == "menuwheel") {
+        MenuInput input;
+        input.wheel = arg(0);
+        if (ui) {
+            ui->QueueMenuInput(input);
+        }
+    } else if (op == "menuclick" || op == "menupoint") {
+        MenuInput input;
+        input.pointer_valid = true;
+        input.pointer = glm::vec2(arg(0), arg(1));
+        input.click = op == "menuclick";
         if (ui) {
             ui->QueueMenuInput(input);
         }
@@ -207,10 +243,16 @@ void GameUi::QueueMenuInput(const MenuInput& input) {
     q.back |= input.back;
     q.open_pc |= input.open_pc;
     q.switch_column |= input.switch_column;
+    q.tab_prev |= input.tab_prev;
+    q.tab_next |= input.tab_next;
+    q.tab_from_e |= input.tab_from_e;
+    q.donate |= input.donate;
     q.street_return |= input.street_return;
     q.held_dirs |= input.held_dirs;
+    q.music |= input.music;
     q.click |= input.click;
     q.right_click |= input.right_click;
+    q.wheel += input.wheel;
     if (input.pointer_valid) {
         q.pointer_valid = true;
         q.pointer = input.pointer;
@@ -280,10 +322,16 @@ void GameUi::UpdateSubliminal(Game& game, float dt, bool paused) {
     }
 }
 
+void GameUi::ShowBootSplash(uint32_t texture, float seconds) {
+    boot_splash_ = texture;
+    boot_splash_time_ = seconds;
+}
+
 void GameUi::Update(Game& game, const InputState& input, float dt) {
     if (!ready_) {
         return;
     }
+    boot_splash_time_ = std::max(0.0f, boot_splash_time_ - std::min(dt, 0.1f));
     if (game.TakeSubtitleClear()) {
         ClearSubtitles();
     }
@@ -311,8 +359,10 @@ void GameUi::Update(Game& game, const InputState& input, float dt) {
     last_caption_time_ = fx.caption_time;
 
     menu_.SetPromptStyle(input.prompts);
-    MenuInput menu_input = MapMenuInput(input, previous_held_);
+    prompts_ = input.prompts;
+    MenuInput menu_input = MapMenuInput(input, previous_held_, previous_dirs_);
     previous_held_ = input.held;
+    previous_dirs_ = menu_input.held_dirs;
     if (input.pointer_valid && canvas_ready_) {
         const glm::vec2 virtual_px = (input.pointer - canvas_.origin) / canvas_.scale;
         menu_input.pointer_valid = true;
@@ -321,8 +371,10 @@ void GameUi::Update(Game& game, const InputState& input, float dt) {
     QueueMenuInput(menu_input);
     menu_input = std::exchange(queued_menu_input_, MenuInput{});
     save_dialog_text_.clear();
+    dialog_flash_ += dt * 60.0f;
     if (const auto& dialog = game.PendingSaveDialog()) {
-        if (dialog->key.starts_with("pc_")) {
+        const bool pc_text = dialog->key.starts_with("pc_");
+        if (pc_text) {
             save_dialog_text_ = std::string(PcText(dialog->key, language_));
         } else if (const ui::LangFile* system = assets_.System(language_)) {
             save_dialog_text_ = system->Text(dialog->key);
@@ -330,13 +382,25 @@ void GameUi::Update(Game& game, const InputState& input, float dt) {
         if (save_dialog_text_.empty()) {
             save_dialog_text_ = dialog->key;
         }
-        if (menu_input.accept || menu_input.click || input.confirm) {
-            game.CloseSaveDialog();
-            save_dialog_text_.clear();
+        if (!save_nav_open_) {
+            save_nav_open_ = true;
+            save_nav_.Open(0, menu_input.held_dirs);
+            dialog_flash_ = 0.0f;
+        } else {
+            MenuInput answer = menu_input;
+            answer.accept = answer.accept || input.confirm;
+            if (save_nav_.Update(answer, 1, language_, pc_text) != dialog::Result::None) {
+                game.CloseSaveDialog();
+                save_dialog_text_.clear();
+            }
         }
         menu_input = MenuInput{};
+    } else {
+        save_nav_open_ = false;
     }
     port_credits_time_ = game.PortCreditsActive() && game.Controller().Step() == 33 ? game.PortCreditsTime() : -1.0f;
+    ending_skip_alpha_ = game.EndingSkipAlpha();
+    ending_skip_progress_ = std::clamp(game.EndingSkipProgress(), 0.0f, 1.0f);
     if (port_credits_time_ >= 0.0f && !menu_.IsOpen()) {
         if (port_credits_time_ > 0.5f && (menu_input.accept || menu_input.back || menu_input.close || menu_input.click)) {
             game.SkipPortCredits();
@@ -372,7 +436,11 @@ void GameUi::Update(Game& game, const InputState& input, float dt) {
                 pause_owner_ = false;
             }
             if (menu_.TakeStreetReturn()) {
-                game.LeaveStreetWalk();
+                if (game.LisaDateActive()) {
+                    game.RequestLeaveLisaDate();
+                } else {
+                    game.LeaveStreetWalk();
+                }
             }
         }
         if (menu_.TakeClosed()) {
@@ -399,6 +467,16 @@ void GameUi::Update(Game& game, const InputState& input, float dt) {
     }
     save_icon_.Update(dt);
     const bool paused = game.Paused();
+    lisa_vignette_ = game.LisaDateActive() ? 0.0f : game.LisaHintVignette();
+    sound_captions_.clear();
+    if (SoundCaptions& captions = game.Captions(); captions.Enabled()) {
+        if (!paused) {
+            captions.Update(dt, game.GetCamera().position, game.GetCamera().Forward());
+        }
+        for (const SoundCaptions::Line& line : captions.Lines()) {
+            sound_captions_.push_back({line.rule->key, line.side, line.Alpha()});
+        }
+    }
     if (!paused) {
         subtitles_.Update(dt);
         if (caption_clock) {
@@ -429,8 +507,15 @@ void GameUi::Update(Game& game, const InputState& input, float dt) {
 }
 
 void GameUi::DrawSubtitle(ui::UiBatch& batch, const UiCanvas& canvas) {
+    subtitle_top_ = 1.0e30f;
     SubtitleView view;
-    if (!subtitles_on_ || !subtitles_.Current(hidden_subtitle_, view)) {
+    const bool shown = subtitles_on_ && subtitles_.Current(hidden_subtitle_, view);
+    const std::string on_screen = shown ? view.id + " " + view.text : std::string();
+    if (on_screen != logged_subtitle_) {
+        logged_subtitle_ = on_screen;
+        LogInfo("ui: subtitle on screen: {}", on_screen.empty() ? std::string("none") : view.id);
+    }
+    if (!shown) {
         return;
     }
     const int language = subtitles_.Language();
@@ -493,6 +578,9 @@ void GameUi::DrawSubtitle(ui::UiBatch& batch, const UiCanvas& canvas) {
             }
         }
     }
+    for (const ui::TextLine& line : layout.lines) {
+        for (const ui::LaidGlyph& g : line.glyphs) subtitle_top_ = std::min(subtitle_top_, g.position.y);
+    }
     glm::vec4 subtitle_color = color * generator.color;
     ui::UiShade shade = ui::UiShade::Border;
     const float backdrop_luminance = glm::dot(glm::vec3(fade_), glm::vec3(0.2126f, 0.7152f, 0.0722f));
@@ -503,12 +591,86 @@ void GameUi::DrawSubtitle(ui::UiBatch& batch, const UiCanvas& canvas) {
     DrawText(batch, canvas, *font, layout, subtitle_color, ui::UiBlend::Alpha, shade);
 }
 
+void GameUi::DrawSoundCaptions(ui::UiBatch& batch, const UiCanvas& canvas, glm::vec2 full) {
+    UiFont* font = assets_.Font(UiFontType::Movie, language_);
+    if (!font || sound_captions_.empty()) {
+        return;
+    }
+    const SubtitleGeneratorSettings& generator = assets_.Generator();
+    glm::vec2 size(1024.0f, 100.0f);
+    glm::vec2 box_min(-0.05f, 0.0f);
+    glm::vec2 box_max(0.05f, -0.1f);
+    glm::vec2 origin(0.0f);
+    const UiFontStyle* style = assets_.FontStyle(kSubtitleFont, language_);
+    if (const ui::UifModel* model = assets_.Model(kSubtitleModel)) {
+        if (const ui::UifNode* node = model->FindById(kSubtitleTextNode)) {
+            size = node->size;
+            box_min = glm::vec2(node->box_min);
+            box_max = glm::vec2(node->box_max);
+            origin = glm::vec2(node->translate);
+            if (const UiFontStyle* node_style = assets_.FontStyleByHash(node->font_name, language_)) {
+                style = node_style;
+            }
+        }
+    }
+    ui::TextStyle text_style;
+    text_style.font = &font->font;
+    if (style) {
+        text_style.font_width = style->width;
+        text_style.font_height = style->height;
+        text_style.text_space = style->text_space;
+        text_style.line_space = style->line_space;
+    }
+    text_style.text_space += generator.font_space;
+    text_style.line_space += generator.line_space;
+    ui::NormalizeSubtitleStyle(text_style);
+    constexpr float kScale = 0.85f;
+    text_style.font_width *= kScale;
+    text_style.font_height *= kScale;
+    text_style.text_space *= kScale;
+    text_style.line_space *= kScale;
+    const glm::vec2 anchor = origin + generator.offset;
+    const glm::vec2 lo_units = anchor + glm::vec2(box_min.x * size.x, box_min.y * size.y);
+    const glm::vec2 hi_units = anchor + glm::vec2(box_max.x * size.x, box_max.y * size.y);
+    const float left = UiCanvas::kWidth * 0.5f + std::min(lo_units.x, hi_units.x) * UiCanvas::kUnit;
+    const float right = UiCanvas::kWidth * 0.5f + std::max(lo_units.x, hi_units.x) * UiCanvas::kUnit;
+    const float box_top = UiCanvas::kHeight * 0.5f - std::max(lo_units.y, hi_units.y) * UiCanvas::kUnit;
+    constexpr float kGap = 8.0f;
+    float bottom = std::min(box_top, subtitle_top_) - kGap;
+    if (const float bar = LetterboxBar(full, letterbox_); bar > 0.0f && canvas.scale > 0.0f) {
+        const float frame_bottom = (full.y - canvas.origin.y) / canvas.scale;
+        const float margin = std::max(0.0f, frame_bottom - (UiCanvas::kHeight * 0.5f - std::min(lo_units.y, hi_units.y) * UiCanvas::kUnit));
+        bottom = std::min(bottom, (full.y - bar - canvas.origin.y) / canvas.scale - margin - kGap);
+    }
+    for (size_t i = sound_captions_.size(); i-- > 0;) {
+        const SoundCaptionDraw& caption = sound_captions_[i];
+        std::string text(PcText(caption.key, language_));
+        if (caption.side != CaptionSide::None) {
+            const char* side = caption.side == CaptionSide::Left ? "pc_cap_left" : caption.side == CaptionSide::Right ? "pc_cap_right"
+                               : caption.side == CaptionSide::Behind ? "pc_cap_behind" : "pc_cap_ahead";
+            text += ' ';
+            text += PcText(side, language_);
+        }
+        ui::TextLayout layout = ui::LayoutText(text, text_style, generator.auto_line_feed ? right - left : 0.0f);
+        ui::PlaceText(layout, {left, bottom - layout.height}, {right, bottom}, ui::TextAlign::Center, ui::TextAlign::Center, ui::TextAlign::End, true);
+        DrawText(batch, canvas, *font, layout, glm::vec4(1.0f, 1.0f, 1.0f, std::clamp(caption.alpha, 0.0f, 1.0f)), ui::UiBlend::Alpha, ui::UiShade::Border);
+        bottom -= layout.height + kGap;
+    }
+}
+
+GameUi::SubliminalStringDraw GameUi::SubliminalString() const {
+    const int image = subliminal_.Image();
+    if (!ready_ || subliminal_.StringValue() <= 0.0f || image < 0 || image >= SubliminalEffect::kImageCount) return {};
+    return {subliminal_textures_[image], subliminal_.Position(), subliminal_.StringValue()};
+}
+
 void GameUi::DrawSubliminal(ui::UiBatch& batch, bool string_pass) {
     const glm::vec2 extent(static_cast<float>(batch.Extent().width), static_cast<float>(batch.Extent().height));
     const float across = extent.y > 0.0f ? (extent.x / extent.y) / (UiCanvas::kWidth / UiCanvas::kHeight) : 1.0f;
     const glm::vec2 uv0(0.5f - 0.5f * across, 0.0f);
     const glm::vec2 uv1(0.5f + 0.5f * across, 1.0f);
     if (string_pass) {
+        if (!vr_hud_) return;
         const int image = subliminal_.Image();
         if (subliminal_.StringValue() <= 0.0f || image < 0 || image >= SubliminalEffect::kImageCount) {
             return;
@@ -524,7 +686,8 @@ void GameUi::DrawSubliminal(ui::UiBatch& batch, bool string_pass) {
     ui::UiDrawParams params = ui::UiDrawParams::Plain(noise_texture_);
     params.textures[1] = noise_normal_texture_;
     params.extra = glm::vec4(subliminal_.Phase(), 0.0f, subliminal_.NoiseB(), subliminal_.NoiseA());
-    const bool hdr_scene = Renderer::kSceneColorFormat == VK_FORMAT_R16G16B16A16_SFLOAT || Renderer::kSceneColorFormat == VK_FORMAT_R32G32B32A32_SFLOAT;
+    const gpu::Format scene_format = renderer_ ? renderer_->SceneColorFormat() : Renderer::kSceneColorFormat;
+    const bool hdr_scene = scene_format == gpu::Format::R16G16B16A16Sfloat || scene_format == gpu::Format::R32G32B32A32Sfloat;
     params.extra2 = hdr_scene ? glm::vec4(renderer_ ? renderer_->exposure : 1.0f, 2.2f, 0.0f, 0.0f) : glm::vec4(1.0f, 1.0f, 0.0f, 0.0f);
     params.extra2.z = across;
     batch.Quad(glm::vec2(0.0f), extent, glm::vec2(0.0f), glm::vec2(1.0f), glm::vec4(1.0f), params, ui::UiShade::Noise, ui::UiBlend::Alpha);
@@ -549,29 +712,52 @@ void GameUi::DrawLetterbox(ui::UiBatch& batch, glm::vec2 full, float aspect) {
 }
 
 void GameUi::DrawSaveDialog(ui::UiBatch& batch, const UiCanvas& canvas, glm::vec2 full) {
-    batch.Quad(glm::vec2(0.0f), full, glm::vec2(0.0f), glm::vec2(1.0f), glm::vec4(0.0f, 0.0f, 0.0f, 0.75f),
-               ui::UiDrawParams::Plain(TextureManager::kWhite), ui::UiShade::Solid, ui::UiBlend::Alpha);
-    UiFont* font = assets_.Font(UiFontType::Movie, language_);
-    if (!font) {
-        return;
+    (void)full;
+    dialog::View view;
+    view.text = save_dialog_text_;
+    view.choices = {std::string(PcText("pc_ok", language_))};
+    view.focus = 0;
+    view.language = language_;
+    view.flash = menu_.SelectionFlash(dialog_flash_);
+    dialog::Draw(batch, canvas, assets_, menu_.Model(), prompts_, view);
+}
+
+std::string GameUi::DialogKind(int* focus) const {
+    *focus = 0;
+    if (!save_dialog_text_.empty()) return "save";
+    if (textures_asking_) {
+        *focus = textures_nav_.Focus();
+        return "textures";
     }
-    ui::TextStyle style;
-    style.font = &font->font;
-    if (const UiFontStyle* s = assets_.FontStyle(kSubtitleFont, language_)) {
-        style.font_width = s->width;
-        style.font_height = s->height;
-        style.text_space = s->text_space;
-        style.line_space = s->line_space;
+    return menu_.DialogKind(focus);
+}
+
+bool GameUi::PointerUnits(const InputState& input, glm::vec2* units) const {
+    if (!input.pointer_valid || !canvas_ready_ || canvas_.scale <= 0.0f) return false;
+    const glm::vec2 virtual_px = (input.pointer - canvas_.origin) / canvas_.scale;
+    *units = glm::vec2(virtual_px.x - UiCanvas::kWidth * 0.5f, UiCanvas::kHeight * 0.5f - virtual_px.y) / UiCanvas::kUnit;
+    return true;
+}
+
+GameUi::TexturesAnswer GameUi::AnswerTexturesQuestion(const InputState& input) {
+    TexturesAnswer answer;
+    MenuInput menu_input = MapMenuInput(input, 0);
+    menu_input.accept = menu_input.accept || input.confirm;
+    glm::vec2 units;
+    if (PointerUnits(input, &units)) {
+        menu_input.pointer_valid = true;
+        menu_input.pointer = units;
     }
-    style.text_space += assets_.Generator().font_space;
-    style.line_space += assets_.Generator().line_space;
-    ui::NormalizeSubtitleStyle(style);
-    const std::string text = save_dialog_text_ + "\n\n" + std::string(PcText("pc_ok", language_));
-    ui::TextLayout layout = ui::LayoutText(text, style, UiCanvas::kWidth * 0.6f);
-    const glm::vec2 lo(UiCanvas::kWidth * 0.2f, UiCanvas::kHeight * 0.3f);
-    const glm::vec2 hi(UiCanvas::kWidth * 0.8f, UiCanvas::kHeight * 0.7f);
-    ui::PlaceText(layout, lo, hi, ui::TextAlign::Center, ui::TextAlign::Center, ui::TextAlign::Center);
-    DrawText(batch, canvas, *font, layout, glm::vec4(1.0f), ui::UiBlend::Alpha, ui::UiShade::Text);
+    if (textures_nav_fresh_) {
+        textures_nav_fresh_ = false;
+        textures_nav_.Open(0, menu_input.held_dirs);
+        dialog_flash_ = 0.0f;
+        return answer;
+    }
+    answer.result = textures_nav_.Update(menu_input, 2, language_, true);
+    if (textures_nav_.Moved()) dialog_flash_ = 0.0f;
+    answer.yes = answer.result == dialog::Result::Chosen && textures_nav_.Chosen() == 0;
+    return answer;
 }
 
 void GameUi::SwapTracked() {
@@ -610,15 +796,30 @@ void GameUi::DrawTheaterHint(ui::UiBatch& batch, const UiCanvas& canvas) {
     if (!font) return;
     auto line = [&](const std::string& text, glm::vec2 lo, glm::vec2 hi, ui::TextAlign align) {
         if (text.empty()) return;
-        ui::TextStyle style;
-        style.font = &font->font;
-        style.font_width = style.font_height = 18.0f;
-        ui::TextLayout layout = ui::LayoutText(text, style, hi.x - lo.x);
-        ui::PlaceText(layout, lo, hi, align, align, ui::TextAlign::Center, true);
-        DrawText(batch, canvas, *font, layout, glm::vec4(1.0f, 1.0f, 1.0f, 0.55f), ui::UiBlend::Alpha);
+        DrawPromptText(batch, canvas, assets_, *font, text, prompts_, 18.0f, lo, hi, align, ui::TextAlign::Center, glm::vec4(1.0f, 1.0f, 1.0f, 0.55f), true);
     };
     line(theater_title_, {30.0f, 14.0f}, {UiCanvas::kWidth - 30.0f, 40.0f}, ui::TextAlign::Start);
-    line(theater_hint_, {30.0f, UiCanvas::kHeight - 40.0f}, {UiCanvas::kWidth - 30.0f, UiCanvas::kHeight - 14.0f}, ui::TextAlign::Center);
+    line(theater_hint_, {30.0f, UiCanvas::kHeight - 64.0f}, {UiCanvas::kWidth - 30.0f, UiCanvas::kHeight - 14.0f}, ui::TextAlign::Center);
+}
+
+void GameUi::DrawEndingSkip(ui::UiBatch& batch, const UiCanvas& canvas) {
+    UiFont* font = assets_.Font(UiFontType::PcSystem, language_);
+    if (!font || ending_skip_alpha_ <= 0.0f) return;
+    const float light = 0.2126f * fade_.r + 0.7152f * fade_.g + 0.0722f * fade_.b;
+    const glm::vec3 ink = fade_.a > 0.5f && light > 0.5f ? glm::vec3(0.08f) : glm::vec3(1.0f);
+    const float alpha = std::clamp(ending_skip_alpha_, 0.0f, 1.0f);
+    const glm::vec2 lo(UiCanvas::kWidth - 470.0f, UiCanvas::kHeight - 74.0f);
+    const glm::vec2 hi(UiCanvas::kWidth - 40.0f, UiCanvas::kHeight - 44.0f);
+    DrawPromptText(batch, canvas, assets_, *font, PcText("pc_ending_skip_hold", language_), prompts_, 18.0f, lo, hi, ui::TextAlign::End, ui::TextAlign::Center,
+                   glm::vec4(ink, 0.75f * alpha), true);
+    const glm::vec2 bar_lo = canvas.origin + glm::vec2(lo.x + 230.0f, hi.y + 8.0f) * canvas.scale;
+    const glm::vec2 bar_hi = canvas.origin + glm::vec2(hi.x, hi.y + 11.0f) * canvas.scale;
+    const ui::UiDrawParams plain = ui::UiDrawParams::Plain(TextureManager::kWhite);
+    batch.Quad(bar_lo, bar_hi, glm::vec2(0.0f), glm::vec2(1.0f), glm::vec4(ink, 0.2f * alpha), plain, ui::UiShade::Solid, ui::UiBlend::Alpha);
+    if (ending_skip_progress_ > 0.0f) {
+        const glm::vec2 fill_hi(bar_lo.x + (bar_hi.x - bar_lo.x) * ending_skip_progress_, bar_hi.y);
+        batch.Quad(bar_lo, fill_hi, glm::vec2(0.0f), glm::vec2(1.0f), glm::vec4(ink, 0.8f * alpha), plain, ui::UiShade::Solid, ui::UiBlend::Alpha);
+    }
 }
 
 void GameUi::DrawPortCredits(ui::UiBatch& batch, const UiCanvas& canvas, glm::vec2 full) {
@@ -755,55 +956,134 @@ void GameUi::DrawSpeedrun(ui::UiBatch& batch, const UiCanvas& canvas, glm::vec2 
     line({}, speedrun_view_.total, 0.9f, white);
     line(speedrun_view_.segment_name, speedrun_view_.segment_time, 0.62f, glm::vec4(1.0f, 1.0f, 1.0f, 0.8f));
     line({}, speedrun_view_.delta, 0.62f, speedrun_view_.ahead ? glm::vec4(0.45f, 0.9f, 0.5f, 1.0f) : glm::vec4(1.0f, 0.5f, 0.42f, 1.0f));
+    speedrun_bottom_ = y;
 }
 
 void GameUi::ShowUpdateNotice(std::string note) {
-    if (!update_notice_.empty() || note.empty()) return;
-    update_notice_ = std::move(note);
-    update_notice_time_ = -1.0f;
+    if (update_notice_given_ || note.empty()) return;
+    update_notice_given_ = true;
+    ShowNotice(std::move(note));
+}
+
+void GameUi::ShowNotice(std::string note) {
+    if (note.empty()) return;
+    if (notices_.Push(note)) LogInfo("notice: queued {}", note);
 }
 
 void GameUi::UpdateUpdateNotice(Game& game, float dt) {
-    if (update_notice_.empty() || update_notice_time_ >= kUpdateNoticeLength) return;
     const bool allowed = game.Controller().Step() == 15 && !game.Demos().HasActiveCamera() && !menu_suspended_ && !update_notice_held_ &&
-                         fade_.a < 0.5f && !(menu_.IsOpen() && menu_.FirstBoot());
-    if (!allowed) return;
-    if (update_notice_time_ < 0.0f) {
-        update_notice_time_ = 0.0f;
-        LogInfo("update: notice shown");
-    } else {
-        update_notice_time_ += dt;
+                         !lisa_date_ && fade_.a < 0.5f && !(menu_.IsOpen() && (menu_.FirstBoot() || menu_.PictureFullScreen())) && !ShaderScreenShown() && !TexturesScreenShown() &&
+                         save_dialog_text_.empty();
+    const bool was_done = notices_.Done();
+    const std::string before = notices_.Current();
+    const float seconds = notices_.Time();
+    notices_.Update(dt, allowed);
+    if (notices_.Visible() && notices_.Time() <= 0.0f) LogInfo("notice: shown {}", notices_.Current());
+    if (notices_.Restarted()) LogInfo("notice: taken away {} after {:.1f} s, too soon to be read, it starts again", before, seconds);
+    if (notices_.Done() && !was_done) {
+        if (notices_.Cut()) LogInfo("notice: cut {} after {:.1f} s (taken away by a demo, a fade, a dialog or the photo mode, not shown again)", before, notices_.Time());
+        else LogInfo("notice: ended {} after {:.1f} s", before, notices_.Time());
     }
 }
 
 void GameUi::DrawUpdateNotice(ui::UiBatch& batch, const UiCanvas& canvas, glm::vec2 full) {
-    const float t = update_notice_time_;
-    if (t < 0.0f || t >= kUpdateNoticeLength || canvas.scale <= 0.0f) return;
+    if (!notices_.Visible() || canvas.scale <= 0.0f) return;
     UiFont* font = assets_.Font(UiFontType::PcSystem, language_);
     if (!font) return;
-    const std::string text = PcNoteText(update_notice_, language_);
+    const std::string text = PcNoteText(notices_.Current(), language_);
     if (text.empty()) return;
-    const float fade = t < kUpdateNoticeFadeIn                       ? t / kUpdateNoticeFadeIn
-                       : t > kUpdateNoticeFadeIn + kUpdateNoticeHold ? (kUpdateNoticeLength - t) / kUpdateNoticeFadeOut
-                                                                     : 1.0f;
+    const float fade = notices_.Alpha();
     ui::TextStyle style;
     style.font = &font->font;
     style.font_width = style.font_height = 18.0f;
     const float bar = LetterboxBar(full, letterbox_);
-    const float top = std::max(14.0f, (bar - canvas.origin.y) / canvas.scale + 12.0f);
+    float top = std::max(14.0f, (bar - canvas.origin.y) / canvas.scale + 12.0f);
+    if (speedrun_view_.shown && !menu_.IsOpen()) top = std::max(top, speedrun_bottom_ + 8.0f);
     const glm::vec2 lo(UiCanvas::kWidth * 0.15f, top);
     const glm::vec2 hi(UiCanvas::kWidth * 0.85f, top + 26.0f);
-    ui::TextLayout layout = ui::LayoutText(text, style, hi.x - lo.x);
+    ui::TextLayout layout = ui::LayoutTextInBox(text, style, glm::vec2(0.0f), hi - lo);
     ui::PlaceText(layout, lo, hi, ui::TextAlign::Center, ui::TextAlign::Center, ui::TextAlign::Start, true);
-    DrawText(batch, canvas, *font, layout, glm::vec4(1.0f, 1.0f, 1.0f, 0.55f * std::clamp(fade, 0.0f, 1.0f)), ui::UiBlend::Alpha);
+    DrawText(batch, canvas, *font, layout, glm::vec4(1.0f, 1.0f, 1.0f, 0.55f * fade), ui::UiBlend::Alpha);
 }
 
-void GameUi::Record(VkCommandBuffer cmd, VkImageView target, VkExtent2D extent) {
+void GameUi::DrawTexturesScreen(ui::UiBatch& batch, const UiCanvas& canvas, glm::vec2 full) {
+    batch.Quad(glm::vec2(0.0f), full, glm::vec2(0.0f), glm::vec2(1.0f), glm::vec4(0.0f, 0.0f, 0.0f, 1.0f), ui::UiDrawParams::Plain(TextureManager::kWhite),
+               ui::UiShade::Solid, ui::UiBlend::Alpha);
+    UiFont* font = assets_.Font(UiFontType::PcSystem, language_);
+    if (!font) return;
+    const float middle = UiCanvas::kHeight * 0.5f;
+    const float left = UiCanvas::kWidth * 0.15f, right = UiCanvas::kWidth * 0.85f;
+    if (textures_asking_) {
+        dialog::View view;
+        view.text = std::string(PcText("pc_boot_textures_ask", language_));
+        view.choices = {std::string(PcText("pc_save_move_yes", language_)), std::string(PcText("pc_save_move_no", language_))};
+        view.focus = textures_nav_.Focus();
+        view.language = language_;
+        view.back_label = std::string(PcText("pc_back", language_));
+        view.flash = menu_.SelectionFlash(dialog_flash_);
+        view.dim = 0.0f;
+        dialog::Draw(batch, canvas, assets_, menu_.Model(), prompts_, view);
+        return;
+    }
+    DrawPromptText(batch, canvas, assets_, *font, PcNoteText(textures_screen_, language_), prompts_, 18.0f, {left, middle - 28.0f}, {right, middle - 2.0f},
+                   ui::TextAlign::Center, ui::TextAlign::Center, glm::vec4(1.0f, 1.0f, 1.0f, 0.75f), true);
+    const glm::vec2 bar_lo = canvas.origin + glm::vec2(UiCanvas::kWidth * 0.35f, middle + 6.0f) * canvas.scale;
+    const glm::vec2 bar_hi = canvas.origin + glm::vec2(UiCanvas::kWidth * 0.65f, middle + 9.0f) * canvas.scale;
+    const ui::UiDrawParams plain = ui::UiDrawParams::Plain(TextureManager::kWhite);
+    batch.Quad(bar_lo, bar_hi, glm::vec2(0.0f), glm::vec2(1.0f), glm::vec4(1.0f, 1.0f, 1.0f, 0.2f), plain, ui::UiShade::Solid, ui::UiBlend::Alpha);
+    const glm::vec2 fill_hi(bar_lo.x + (bar_hi.x - bar_lo.x) * std::clamp(textures_progress_, 0.0f, 1.0f), bar_hi.y);
+    if (fill_hi.x > bar_lo.x) {
+        batch.Quad(bar_lo, fill_hi, glm::vec2(0.0f), glm::vec2(1.0f), glm::vec4(1.0f, 1.0f, 1.0f, 0.8f), plain, ui::UiShade::Solid, ui::UiBlend::Alpha);
+    }
+    DrawPromptText(batch, canvas, assets_, *font, PcText("pc_boot_textures_skip", language_), prompts_, 16.0f, {left, middle + 32.0f}, {right, middle + 58.0f},
+                   ui::TextAlign::Center, ui::TextAlign::Center, glm::vec4(1.0f, 1.0f, 1.0f, 0.55f), true);
+}
+
+void GameUi::DrawLisaVignette(ui::UiBatch& batch, glm::vec2 full, float strength) {
+    constexpr int kSegments = 64;
+    constexpr float kRadius[] = {0.52f, 0.72f, 0.88f, 1.0f, 1.6f};
+    constexpr float kShare[] = {0.0f, 0.22f, 0.58f, 0.85f, 1.0f};
+    const glm::vec2 middle = full * 0.5f;
+    const glm::vec2 half = middle * 1.4143f;
+    const glm::vec3 pink(1.0f, 0.42f, 0.66f);
+    std::vector<ui::UiVertex> v;
+    v.reserve(kSegments * 6 * 4);
+    for (int ring = 0; ring + 1 < static_cast<int>(std::size(kRadius)); ++ring) {
+        const glm::vec4 inner(pink, std::clamp(strength * kShare[ring], 0.0f, 1.0f));
+        const glm::vec4 outer(pink, std::clamp(strength * kShare[ring + 1], 0.0f, 1.0f));
+        for (int i = 0; i < kSegments; ++i) {
+            const float a0 = 6.2831853f * static_cast<float>(i) / kSegments;
+            const float a1 = 6.2831853f * static_cast<float>(i + 1) / kSegments;
+            const glm::vec2 d0(std::cos(a0), std::sin(a0));
+            const glm::vec2 d1(std::cos(a1), std::sin(a1));
+            const glm::vec2 p00 = middle + half * d0 * kRadius[ring];
+            const glm::vec2 p01 = middle + half * d1 * kRadius[ring];
+            const glm::vec2 p10 = middle + half * d0 * kRadius[ring + 1];
+            const glm::vec2 p11 = middle + half * d1 * kRadius[ring + 1];
+            v.push_back({p00, {0, 0}, inner});
+            v.push_back({p10, {0, 0}, outer});
+            v.push_back({p11, {0, 0}, outer});
+            v.push_back({p00, {0, 0}, inner});
+            v.push_back({p11, {0, 0}, outer});
+            v.push_back({p01, {0, 0}, inner});
+        }
+    }
+    batch.Draw(v, ui::UiDrawParams::Plain(TextureManager::kWhite), ui::UiShade::Solid, ui::UiBlend::Alpha);
+}
+
+void GameUi::Record(gpu::CommandList& cmd, gpu::ImageViewHandle target, gpu::Extent2D extent, Part part) {
     (void)target;
     if (!ready_ || !batch_) {
+        top_pending_ = false;
         return;
     }
     ui::UiBatch& batch = *batch_;
+    if (part == Part::Top) {
+        if (top_pending_) {
+            batch.RecordTop(cmd, extent);
+        }
+        return;
+    }
     batch.Begin(extent);
     batch.SetCoverageAlpha(vr_hud_);
     const UiCanvas canvas = UiCanvas::Fit(extent);
@@ -836,6 +1116,12 @@ void GameUi::Record(VkCommandBuffer cmd, VkImageView target, VkExtent2D extent) 
     layers.push_back({kSubliminalStringPriority, [&] { DrawSubliminal(batch, true); }});
     layers.push_back({kSubliminalNoisePriority, [&] { DrawSubliminal(batch, false); }});
     layers.push_back({strong_subtitles_ ? kStrongSubtitlePriority : kSubtitlePriority, [&] { DrawSubtitle(batch, canvas); }});
+    if (!sound_captions_.empty() && !vr_hud_) {
+        layers.push_back({strong_subtitles_ ? kStrongSubtitlePriority : kSubtitlePriority, [&] { DrawSoundCaptions(batch, canvas, full); }});
+    }
+    if (lisa_vignette_ > 0.0f && !vr_hud_) {
+        layers.push_back({kLisaVignettePriority, [&] { DrawLisaVignette(batch, full, lisa_vignette_); }});
+    }
     if (LetterboxBar(full, letterbox_) > 0.0f && !vr_hud_) {
         layers.push_back({kLetterboxPriority, [&] { DrawLetterbox(batch, full, letterbox_); }});
     }
@@ -852,7 +1138,45 @@ void GameUi::Record(VkCommandBuffer cmd, VkImageView target, VkExtent2D extent) 
         layers.push_back({SaveIcon::kPriority - 1, [&] { DrawTheaterHint(batch, canvas); }});
     }
     if (demo_ui_.Active()) {
-        layers.push_back({DemoUi::kPriority, [&] { demo_ui_.Draw(batch, canvas, language_); }});
+        layers.push_back({DemoUi::kPriority, [&] {
+                              if (const glm::vec4 color = demo_ui_.BugPillarColor(); color.a > 0.0f) {
+                                  const float left = canvas.origin.x;
+                                  const float right = canvas.origin.x + UiCanvas::kWidth * canvas.scale;
+                                  const auto plain = ui::UiDrawParams::Plain(TextureManager::kWhite);
+                                  if (left > 0.5f) batch.Quad(glm::vec2(0.0f), glm::vec2(left, full.y), glm::vec2(0.0f), glm::vec2(1.0f), color, plain, ui::UiShade::Solid, ui::UiBlend::Alpha);
+                                  if (full.x - right > 0.5f) batch.Quad(glm::vec2(right, 0.0f), full, glm::vec2(0.0f), glm::vec2(1.0f), color, plain, ui::UiShade::Solid, ui::UiBlend::Alpha);
+                              }
+                              demo_ui_.Draw(batch, canvas, language_);
+                          }});
+    }
+    if (boot_splash_ != 0 && boot_splash_time_ > 0.0f) {
+        layers.push_back({SaveIcon::kPriority - 2, [&] {
+                              const glm::vec2 lo = canvas.origin;
+                              const glm::vec2 hi = canvas.origin + glm::vec2(UiCanvas::kWidth, UiCanvas::kHeight) * canvas.scale;
+                              const float alpha = std::clamp(boot_splash_time_ / 0.6f, 0.0f, 1.0f);
+                              batch.Quad(lo, hi, glm::vec2(0.0f), glm::vec2(1.0f), glm::vec4(1.0f, 1.0f, 1.0f, alpha),
+                                         ui::UiDrawParams::Plain(boot_splash_), ui::UiShade::Material, ui::UiBlend::Alpha);
+                          }});
+    }
+    if (!shader_screen_.empty() && canvas.scale > 0.0f) {
+        layers.push_back({kShaderScreenPriority, [&] {
+                              batch.Quad(glm::vec2(0.0f), full, glm::vec2(0.0f), glm::vec2(1.0f), glm::vec4(0.0f, 0.0f, 0.0f, 1.0f),
+                                         ui::UiDrawParams::Plain(TextureManager::kWhite), ui::UiShade::Solid, ui::UiBlend::Alpha);
+                              UiFont* font = assets_.Font(UiFontType::PcSystem, language_);
+                              const std::string text = font ? PcNoteText(shader_screen_, language_) : std::string();
+                              if (text.empty()) return;
+                              ui::TextStyle style;
+                              style.font = &font->font;
+                              style.font_width = style.font_height = 18.0f;
+                              const glm::vec2 lo(UiCanvas::kWidth * 0.15f, UiCanvas::kHeight * 0.5f - 13.0f);
+                              const glm::vec2 hi(UiCanvas::kWidth * 0.85f, UiCanvas::kHeight * 0.5f + 13.0f);
+                              ui::TextLayout layout = ui::LayoutText(text, style, hi.x - lo.x);
+                              ui::PlaceText(layout, lo, hi, ui::TextAlign::Center, ui::TextAlign::Center, ui::TextAlign::Start, true);
+                              DrawText(batch, canvas, *font, layout, glm::vec4(1.0f, 1.0f, 1.0f, 0.75f), ui::UiBlend::Alpha);
+                          }});
+    }
+    if (!textures_screen_.empty() && canvas.scale > 0.0f) {
+        layers.push_back({kShaderScreenPriority, [&] { DrawTexturesScreen(batch, canvas, full); }});
     }
     if (save_icon_.Visible()) {
         layers.push_back({SaveIcon::kPriority, [&] { save_icon_.Draw(batch, canvas); }});
@@ -863,17 +1187,39 @@ void GameUi::Record(VkCommandBuffer cmd, VkImageView target, VkExtent2D extent) 
     if (port_credits_time_ >= 0.0f && !menu_.IsOpen()) {
         layers.push_back({kPortCreditsPriority, [&] { DrawPortCredits(batch, canvas, full); }});
     }
+    if (ending_skip_alpha_ > 0.0f && !vr_hud_) {
+        layers.push_back({kEndingSkipPriority, [&] { DrawEndingSkip(batch, canvas); }});
+    }
     if (speedrun_view_.shown && !menu_.IsOpen()) {
         layers.push_back({kSpeedrunPriority, [&] { DrawSpeedrun(batch, canvas, full); }});
     }
     if (UpdateNoticeShown() && !vr_hud_) {
         layers.push_back({kUpdateNoticePriority, [&] { DrawUpdateNotice(batch, canvas, full); }});
     }
+    if (lisa_date_) {
+        layers.push_back({LisaDate::kUiPriority, [&] {
+                              ui::UiDrawParams noise = ui::UiDrawParams::Plain(noise_texture_);
+                              noise.textures[1] = noise_normal_texture_;
+                              const gpu::Format scene_format = renderer_ ? renderer_->SceneColorFormat() : Renderer::kSceneColorFormat;
+                              const bool hdr_scene = scene_format == gpu::Format::R16G16B16A16Sfloat || scene_format == gpu::Format::R32G32B32A32Sfloat;
+                              noise.extra2 = hdr_scene ? glm::vec4(renderer_ ? renderer_->exposure : 1.0f, 2.2f, 0.0f, 0.0f) : glm::vec4(1.0f, 1.0f, 0.0f, 0.0f);
+                              noise.extra2.z = full.y > 0.0f ? (full.x / full.y) / (16.0f / 9.0f) : 1.0f;
+                              lisa_date_->DrawUi(batch, canvas, full, noise);
+                          }});
+    }
     std::stable_sort(layers.begin(), layers.end(), [](const Layer& a, const Layer& b) { return a.priority < b.priority; });
     for (const Layer& layer : layers) {
+        if (part == Part::Below && layer.priority >= kGrainPriority && !batch.HasTop()) {
+            batch.MarkTop();
+        }
         layer.draw();
     }
-    batch.Record(cmd, extent);
+    if (part == Part::Below) {
+        top_pending_ = batch.HasTop();
+        batch.RecordBelow(cmd, extent);
+    } else {
+        batch.Record(cmd, extent);
+    }
 }
 
 namespace {
@@ -891,8 +1237,10 @@ constexpr float kPhotoScale = 0.8f;
 constexpr float kPhotoLabelX = -58.0f;
 constexpr float kPhotoValueX = kPhotoLabelX + 32.0f * kPhotoScale;
 constexpr float kPhotoArrow = 12.0f * kPhotoScale;
-constexpr float kPhotoTitleY = 30.0f;
-constexpr float kPhotoTop = 25.5f;
+constexpr float kPhotoTitleY = 32.0f;
+constexpr float kPhotoTop = 27.5f;
+constexpr float kPhotoBottom = -35.0f;
+constexpr float kPhotoTipRoom = 11.6f;
 constexpr float kPhotoRowStep = 3.0f * kPhotoScale;
 constexpr float kPhotoSectionGap = 3.5f * kPhotoScale;
 constexpr float kPhotoPanelRight = -14.0f;
@@ -991,10 +1339,14 @@ void GameUi::DrawPhotoPanel(ui::UiBatch& batch, const UiCanvas& canvas, const Ph
     auto box_text = [&](uint16_t id, std::string_view value, glm::vec2 lo, glm::vec2 hi, glm::vec4 color) {
         const ui::UifNode* node = model->FindById(id);
         if (!node || !font || value.empty()) return;
-        const ui::TextStyle text_style =
+        ui::TextStyle text_style =
             NodeTextStyle(*font, assets_.FontStyleByHash(node->font_name, language), root_scale * OwnScale(*node) * kPhotoScale);
-        const ui::TextLayout layout = ui::LayoutTextInBox(value, text_style, VirtualPx({lo.x, hi.y}), VirtualPx({hi.x, lo.y}), true);
+        const PromptLine line = ExpandPromptHint(value, prompts_);
+        text_style.inline_advances = PromptAdvances(assets_, line, prompts_, text_style.font_height);
+        text_style.inline_advance = text_style.inline_advances.empty() ? 0.0f : text_style.inline_advances.front();
+        const ui::TextLayout layout = ui::LayoutTextInBox(line.text, text_style, VirtualPx({lo.x, hi.y}), VirtualPx({hi.x, lo.y}), true);
         DrawText(batch, canvas, *font, layout, color, ui::UiBlend::Alpha);
+        DrawPromptPictures(batch, canvas, assets_, *font, layout, line, prompts_, color.a);
     };
     auto mesh = [&](uint16_t id, glm::vec2 parent, glm::vec2 at, glm::vec4 color) {
         const ui::UifNode* node = model->FindById(id);
@@ -1028,6 +1380,11 @@ void GameUi::DrawPhotoPanel(ui::UiBatch& batch, const UiCanvas& canvas, const Ph
 
     text(kOptionTitle, glm::vec2(1.0f), PcText("pc_photo_title", language), kPhotoLabelX, text_right, kPhotoTitleY, ui::TextAlign::Start,
          root_color * node_color(kOptionTitle));
+    int sections = 0;
+    for (const PhotoPanelRow& row : view.rows) sections += row.section ? 1 : 0;
+    const int steps = static_cast<int>(view.rows.size());
+    const float room = kPhotoTop - (kPhotoBottom + kPhotoTipRoom) - std::max(0, sections - 1) * (kPhotoSectionGap - kPhotoRowStep);
+    const float row_step = steps > 0 ? std::min(kPhotoRowStep, room / static_cast<float>(steps)) : kPhotoRowStep;
     float y = kPhotoTop;
     bool first = true;
     for (const PhotoPanelRow& row : view.rows) {
@@ -1036,7 +1393,7 @@ void GameUi::DrawPhotoPanel(ui::UiBatch& batch, const UiCanvas& canvas, const Ph
             text(kOptionHeaderText, glm::vec2(1.0f), row.label, kPhotoLabelX, kPhotoValueX + kPhotoArrow + 2.0f, y, ui::TextAlign::Start,
                  root_color * node_color(kOptionHeaderText));
             mesh(kOptionHeaderLine, glm::vec2(1.0f), glm::vec2(kPhotoLabelX, y) + glm::vec2(16.0f, -1.0f) * kPhotoScale, root_color);
-            y -= kPhotoRowStep;
+            y -= row_step;
             first = false;
             continue;
         }
@@ -1057,16 +1414,16 @@ void GameUi::DrawPhotoPanel(ui::UiBatch& batch, const UiCanvas& canvas, const Ph
                      tint(available ? (row.selected ? 1.0f : 0.65f) : 0.25f));
             }
         }
-        y -= kPhotoRowStep;
+        y -= row_step;
     }
     const glm::vec4 tip_color = root_color * node_color(kOptionTipText);
     const float note_top = y - 0.6f;
     box_text(kOptionTipText, view.note, {kPhotoLabelX, note_top - 5.4f}, {text_right, note_top}, tip_color);
-    box_text(kOptionTipText, view.hint, {kPhotoLabelX, note_top - 11.0f}, {text_right, note_top - 6.2f},
+    box_text(kOptionTipText, view.hint, {kPhotoLabelX, std::max(note_top - 11.0f, kPhotoBottom)}, {text_right, note_top - 6.2f},
              tip_color * glm::vec4(1.0f, 1.0f, 1.0f, 0.6f));
 }
 
-void GameUi::RecordPhotoMode(VkCommandBuffer cmd, VkExtent2D extent, const PhotoPanelView& view) {
+void GameUi::RecordPhotoMode(gpu::CommandList& cmd, gpu::Extent2D extent, const PhotoPanelView& view) {
     if (!ready_ || !batch_) {
         return;
     }
@@ -1078,7 +1435,13 @@ void GameUi::RecordPhotoMode(VkCommandBuffer cmd, VkExtent2D extent, const Photo
     canvas_ready_ = true;
     batch.SetScreenArea(canvas.origin, UiCanvas::kHeight * canvas.scale);
     const glm::vec2 full(static_cast<float>(extent.width), static_cast<float>(extent.height));
-    DrawLetterbox(batch, full, view.letterbox);
+    const glm::vec2 lo(view.crop.x*full.x,view.crop.y*full.y);
+    const glm::vec2 hi((view.crop.x+view.crop.width)*full.x,(view.crop.y+view.crop.height)*full.y);
+    const auto black=ui::UiDrawParams::Plain(TextureManager::kWhite);
+    const glm::vec4 color(0,0,0,1);
+    auto matte=[&](glm::vec2 a,glm::vec2 b){ if(b.x>a.x && b.y>a.y) batch.Quad(a,b,{0,0},{1,1},color,black,ui::UiShade::Solid,ui::UiBlend::Alpha); };
+    matte({0,0},{full.x,lo.y}); matte({0,hi.y},full);
+    matte({0,lo.y},{lo.x,hi.y}); matte({hi.x,lo.y},{full.x,hi.y});
     if (view.panel) {
         DrawPhotoPanel(batch, canvas, view);
     }

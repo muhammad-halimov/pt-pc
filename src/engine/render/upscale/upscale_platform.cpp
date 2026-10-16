@@ -72,4 +72,38 @@ int HardwareGpuScheduling(const uint8_t (&luid)[8]) {
 
 }
 
+#elif defined(__linux__)
+
+#include <cstdint>
+
+namespace pt {
+
+std::string NarrowText(const wchar_t* text) {
+    std::string out;
+    for (; text && *text; ++text) {
+        uint32_t c = static_cast<uint32_t>(*text);
+        if (c > 0x10FFFF || (c >= 0xD800 && c <= 0xDFFF)) {
+            c = 0xFFFD;
+        }
+        if (c < 0x80) {
+            out += static_cast<char>(c);
+        } else if (c < 0x800) {
+            out += static_cast<char>(0xC0 | (c >> 6));
+            out += static_cast<char>(0x80 | (c & 0x3F));
+        } else if (c < 0x10000) {
+            out += static_cast<char>(0xE0 | (c >> 12));
+            out += static_cast<char>(0x80 | ((c >> 6) & 0x3F));
+            out += static_cast<char>(0x80 | (c & 0x3F));
+        } else {
+            out += static_cast<char>(0xF0 | (c >> 18));
+            out += static_cast<char>(0x80 | ((c >> 12) & 0x3F));
+            out += static_cast<char>(0x80 | ((c >> 6) & 0x3F));
+            out += static_cast<char>(0x80 | (c & 0x3F));
+        }
+    }
+    return out;
+}
+
+}
+
 #endif

@@ -6,6 +6,11 @@ p=argparse.ArgumentParser();p.add_argument('--runtime',type=Path,required=True);
 # --out: another folder for the payload (the Linux installer's, tools/linux/attach_payload.py); the Windows one stays where CMake looks
 p.add_argument('--out',type=Path,default=REPO/'dump/installer-20261002/native')
 a=p.parse_args()
+with zipfile.ZipFile(a.runtime) as runtime_zip:
+    windows_runtime=any(name.lower().endswith('.exe') for name in runtime_zip.namelist())
+if windows_runtime:
+    from package import validate_upscaler_archive
+    validate_upscaler_archive(a.runtime)
 out=a.out;out.mkdir(parents=True,exist_ok=True)
 sourcezip=out/'extractor-source.zip'
 with zipfile.ZipFile(sourcezip,'w',zipfile.ZIP_DEFLATED) as z:
@@ -19,12 +24,16 @@ with zipfile.ZipFile(a.runtime) as z:
         parts=Path(entry.filename).parts
         if entry.is_dir() or len(parts)<2:continue
         name=Path(*parts[1:]).as_posix()
-        if parts[1].lower() in {'game','cusa01127','enhanced-textures'}:raise RuntimeError('Game assets in runtime ZIP')
+        if parts[1].lower() in {'game','cusa01127','enhanced-textures','data'}:raise RuntimeError('Game assets or writable data directory in runtime ZIP')
         files[name]=z.read(entry)
 for file in a.extractor.rglob('*'):
     if file.is_file() and file.suffix.lower()!='.pdb':files['extractor/'+file.relative_to(a.extractor).as_posix()]=file.read_bytes()
 files['extractor/LibOrbisPkg-corresponding-source.zip']=sourcezip.read_bytes()
 files['extractor/LICENSE-LibOrbisPkg.txt']=(a.source/'LICENSE.txt').read_bytes()
+# the payload's own file list (tools/package.py, pt-files.json): every file the setup installs, the helper included
+import sys;sys.path.insert(0,str(REPO/'tools'))
+from package import FILE_LIST,file_list
+files[FILE_LIST]=file_list(files)
 with (out/'payload.bin').open('wb') as f:
     f.write(b'PTSETUP1'+struct.pack('<I',len(files)))
     for name,data in sorted(files.items()):

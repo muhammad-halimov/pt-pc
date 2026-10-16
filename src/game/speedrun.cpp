@@ -1,3 +1,4 @@
+#include "engine/platform/os.h"
 #include "game/speedrun.h"
 
 #include <algorithm>
@@ -124,7 +125,23 @@ void SpeedrunTimer::SetRecordDirectory(const std::filesystem::path& directory) {
     records_loaded_ = false;
 }
 
+void SpeedrunTimer::PauseReal() {
+    if (real_paused_) return;
+    real_paused_ = true;
+    paused_at_ = std::chrono::steady_clock::now();
+}
+
+void SpeedrunTimer::ResumeReal() {
+    if (!real_paused_) return;
+    real_paused_ = false;
+    const auto paused = std::chrono::steady_clock::now() - paused_at_;
+    start_ += paused;
+    last_split_at_ += paused;
+    LogInfo("speedrun: real time paused {:.1f} s (Coffee with Lisa)", Seconds(paused));
+}
+
 double SpeedrunTimer::Real() const {
+    if (state_ == State::Running && real_paused_) return Seconds(paused_at_ - start_);
     if (state_ == State::Running) return Seconds(std::chrono::steady_clock::now() - start_);
     return real_final_;
 }
@@ -368,7 +385,7 @@ void SpeedrunTimer::SaveRecords() {
     std::filesystem::create_directories(directory_, ec);
     std::ofstream out(directory_ / kRecordsFile, std::ios::binary);
     out << text.str();
-    if (!out) LogWarn("speedrun: cannot write {}", (directory_ / kRecordsFile).string());
+    if (!out) LogWarn("speedrun: cannot write {}", pt::os::PathToUtf8(directory_ / kRecordsFile));
 }
 
 void SpeedrunTimer::AppendHistory() {

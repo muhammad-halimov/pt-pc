@@ -24,7 +24,7 @@ layout(location = 0) out vec4 out_color;
 float g_mip_bias = 0.0;
 
 vec4 Tex(uint index, vec2 uv) {
-    return texture(textures[nonuniformEXT(index)], uv, g_mip_bias);
+    return texture(PT_TEX2D(index), uv, g_mip_bias);
 }
 
 vec4 ForwardOut(vec3 encoded_premultiplied, float a) {
@@ -130,7 +130,7 @@ void main() {
         highlight += c * spec * ndl;
     }
     uint cube = (m.flags & MAT_COMMON_REFLECTION) != 0u ? uint(draw.aux1.w) : m.aux0;
-    vec3 refl = texture(cube_textures[nonuniformEXT(cube)], Rw).rgb;
+    vec3 refl = texture(PT_TEXCUBE(cube), Rw).rgb;
     vec3 tint = (1.0 - F) * (m.albedo_factor.rgb - m.extra.rgb * refl);
     vec3 color = (m.albedo_factor.w * tint + m.extra.rgb * refl) * irradiance + highlight;
     float dither = ImgFetch(RES_DITHER, ivec2(gl_FragCoord.xy) & 7).z * 0.0078125;

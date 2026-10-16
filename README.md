@@ -9,8 +9,11 @@ rebuilt in C++ from the original's behaviour and the renderer is written on Vulk
 script and cutscene is read at run time from your own copy of the PS4 game. There is no game data in this repository
 and none in the installer.
 
-I made this on my own, in my spare time, because P.T. deserved to keep existing somewhere other than on consoles that
-still have it installed. It plays the whole teaser from the first wake-up to the street, with the voice part included.
+The port runs on its own engine, Hallway Engine.
+
+I made this in my spare time, with AI tools (see AI Disclosure at the end), because P.T. deserved to keep existing
+somewhere other than on consoles that still have it installed. It plays the whole teaser from the first wake-up to
+the street, with the voice part included.
 
 ## What you need
 
@@ -18,11 +21,12 @@ still have it installed. It plays the whole teaser from the first wake-up to the
   or a fake PKG made from that dump. The European and Japanese releases install too, with a note, but I have not seen
   their data myself. A store PKG cannot be used: it is encrypted for the console that owns it, and nothing here
   decrypts it.
-- Windows 10 or 11 (x64), or Linux x86-64 with glibc 2.38 or newer (Ubuntu 24.04, Debian 13, Fedora 39, current Arch
-  and SteamOS).
-- A GPU and driver with Vulkan 1.3. The optional ray-traced shadows, ambient occlusion and reflections need a GPU with
-  Vulkan ray queries. DLSS needs a GeForce RTX card; FSR and XeSS run on any recent GPU. The settings page greys out
-  what your machine cannot run and says why.
+- Windows 10 or 11 (x64), Linux x86-64 with glibc 2.38 or newer (Ubuntu 24.04, Debian 13, Fedora 39, current Arch
+  and SteamOS), or macOS 14 or newer on an Apple silicon or Intel Mac.
+- A GPU and driver with Vulkan 1.3; on macOS the port brings MoltenVK, which runs Vulkan on Metal. The optional
+  ray-traced shadows, ambient occlusion and reflections need a GPU with Vulkan ray queries (not on macOS). DLSS needs a
+  GeForce RTX card; FSR and XeSS run on any recent GPU (Windows only). The settings page greys out what your machine
+  cannot run and says why.
 - A microphone for one part of the game, as on the PS4. If you have none, `key = J` under `[voice]` in `pt.ini` lets a
   key stand in for the spoken word.
 
@@ -37,12 +41,22 @@ system files are not used.
 Linux: `chmod +x` the setup and run it from a terminal. The game needs only glibc and the system's Vulkan driver. On a Steam Deck
 install from desktop mode and add `pt` as a non-Steam game; it runs on SteamOS as it is.
 
-There is also a portable zip on the Releases page if you prefer to put the game files in place yourself: unpack it,
-then start `pt.exe --game <your CUSA01127 folder>` once, or put the folder next to the executable as `game/CUSA01127`.
+macOS: download `P.T.PC.Port-macOS-arm64.zip` (M1 and later) or `P.T.PC.Port-macOS-x64.zip` (Intel), unzip `P.T. PC Port.app`,
+open it once and allow it under System Settings > Privacy & Security (it is not signed with a Developer ID), then pick your
+dump folder when it asks. A fake PKG has to be extracted on Windows or Linux first. Intel Macs need a GPU that MoltenVK can
+run the renderer on; the port was written without a Mac at hand and the Intel app has not been run on one yet. More in
+docs/macos.md.
 
-Settings go to `%APPDATA%\pt-port\pt\pt.ini` on Windows and `~/.local/share/pt-port/pt/` on Linux, together with the
-save, the log (`pt.log`) and crash dumps. The game checks the Releases page for a newer version once at start; `[network]
-check_updates = 0` turns that off.
+The published 1.0.1 release contains setup downloads, not a portable ZIP. The earlier README incorrectly claimed
+a ZIP was available. The setup accepts an already extracted dump folder as well as a fake PKG.
+
+This source tree contains the upcoming 1.0.2 changes; its new features and macOS packages are not yet published release
+downloads. On Windows and Linux, 1.0.2 stores settings, saves, logs and cache in `data/` beside the executable and migrates
+existing user data without overwriting newer files. On macOS, these stay in `~/Library/Application Support/pt-port/pt/`.
+The game checks GitHub Releases for a newer version at startup; `[network] check_updates = 0` disables that check.
+
+Thanks to ahm3texe for the Apple silicon port, totsu0jv for Czech translation, and yewhochen for the Linux library-loading
+and startup-focus fixes. Their contributions are incorporated here, with platform and release changes adapted for 1.0.2.
 
 ## Playing
 
@@ -58,7 +72,8 @@ Everything below is off or set to the original's behaviour by default. The PS4 l
 there if you want them.
 
 Display and image
-- Window, borderless or fullscreen, any resolution, v-sync on or off.
+- Windowed, borderless or exclusive fullscreen, with a selectable render resolution and v-sync on or off. Exclusive
+  fullscreen lists supported display modes; borderless keeps the desktop window and can render at another selected size.
 - Upscalers: AMD FSR 3.1, NVIDIA DLSS 4.5 (with a choice of model) and Intel XeSS, in the usual quality steps or a
   custom scale, plus native-resolution anti-aliasing (FSR native AA, DLAA).
 - Frame generation: AMD FSR 3 on Radeon RX 5000 or newer, NVIDIA DLSS Frame Generation on RTX 40 or newer.
@@ -69,12 +84,17 @@ Display and image
   fringing. Each one can go back to the PS4 setting on its own.
 
 Extras
-- Photo mode (F7): pause, fly the camera, set field of view, roll, aperture and the flashlight, save to Pictures/PT
-  Photos.
+- Photo mode (F7): pause, fly the camera, adjust focal length, focus, aperture, exposure and roll, choose an aspect
+  crop and color filter, then save at native resolution or 4K (3840 pixels on the long edge) to Pictures/PT Photos.
 - Free camera (F6).
 - Loop browser: jump to any loop of the house once you have finished the game.
 - Museum: the game's subliminal images, radio and voice lines with transcripts, photo pieces, cutscenes, models and
-  unused content, as you reach them in play.
+  unused content, as you reach them in play. Pan model exhibits with WASD or the left stick; orbit with arrows or the
+  right stick.
+- Controller feedback: Original vibration is the default. Enhanced adds supported trigger vibration and, on supported
+  wired USB DualSense controllers on Windows, haptics from filtered Lisa cries. The optional controller speaker and
+  its volume are separate from vibration; the main game and headphone mix continue unchanged. Physical controller
+  output still needs hardware validation.
 - Game+: the content a finished game unlocks.
 - Speedrun timer with a split at every loop, real time and game time, personal bests, and a LiveSplit server
   connection (Control > Start TCP Server in LiveSplit).
@@ -84,7 +104,7 @@ Extras
 
 Languages
 - The original's English, French, German, Spanish, Italian, Portuguese and Japanese, plus Turkish, Simplified Chinese,
-  Arabic, Russian and Ukrainian added by the port: menus, the PC settings and all subtitle lines. Voice audio stays the
+  Arabic, Russian, Ukrainian and Czech added by the port: menus, the PC settings and all subtitle lines. Voice audio stays the
   original English, and the word the microphone listens for is always "Jack".
 
 Mods
@@ -105,6 +125,11 @@ tools\package.py` turns the build into the portable folder and zip.
 Linux: `cmake -G Ninja -B build/linux -DCMAKE_BUILD_TYPE=RelWithDebInfo && cmake --build build/linux --target pt`.
 GCC 13 or clang 17, the Vulkan headers and `glslc`. The upscalers are Windows-only SDKs and are left out there.
 `tools/linux/` has the cross build I use from Windows. More in docs/linux.md.
+
+macOS (Apple silicon or Intel, built for the CPU it runs on): the command line tools, then `brew install cmake ninja shaderc
+vulkan-headers vulkan-loader` and `cmake -G Ninja -B build/macos -DCMAKE_BUILD_TYPE=RelWithDebInfo && cmake --build
+build/macos --target pt`. `python3 tools/macos/make_app.py` makes the app bundle and its zip. The upscalers and the VR mode
+are left out there too, and MoltenVK has no ray queries. More in docs/macos.md.
 
 The unit tests are CMake targets (`pt_tests`, `pt_mods_test` and the others in CMakeLists.txt). `python
 tools/walkthrough.py --exe build/release/pt.exe --game <folder>` plays the whole game without a window through the
@@ -134,3 +159,11 @@ executable.
 
 The port's own code is under the MIT license (see LICENSE). The third-party pieces listed above keep their own
 licenses.
+
+## AI Disclosure
+
+AI coding tools were used in developing and debugging this port. My focus has been on matching the original P.T.:
+comparing builds with PS4 references, identifying discrepancies, testing gameplay and prioritizing fixes.
+
+The project uses the original game assets from the player's own PS4 copy. Optional enhanced textures use
+machine-learning upscaling on existing textures.

@@ -82,6 +82,7 @@ public:
     void LogicControl(int state);
     void Update(float dt);
     int State() const { return state_; }
+    int LookPhase() const { return look_phase_; }
     bool Visible() const { return visible_; }
     bool HasKilled() const { return has_killed_; }
     void Setup();
@@ -91,6 +92,7 @@ public:
     int SpawnIndex() const { return spawn_; }
     int WarpPhase() const { return warp_phase_; }
     float TimerA() const { return timer_a_; }
+    float Wait() const { return wait_; }
 
 private:
     struct Spawn {

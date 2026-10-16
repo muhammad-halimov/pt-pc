@@ -8,8 +8,10 @@
 #include <thread>
 
 #include "engine/assets/fmdl.h"
+#include "engine/assets/gltf_model.h"
 #include "engine/core/log.h"
 #include "engine/core/parallel_for.h"
+#include "engine/fs/mods.h"
 
 namespace pt::game {
 namespace {
@@ -72,6 +74,66 @@ const BodyState* Stage::FindBody(const fox2::Entity* entity) const {
     return it == bodies_.end() ? nullptr : &it->second;
 }
 
+namespace {
+glm::mat4 TurnScale(const std::array<float, 3>& turn, const std::array<float, 3>& scale) {
+    glm::mat4 m(1.0f);
+    m = glm::rotate(m, glm::radians(turn[1]), glm::vec3(0, 1, 0));
+    m = glm::rotate(m, glm::radians(turn[0]), glm::vec3(1, 0, 0));
+    m = glm::rotate(m, glm::radians(turn[2]), glm::vec3(0, 0, 1));
+    return glm::scale(m, glm::vec3(scale[0], scale[1], scale[2]));
+}
+}
+
+void StageManager::ApplyModLevel(Stage& stage, std::vector<std::string>& notes) {
+    const mods::ModSet* set = mods::Active();
+    if (!set || (set->level_edits.empty() && set->level_adds.empty())) return;
+    for (const mods::LevelEdit& edit : set->level_edits) {
+        if (!mods::LevelStageMatches(edit.stage, stage.package_path)) continue;
+        int matched = 0;
+        for (const auto& file : stage.files) {
+            auto& models = file->static_models;
+            for (size_t i = 0; !edit.model.empty() && i < models.size();) {
+                StaticModelPlacement& m = models[i];
+                if (!mods::LevelNameMatches(edit.model, m.name)) {
+                    ++i;
+                    continue;
+                }
+                ++matched;
+                if (edit.hide) {
+                    models.erase(models.begin() + static_cast<ptrdiff_t>(i));
+                    continue;
+                }
+                m.world = glm::translate(glm::mat4(1.0f), glm::vec3(edit.move[0], edit.move[1], edit.move[2])) * m.world *
+                          TurnScale(edit.turn, edit.scale);
+                if (!edit.collision) m.geom_file.clear();
+                if (!edit.replace.empty()) m.model_file = edit.replace;
+                ++i;
+            }
+            for (LightPlacement& l : file->lights) {
+                if (edit.light.empty() || !mods::LevelNameMatches(edit.light, l.name)) continue;
+                ++matched;
+                l.mod_off = l.mod_off || edit.off;
+                l.mod_tint *= glm::vec3(edit.tint[0], edit.tint[1], edit.tint[2]);
+                l.mod_brightness *= edit.brightness;
+            }
+        }
+        notes.push_back(std::format("mods: {} level.json: {} {} in {}: {} matched{}", edit.mod, edit.model.empty() ? "light" : "model",
+                                    edit.model.empty() ? edit.light : edit.model, stage.package_path, matched,
+                                    matched ? "" : " (check the entity name and the stage)"));
+    }
+    for (const mods::LevelAdd& add : set->level_adds) {
+        if (!mods::LevelStageMatches(add.stage, stage.package_path)) continue;
+        StaticModelPlacement m;
+        m.name = add.name;
+        m.model_file = add.model;
+        m.world = glm::translate(glm::mat4(1.0f), glm::vec3(add.at[0], add.at[1], add.at[2])) * TurnScale(add.turn, add.scale);
+        m.mod_collision = add.collision;
+        stage.main->static_models.push_back(std::move(m));
+        notes.push_back(std::format("mods: {} level.json: {} added to {} at ({:.2f} {:.2f} {:.2f})", add.mod, add.model, stage.package_path,
+                                    add.at[0], add.at[1], add.at[2]));
+    }
+}
+
 StageManager::ParsedStage StageManager::Parse(Vfs& vfs, const std::string& fpk_path, const KnownAssets* known) {
     ParsedStage parsed;
     auto stage = std::make_unique<Stage>();
@@ -108,6 +170,7 @@ StageManager::ParsedStage StageManager::Parse(Vfs& vfs, const std::string& fpk_p
     if (!stage->main) {
         stage->main = stage->files.front().get();
     }
+    ApplyModLevel(*stage, parsed.notes);
     stage->file_root = stage->main->has_root ? stage->main->root : glm::mat4(1.0f);
     if (known) {
         std::unordered_set<std::string> stems;
@@ -117,8 +180,7 @@ StageManager::ParsedStage StageManager::Parse(Vfs& vfs, const std::string& fpk_p
                     continue;
                 }
                 auto model = std::make_shared<FmdlModel>();
-                auto bytes = vfs.ReadFile(placement.model_file);
-                if (!bytes || !LoadFmdl(*bytes, placement.model_file, *model)) {
+                if (!LoadModelFile(vfs, placement.model_file, *model)) {
                     model.reset();
                 }
                 if (model) {
@@ -160,8 +222,7 @@ StageManager::ParsedStage StageManager::Parse(Vfs& vfs, const std::string& fpk_p
                         auto& slot = position_models[placement.model_file];
                         if (!slot) {
                             slot = std::make_shared<FmdlModel>();
-                            auto bytes = vfs.ReadFile(placement.model_file);
-                            if (!bytes || !LoadFmdl(*bytes, placement.model_file, *slot)) {
+                            if (!LoadModelFile(vfs, placement.model_file, *slot)) {
                                 slot.reset();
                             }
                         }
@@ -186,14 +247,14 @@ void StageManager::StartPrefetch(const std::string& fpk_path) {
     for (const auto& [geom_file, lines] : line_cache_) {
         known->geoms.insert(geom_file);
     }
-    prefetch_ = std::async(std::launch::async, [&vfs = vfs_, fpk_path, known] { return Parse(vfs, fpk_path, known.get()); });
+    prefetch_ = std::make_unique<Prefetch>();
+    prefetch_->task = std::make_unique<ParallelTask>([&vfs = vfs_, fpk_path, known, out = &prefetch_->parsed] {
+        *out = Parse(vfs, fpk_path, known.get());
+    });
 }
 
 void StageManager::DropPrefetch() {
-    if (prefetch_.valid()) {
-        prefetch_.wait();
-        prefetch_ = {};
-    }
+    prefetch_.reset();
     prefetch_path_.clear();
 }
 
@@ -227,9 +288,11 @@ std::unique_ptr<Stage> StageManager::Load(const std::string& fpk_path, const std
     const auto started = clock::now();
     ++load_count_;
     ParsedStage parsed;
-    const bool prefetched = prefetch_.valid() && prefetch_path_ == fpk_path;
+    const bool prefetched = prefetch_ && prefetch_path_ == fpk_path;
     if (prefetched) {
-        parsed = prefetch_.get();
+        prefetch_->task->Wait();
+        parsed = std::move(prefetch_->parsed);
+        prefetch_.reset();
         prefetch_path_.clear();
     } else {
         DropPrefetch();
@@ -238,6 +301,9 @@ std::unique_ptr<Stage> StageManager::Load(const std::string& fpk_path, const std
     const auto parsed_at = clock::now();
     for (const std::string& error : parsed.errors) {
         LogError("{}", error);
+    }
+    for (const std::string& note : parsed.notes) {
+        LogInfo("{}", note);
     }
     if (!parsed.stage) {
         return nullptr;
@@ -248,6 +314,19 @@ std::unique_ptr<Stage> StageManager::Load(const std::string& fpk_path, const std
     }
     stage->id = next_id_++;
     stage->label = label;
+    for (const auto& data : stage->files) {
+        const fox2::DataSetFile& f = *data->file;
+        for (const fox2::Entity& e : f.Entities()) {
+            if (!e.FindDynamic("targetStageLabel") || !e.FindDynamic("hijackerStageLabel")) {
+                continue;
+            }
+            std::pair<std::string, std::string> swap{f.GetString(e, "targetStageLabel"), f.GetString(e, "hijackerStageLabel")};
+            if (!swap.first.empty() && !swap.second.empty() && swap.first != swap.second &&
+                std::find(stage->swaps.begin(), stage->swaps.end(), swap) == stage->swaps.end()) {
+                stage->swaps.push_back(std::move(swap));
+            }
+        }
+    }
     for (const auto& file : stage->files) {
         for (const auto& placement : file->static_models) {
             stage->Body(placement.entity);
@@ -264,15 +343,54 @@ std::unique_ptr<Stage> StageManager::Load(const std::string& fpk_path, const std
     const double upload_before = models_.Textures().UploadMs();
     double models_ms = 0.0;
     double geoms_ms = 0.0;
+    const ModelCache::StageScope stage_models(models_);
+    std::unordered_set<std::string> referenced;
     for (const auto& file : stage->files) {
         for (const auto& placement : file->static_models) {
             const auto model_started = clock::now();
             const auto pre_model = parsed.models.find(placement.model_file);
             const ModelEntry* model = models_.Get(placement.model_file, pre_model != parsed.models.end() ? pre_model->second.get() : nullptr);
+            if (referenced.insert(placement.model_file).second) {
+                models_.AddStageRef(placement.model_file);
+                stage->model_refs.push_back(placement.model_file);
+            }
             const auto model_done = clock::now();
             models_ms += ms(model_started, model_done);
             if (model) {
                 stage->draws.push_back({file.get(), placement.entity, model->mesh.get(), placement.world, placement.color});
+            }
+            if (model && (placement.mod_collision == "box" || placement.mod_collision == "mesh")) {
+                Stage::CollisionPiece piece;
+                piece.file_transform = placement.world;
+                piece.model_file = placement.model_file;
+                auto triangle = [&](glm::vec3 a, glm::vec3 b, glm::vec3 c) {
+                    GeomTriangle t{};
+                    t.a = a;
+                    t.b = b;
+                    t.c = c;
+                    t.shape_flags = 0x200;
+                    piece.triangles.push_back(t);
+                };
+                MeshData mesh;
+                if (placement.mod_collision == "mesh" && models_.ReadMesh(placement.model_file, mesh)) {
+                    for (const SubMesh& sub : mesh.submeshes) {
+                        for (uint32_t i = 0; i + 2 < sub.index_count; i += 3) {
+                            const uint32_t* k = mesh.indices.data() + sub.first_index + i;
+                            auto at = [&](uint32_t j) { return mesh.vertices[static_cast<size_t>(sub.vertex_offset + static_cast<int32_t>(j))].position; };
+                            triangle(at(k[0]), at(k[1]), at(k[2]));
+                        }
+                    }
+                } else {
+                    const glm::vec3 lo = model->mesh->bounds_min, hi = model->mesh->bounds_max;
+                    const glm::vec3 p[8] = {{lo.x, lo.y, lo.z}, {hi.x, lo.y, lo.z}, {hi.x, hi.y, lo.z}, {lo.x, hi.y, lo.z},
+                                            {lo.x, lo.y, hi.z}, {hi.x, lo.y, hi.z}, {hi.x, hi.y, hi.z}, {lo.x, hi.y, hi.z}};
+                    const int faces[6][4] = {{0, 1, 2, 3}, {4, 7, 6, 5}, {0, 4, 5, 1}, {3, 2, 6, 7}, {0, 3, 7, 4}, {1, 5, 6, 2}};
+                    for (const auto& f : faces) {
+                        triangle(p[f[0]], p[f[1]], p[f[2]]);
+                        triangle(p[f[0]], p[f[2]], p[f[3]]);
+                    }
+                }
+                if (!piece.triangles.empty()) stage->collision.push_back(std::move(piece));
             }
             if (!placement.geom_file.empty()) {
                 Stage::CollisionPiece piece;
@@ -311,6 +429,8 @@ std::unique_ptr<Stage> StageManager::Load(const std::string& fpk_path, const std
                 models_ms, models_.Loaded() + models_.Failed() - models_before, models_.Textures().ReadMs() - read_before,
                 models_.Textures().UploadMs() - upload_before, geoms_ms);
     }
+    LogDebug("stage: {} textures of {}, {} materials of {} in use", models_.Textures().TextureCount(), TextureManager::kMaxTextures,
+             models_.Textures().MaterialCount(), TextureManager::kMaxMaterials);
     return stage;
 }
 
@@ -485,6 +605,7 @@ bool StageManager::ActivateStage(const std::string& label) {
     stage->active = true;
     MarkVisualsDirty();
     LogInfo("stage: {} (id {}) activated", label, stage->id);
+    StartSwapBuild();
     return true;
 }
 
@@ -499,7 +620,9 @@ bool StageManager::DeactivateStage(const std::string& label) {
 }
 
 bool StageManager::ChangeStageId(const std::string& from, const std::string& to) {
-    DropCollisionBuild();
+    if (CollisionBuildRunning()) {
+        DropCollisionBuild();
+    }
     auto it = stages_.find(from);
     if (it == stages_.end()) {
         LogWarn("stage: ChangeStageId({}, {}) without such stage", from, to);
@@ -523,11 +646,14 @@ void StageManager::Unload(std::unique_ptr<Stage> stage) {
     if (!stage) {
         return;
     }
-    DropCollisionBuild();
+    DropCollisionBuildReading(stage.get());
     if (on_unloading) {
         on_unloading(*stage);
     }
     LogInfo("stage: {} (id {}, {}) unloaded", stage->label, stage->id, stage->package_path);
+    for (const std::string& path : stage->model_refs) {
+        models_.ReleaseStageRef(path);
+    }
     stage.reset();
     MarkVisualsDirty();
     MarkCollisionDirty();
@@ -636,7 +762,7 @@ std::shared_ptr<const std::vector<GeomTriangle>> StageManager::BuildSurfaces(Vfs
         FmdlModel read;
         const FmdlModel* parsed = model;
         if (!parsed) {
-            if (auto bytes = vfs.ReadFile(model_file); bytes && LoadFmdl(*bytes, model_file, read)) {
+            if (LoadModelFile(vfs, model_file, read)) {
                 parsed = &read;
             }
         }
@@ -675,6 +801,7 @@ std::shared_ptr<const std::vector<GeomTriangle>> StageManager::BuildLines(std::s
 }
 
 void StageManager::PrepareWalkSurfaces(Stage& stage, std::vector<GeomTriangle> bounds) {
+    DropCollisionBuild();
     size_t pieces = 0;
     size_t triangles = 0;
     for (Stage::CollisionPiece& piece : stage.collision) {
@@ -685,7 +812,12 @@ void StageManager::PrepareWalkSurfaces(Stage& stage, std::vector<GeomTriangle> b
         auto it = walk_cache_.find(piece.geom_file);
         if (it == walk_cache_.end()) {
             auto full = std::make_shared<std::vector<GeomTriangle>>();
+            const ModelCache::StageScope stage_models(models_);
             const ModelEntry* model = models_.Get(piece.model_file);
+            if (std::find(stage.model_refs.begin(), stage.model_refs.end(), piece.model_file) == stage.model_refs.end()) {
+                models_.AddStageRef(piece.model_file);
+                stage.model_refs.push_back(piece.model_file);
+            }
             if (auto bytes = vfs_.ReadFile(piece.geom_file)) {
                 LoadGeom(*bytes, model ? std::span<const glm::vec3>(model->raw_positions) : std::span<const glm::vec3>(), *full);
             }
@@ -706,12 +838,48 @@ void StageManager::PrepareWalkSurfaces(Stage& stage, std::vector<GeomTriangle> b
 }
 
 struct StageManager::PendingCollision {
+    enum class Kind { Preload, Swap };
+    Kind kind = Kind::Preload;
+    std::vector<CollisionEntry> entries;
+    std::vector<glm::mat4> transforms;
+    std::vector<const std::vector<GeomTriangle>*> walks;
+    std::unordered_set<const Stage*> reads;
+    std::string swap;
     CollisionWorld world;
     CollisionWorld lines;
     CollisionWorld reflections;
     std::vector<CollisionOwners> owners;
-    std::thread worker;
     double milliseconds = 0.0;
+    std::unique_ptr<ParallelTask> task;
+
+    static const std::vector<GeomTriangle>* Walk(const CollisionEntry& entry) {
+        return entry.stage->walk_detail_surfaces ? entry.piece->walk.get() : nullptr;
+    }
+    void Start(std::vector<CollisionEntry> from) {
+        entries = std::move(from);
+        for (const CollisionEntry& entry : entries) {
+            transforms.push_back(entry.stage->file_to_world * entry.piece->file_transform);
+            walks.push_back(Walk(entry));
+            reads.insert(entry.stage);
+        }
+        task = std::make_unique<ParallelTask>([this] {
+            const auto start = std::chrono::steady_clock::now();
+            BuildWorlds(entries, world, &lines, &reflections, owners);
+            milliseconds = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
+        });
+    }
+    bool BuiltFrom(const std::vector<CollisionEntry>& now) const {
+        if (now.size() != entries.size()) {
+            return false;
+        }
+        for (size_t i = 0; i < now.size(); ++i) {
+            if (now[i].stage != entries[i].stage || now[i].piece != entries[i].piece || now[i].label != entries[i].label ||
+                now[i].stage->file_to_world * now[i].piece->file_transform != transforms[i] || Walk(now[i]) != walks[i]) {
+                return false;
+            }
+        }
+        return true;
+    }
 };
 
 StageManager::StageManager(Vfs& vfs, ModelCache& models) : vfs_(vfs), models_(models) {}
@@ -722,9 +890,50 @@ StageManager::~StageManager() {
 }
 
 void StageManager::DropCollisionBuild() {
-    if (pending_collision_) {
-        pending_collision_->worker.join();
-        pending_collision_.reset();
+    pending_collision_.reset();
+}
+
+void StageManager::DropCollisionBuildReading(const Stage* stage) {
+    if (pending_collision_ && pending_collision_->reads.contains(stage)) {
+        DropCollisionBuild();
+    }
+}
+
+bool StageManager::CollisionBuildRunning() const {
+    return pending_collision_ && pending_collision_->kind == PendingCollision::Kind::Preload;
+}
+
+void StageManager::StartSwapBuild() {
+    if (pending_collision_ || collision_generation_ != built_generation_) {
+        return;
+    }
+    for (const auto& [owner_label, owner] : stages_) {
+        for (const auto& [target, hijacker] : owner->swaps) {
+            const auto t = stages_.find(target);
+            const auto h = stages_.find(hijacker);
+            if (t == stages_.end() || h == stages_.end() || !h->second->active) {
+                continue;
+            }
+            std::map<std::string, const Stage*> after;
+            for (const auto& [label, stage] : stages_) {
+                if (label != target && label != hijacker) {
+                    after[label] = stage.get();
+                }
+            }
+            after[target] = h->second.get();
+            std::vector<CollisionEntry> entries;
+            for (const auto& [label, stage] : after) {
+                for (const Stage::CollisionPiece& piece : stage->collision) {
+                    entries.push_back({stage, label, &piece});
+                }
+            }
+            pending_collision_ = std::make_unique<PendingCollision>();
+            pending_collision_->kind = PendingCollision::Kind::Swap;
+            pending_collision_->swap = std::format("{} into {}", hijacker, target);
+            pending_collision_->Start(std::move(entries));
+            LogDebug("stage: collision after the swap of {} built on a worker", pending_collision_->swap);
+            return;
+        }
     }
 }
 
@@ -835,6 +1044,27 @@ void StageManager::BuildWorlds(const std::vector<CollisionEntry>& entries, Colli
 void StageManager::BuildCollision(CollisionWorld& world, std::vector<SurfaceTriangle>* surfaces, CollisionWorld* lines,
                                   CollisionWorld* reflections) {
     const auto start = std::chrono::steady_clock::now();
+    if (pending_collision_ && pending_collision_->kind == PendingCollision::Kind::Swap && lines && reflections) {
+        if (pending_collision_->BuiltFrom(CollisionEntries())) {
+            pending_collision_->task->Wait();
+            collision_deferrable_ = false;
+            built_generation_ = collision_generation_;
+            std::swap(world, pending_collision_->world);
+            std::swap(*lines, pending_collision_->lines);
+            std::swap(*reflections, pending_collision_->reflections);
+            std::swap(collision_owners_, pending_collision_->owners);
+            const double built = pending_collision_->milliseconds;
+            const std::string swap = pending_collision_->swap;
+            pending_collision_.reset();
+            UpdateCollisionActive(world, surfaces, lines, reflections);
+            LogDebug("stage: collision {} triangles, {} material surfaces, {} line check triangles (swap of {}, worker {:.1f} ms, taken in "
+                     "{:.2f} ms)", world.ActiveTriangles(), surfaces ? surfaces->size() : 0, lines->ActiveTriangles(), swap, built,
+                     std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count());
+            StartSwapBuild();
+            return;
+        }
+        LogDebug("stage: collision after the swap of {} not taken, the stages changed otherwise", pending_collision_->swap);
+    }
     DropCollisionBuild();
     collision_deferrable_ = false;
     built_generation_ = collision_generation_;
@@ -843,6 +1073,7 @@ void StageManager::BuildCollision(CollisionWorld& world, std::vector<SurfaceTria
     LogDebug("stage: collision {} triangles, {} material surfaces, {} line check triangles ({:.1f} ms)", world.ActiveTriangles(),
              surfaces ? surfaces->size() : 0, lines ? lines->ActiveTriangles() : 0,
              std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count());
+    StartSwapBuild();
 }
 
 void StageManager::StartCollisionBuild() {
@@ -850,21 +1081,16 @@ void StageManager::StartCollisionBuild() {
     collision_deferrable_ = false;
     built_generation_ = collision_generation_;
     pending_collision_ = std::make_unique<PendingCollision>();
-    PendingCollision* pending = pending_collision_.get();
-    pending->worker = std::thread([pending, entries = CollisionEntries()] {
-        const auto start = std::chrono::steady_clock::now();
-        BuildWorlds(entries, pending->world, &pending->lines, &pending->reflections, pending->owners);
-        pending->milliseconds = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
-    });
+    pending_collision_->Start(CollisionEntries());
 }
 
 void StageManager::FinishCollisionBuild(CollisionWorld& world, std::vector<SurfaceTriangle>* surfaces, CollisionWorld& lines,
                                         CollisionWorld& reflections) {
-    if (!pending_collision_) {
+    if (!CollisionBuildRunning()) {
         return;
     }
     const auto start = std::chrono::steady_clock::now();
-    pending_collision_->worker.join();
+    pending_collision_->task->Wait();
     std::swap(world, pending_collision_->world);
     std::swap(lines, pending_collision_->lines);
     std::swap(reflections, pending_collision_->reflections);
@@ -875,6 +1101,7 @@ void StageManager::FinishCollisionBuild(CollisionWorld& world, std::vector<Surfa
     LogDebug("stage: collision {} triangles, {} material surfaces, {} line check triangles (worker {:.1f} ms, taken in {:.2f} ms)",
              world.ActiveTriangles(), surfaces ? surfaces->size() : 0, lines.ActiveTriangles(), built,
              std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count());
+    StartSwapBuild();
 }
 
 void StageManager::UpdateCollisionActive(CollisionWorld& world, std::vector<SurfaceTriangle>* surfaces, CollisionWorld* lines,

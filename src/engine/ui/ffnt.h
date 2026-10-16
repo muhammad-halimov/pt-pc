@@ -26,7 +26,7 @@ struct FfntGlyph {
 };
 
 struct UnicodeFontState;
-struct ShapedGlyph { const FfntGlyph* glyph = nullptr; float pen = 0, x = 0, y = 0, advance = 0; };
+struct ShapedGlyph { const FfntGlyph* glyph = nullptr; float pen = 0, x = 0, y = 0, advance = 0; int code = -1; };
 
 class FfntFont {
 public:
@@ -45,7 +45,7 @@ public:
     void AddTurkishGlyphs();
     bool LoadUnicodeFont(std::string_view family, std::string_view characters, bool rtl, std::string* error);
     bool Unicode() const { return bool(unicode_); }
-    std::vector<ShapedGlyph> ShapeLine(std::span<const uint32_t> codes, float inline_advance) const;
+    std::vector<ShapedGlyph> ShapeLine(std::span<const uint32_t> codes, float inline_advance, std::span<const float> code_advances = {}) const;
     uint8_t Coverage(const FfntGlyph& glyph, int x, int y) const;
     uint32_t AtlasWidth() const { return atlas_width_; }
     uint32_t AtlasHeight() const { return atlas_height_; }

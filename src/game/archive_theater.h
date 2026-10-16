@@ -9,8 +9,10 @@
 
 #include "engine/platform/input.h"
 #include "engine/render/camera.h"
+#include "engine/render/free_camera.h"
 #include "engine/render/scene_renderer.h"
 #include "game/save_data.h"
+#include "game/archive_model_camera.h"
 
 namespace pt {
 class Vfs;
@@ -33,7 +35,7 @@ public:
         float volume = 1.0f;
         float demo_rate = 1.0f;
         GameOptions options;
-        float model_ev = -5.5f;
+        float model_ev = kArchiveModelEv;
     };
 
     ArchiveTheater(Vfs& vfs, ModelCache& models, const ArchiveEntry& entry, const Settings& settings);
@@ -43,6 +45,7 @@ public:
 
     bool Start();
     void Update(float dt, const InputState& input);
+    void UpdateModelCamera(float dt, const FreeCameraControls& input);
     bool Finished() const { return phase_ == Phase::Done; }
     void Stop();
     Game& Sandbox() { return *game_; }
@@ -50,8 +53,10 @@ public:
     const ArchiveEntry& Entry() const { return entry_; }
     bool Showing() const;
     bool ModelView() const { return model_mode_; }
+    bool FreeView() const { return free_started_; }
     Camera ViewCamera() const;
     void CollectDraws(std::vector<DrawItem>& out);
+    void ApplyModelLighting(SceneLighting& lighting) const;
 
 private:
     enum class Kind { Model, Preface, Opening, Room, Hallway, Kill, Ending, Teaser };
@@ -63,6 +68,7 @@ private:
     void StartModel();
     void UpdateModel(float dt, const InputState& input);
     bool FindPlacement(const std::string& demo, glm::mat4& transform, glm::vec3* viewpoint);
+    void UpdateFreeView();
     void Finish(const char* why);
 
     Vfs& vfs_;
@@ -84,7 +90,13 @@ private:
     bool aim_ = false;
     bool aim_started_ = false;
     glm::vec3 look_target_{0.0f};
+    bool free_view_ = false;
+    bool free_started_ = false;
+    Camera free_camera_;
+    glm::vec3 free_origin_{0.0f};
     bool model_mode_ = false;
+    Camera model_camera_;
+    glm::vec3 model_camera_origin_{0.0f};
     bool gimmick_ = false;
     int gimmick_type_ = -1;
     const void* model_mesh_ = nullptr;
@@ -96,6 +108,8 @@ private:
     float yaw_ = 0.0f;
     float pitch_ = -0.1f;
     float distance_ = 2.5f;
+    glm::vec3 model_home_{0.0f};
+    float model_radius_ = 0.5f;
     float min_distance_ = 0.5f;
     float max_distance_ = 6.0f;
 };
