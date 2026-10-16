@@ -1,6 +1,8 @@
 # P.T. for iOS
 
-![Lisa in the hallway](docs/media/lisa.gif)
+![The hallway on an iPhone 15](docs/media/ios_hallway.gif)
+
+*The hallway on an iPhone 15 (A16), drawn on the phone at 67 % of its screen.*
 
 This is the iPhone and iPad build of [LoreanXavier's native P.T. port](https://github.com/LoreanXavier/pt-pc), the
 2014 PS4 teaser by Kojima Productions rebuilt in C++ on Vulkan. It is not an emulator: every level, model, texture,
@@ -61,6 +63,8 @@ Clicking the left stick (L3) hurries until you click it again or stop.
 - Not in the iOS build: ray-traced effects (MoltenVK has no ray queries), enhanced textures (Real-ESRGAN), frame
   generation, VR, and the iOS Simulator (MoltenVK's iOS release has
   no simulator slice).
+
+![The hallway, still, on an iPhone 15](docs/media/ios_hallway.jpg)
 
 Performance on an iPhone 15 (60 Hz screen, v-sync on, so frame rates step through 60, 30 and 20): the original preset at
 67 % without an upscaler draws in about 26 to 30 ms on the GPU, MetalFX at Ultra performance about 24 ms, which holds
