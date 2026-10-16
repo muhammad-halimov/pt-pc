@@ -191,6 +191,8 @@ private:
     uint32_t image_index_ = 0;
     uint32_t gen_index_ = 0;
     bool gen_acquired_ = false;
+    // the frame's HUD-less copy carries the UI (no separate UI layer): the generated frame draws none of its own
+    bool gen_hud_has_ui_ = false;
     gpu::BindingSetHandle gen_set_[kFramesInFlight] = {};
     VkCommandBuffer active_cmd_ = VK_NULL_HANDLE;
     gpu::vk::CommandList active_list_{VK_NULL_HANDLE};

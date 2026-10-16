@@ -808,6 +808,9 @@ void Renderer::EndFrame(bool draw_ui) {
     const bool layer_fits = hud && ui_layer && layer_pipeline_ && output_mode_ == RendererOutputMode::Sdr && hud->extent.width == extent.width &&
                             hud->extent.height == extent.height;
     const vk::Image* layer = layer_fits ? ui_layer(image_index_) : nullptr;
+    // without the UI layer (HDR output, or a HUD-less copy of another size) the copy MetalFX interpolates already has the UI
+    // on it: the generated frame must not draw it a second time
+    gen_hud_has_ui_ = hud && !layer;
     const bool layer_over_rendered = layer && ui_layer_over_rendered && ui_layer_over_rendered();
     auto composite_fitted = [&](gpu::Extent2D area, gpu::Format format, bool with_top_ui) {
         const float scale = std::min(static_cast<float>(area.width) / static_cast<float>(extent.width),
@@ -1171,7 +1174,7 @@ void Renderer::PresentGeneratedFrame(Frame& frame, const vk::Image* source, VkSe
     if (overlay) {
         overlay(list, gpu::vk::Wrap<gpu::ImageViewTag>(view), fitted ? window_extent : extent, OverlayPart::All);
     }
-    if (draw_ui && imgui_ready_) {
+    if (draw_ui && imgui_ready_ && source && !gen_hud_has_ui_) {  // the rendered frame repeated (final_) has its UI already
         ImDrawData* data = ImGui::GetDrawData();
         if (data && data->DisplaySize.x > 0.0f && data->DisplaySize.y > 0.0f) {
             const ImVec2 saved_scale = data->FramebufferScale;
