@@ -231,6 +231,7 @@ TouchControls::Rect TouchControls::Layout(int control) const {
         const ImVec2 display = ImGui::GetCurrentContext() ? ImGui::GetIO().DisplaySize : ImVec2(0.0f, 0.0f);
         const float pair_gx = display.x > 0.0f ? 6.0f / display.x : gap;
         const float pair_gy = display.y > 0.0f ? 6.0f / display.y : gap;
+        const float pair_bottom = std::min(0.84f, bottom);
         const auto stack = [&](bool on_left, int index) -> Rect {
             const int count = on_left ? 4 : 2;
             const float y = bottom - (h + gap) * static_cast<float>(count - index) + gap;
@@ -245,10 +246,11 @@ TouchControls::Rect TouchControls::Layout(int control) const {
         case kBack: return {right - Width(kR1) - gap - Width(kAccept) - gap - w, top, w, h};
         // the directions as two rows of two: language (up, down) over brightness (left, right), the same 6 point gap
         // between them across and down
-        case kUp: return {left, bottom - 2.0f * h - pair_gy, w, h};
-        case kDown: return {left + w + pair_gx, bottom - 2.0f * h - pair_gy, w, h};
-        case kLeft: return {left, bottom - h, w, h};
-        case kRight: return {left + w + pair_gx, bottom - h, w, h};
+        // above the menu's own hints (Back, Exit), which run along the bottom left
+        case kUp: return {left, pair_bottom - 2.0f * h - pair_gy, w, h};
+        case kDown: return {left + w + pair_gx, pair_bottom - 2.0f * h - pair_gy, w, h};
+        case kLeft: return {left, pair_bottom - h, w, h};
+        case kRight: return {left + w + pair_gx, pair_bottom - h, w, h};
         case kFlipY: return stack(false, 0);
         case kFlipX: return stack(false, 1);
         default: return {0, 2.0f, 0, 0};
