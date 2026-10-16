@@ -32,7 +32,7 @@ bool Same(const pt::AppSettings& a, const pt::AppSettings& b) {
            a.upscaling.quality == b.upscaling.quality && Near(a.upscaling.scale, b.upscaling.scale) &&
            Near(a.upscaling.sharpness, b.upscaling.sharpness) && a.upscaling.dlss_model == b.upscaling.dlss_model &&
            a.upscaling.frame_generation == b.upscaling.frame_generation && a.upscaling.ray_reconstruction == b.upscaling.ray_reconstruction &&
-           a.ray_tracing == b.ray_tracing && a.graphics == b.graphics && a.mods == b.mods && a.vr == b.vr && a.accessibility == b.accessibility;
+           a.ray_tracing == b.ray_tracing && a.graphics == b.graphics && a.mods == b.mods && a.vr == b.vr && a.accessibility == b.accessibility && a.extras == b.extras;
 }
 
 pt::AppSettings RoundTrip(const std::filesystem::path& path, const pt::AppSettings& s) {
@@ -82,6 +82,7 @@ int main(int argc, char** argv) {
         {"camera.roll", [](auto& s) { s.camera.roll = 0.0f; }},
         {"camera.third_person", [](auto& s) { s.camera.third_person = true; }},
         {"game.game_plus", [](auto& s) { s.game.game_plus = false; }},
+        {"extras.fast_walk", [](auto& s) { s.extras.fast_walk = true; }},
         {"audio.volume", [](auto& s) { s.audio.volume = 1.7f; }},
         {"voice.device", [](auto& s) { s.voice.device = "Microphone (USB Audio Device)"; }},
         {"voice.key", [](auto& s) { s.voice.key = "J"; }},
@@ -186,6 +187,9 @@ int main(int argc, char** argv) {
     Check("vr world_scale of an older version leaves the size at 1", LoadText(ini, "[vr]\nworld_scale = 0.5\n").vr.world_size == 1.0f);
     Check("vr world_size wins over an old world_scale", LoadText(ini, "[vr]\nworld_scale = 0.5\nworld_size = 1.25\n").vr.world_size == 1.25f);
     Check("vr world_size clamped", LoadText(ini, "[vr]\nworld_size = 9\n").vr.world_size == 2.0f);
+    Check("fast walk off by default", !pt::AppSettings{}.extras.fast_walk);
+    Check("older settings keep fast walk off", !LoadText(ini, "[extras]\nspeedrun = 1\n").extras.fast_walk);
+    Check("disabled fast walk round trip", !RoundTrip(ini, {}).extras.fast_walk);
     std::filesystem::remove(ini);
     std::printf("%s\n", failures ? "FAIL" : "PASS");
     return failures ? 1 : 0;

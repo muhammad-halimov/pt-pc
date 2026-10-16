@@ -290,6 +290,7 @@ void Game::Update(float dt, const InputState& pad_input) {
         if (demo_control && game_frame_tick_) {
             player_.DemoHeldFrame(input);
         }
+        context.fast_walk = fast_walk_ && input.fast_walk;
         if (!demo_control) {
             player_.Update(dt, input, collision_, context);
             zoom_fell_ = zoom_fell_ || player_.ZoomFalling();

@@ -32,6 +32,7 @@ struct PlayerFrameContext {
     bool peephole_theater = false;
     bool peephole_center_valid = false;
     float peephole_center_yaw = 0.0f;
+    bool fast_walk = false;
 };
 
 class PadLocks {
@@ -122,6 +123,7 @@ public:
     bool Standing() const { return published_read_.standing; }
     bool Walking() const { return !published_read_.standing; }
     float StickMagnitude() const { return stick_magnitude_; }
+    float MovementRate() const { return motion_.rate; }
     float StickHeading() const { return stick_heading_; }
     uint32_t HeldButtons() const { return held_ & ~locks.Mask('A'); }
     uint32_t PressedButtons() const { return pressed_ & ~locks.Mask('A'); }

@@ -2453,6 +2453,7 @@ public:
             if (game_.GamePlus()) {
                 extras.rows.push_back(Row(kGamePlus, "pc_game_plus", OffOn(), app_.settings.game.game_plus ? 1 : 0, "pc_note_game_plus"));
             }
+            extras.rows.push_back(Row(kFastWalk, "pc_fast_walk", OffOn(), app_.settings.extras.fast_walk ? 1 : 0, "pc_note_fast_walk"));
             extras.rows.push_back(Row(kSpeedrun, "pc_speedrun", {"pc_off", "pc_speedrun_real_time", "pc_speedrun_game_time"},
                                       std::clamp(app_.settings.extras.speedrun, 0, 2), "pc_note_speedrun"));
             extras.rows.push_back(Row(kLiveSplit, "pc_livesplit", OffOn(), app_.settings.extras.livesplit ? 1 : 0,
@@ -3045,6 +3046,12 @@ public:
         switch (id) {
         case kMicMonitor:
             app_.microphone_monitor = value == 1;
+            return;
+        case kFastWalk:
+            s.extras.fast_walk = value == 1;
+            game_.SetFastWalk(s.extras.fast_walk);
+            pt::LogInfo("fast walk: {} (PC settings)", s.extras.fast_walk ? "on" : "off");
+            Save();
             return;
         case kSpeedrun:
             s.extras.speedrun = std::clamp(value, 0, 2);
@@ -3741,6 +3748,7 @@ private:
         kNeuralRendering, kNeuralStyle, kNeuralIntensity, kNeuralUnlock, kNeuralUninstall, kNeuralReinstall,
         kFgUnlock, kFgReinstall, kFgUninstall,
         kPatreon,
+        kFastWalk,
         kLoopFirst = 1000,
         kRunSplitFirst = 3000,
         kModFirst = 2000,
@@ -4665,6 +4673,7 @@ int RunGame(App& app, pt::Vfs& vfs) {
     }
     pt::boot::Phase("game data");
     game.Speedrun().SetMode(app.settings.extras.speedrun);
+    game.SetFastWalk(app.settings.extras.fast_walk);
     if (!app.settings_path.empty()) game.Speedrun().SetRecordDirectory(std::filesystem::absolute(app.settings_path).parent_path());
     app.livesplit.Configure(app.settings.extras.livesplit, app.settings.extras.livesplit_host, app.settings.extras.livesplit_port);
     game.Speedrun().SetLiveSplit(&app.livesplit);
@@ -5593,6 +5602,7 @@ int RunGame(App& app, pt::Vfs& vfs) {
         }
         pending_input.left_stick = polled.left_stick;
         pending_input.right_stick = polled.right_stick;
+        pending_input.fast_walk = polled.fast_walk;
         pending_input.mouse_look += polled.mouse_look;
         pending_input.gyro_turn += polled.gyro_turn;
         pending_input.gyro_light = polled.gyro_light;

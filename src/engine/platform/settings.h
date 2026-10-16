@@ -104,6 +104,7 @@ struct AppSettings {
         bool operator==(const Game&) const = default;
     } game;
     struct Extras {
+        bool fast_walk = false;
         int speedrun = 0;
         bool livesplit = false;
         std::string livesplit_host = "127.0.0.1";

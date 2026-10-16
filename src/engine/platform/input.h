@@ -60,7 +60,7 @@ enum class KeyAction : uint8_t {
     DateAuto, DateSkip,
     PhotoSave, PhotoHide, FreeRise, FreeSink, FreeFast,
     MusicBack, MusicForward, MusicRestart, MusicLoop,
-    MenuTabPrev, MenuTabNext, MenuDonate
+    MenuTabPrev, MenuTabNext, MenuDonate, FastWalk
 };
 
 inline constexpr uint32_t kMenuKeyTabPrev = 1;
@@ -113,6 +113,7 @@ struct InputState {
     bool any_button = false;
     bool from_gamepad = false;
     bool left_stick_from_pad = false;
+    bool fast_walk = false;
     bool click = false;
     bool right_click = false;
     float wheel = 0.0f;
