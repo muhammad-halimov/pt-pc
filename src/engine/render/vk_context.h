@@ -133,6 +133,10 @@ public:
     std::string ray_query_missing;
     VkDeviceSize scratch_alignment = 256;
 
+    // the GPU samples BC textures; without them the texture uploads decode BC on the CPU (render/bc_decode.h)
+    bool bc_textures = true;
+    // iOS: the drawable's share of the screen's native resolution (display.render_scale)
+    float surface_scale = 1.0f;
     bool memory_budget = false;
     bool device_fault = false;
     bool checkpoints = false;

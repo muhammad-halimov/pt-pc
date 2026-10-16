@@ -26,6 +26,12 @@ struct AppSettings {
         std::string rendering_api = "vulkan";
         bool rendering_api_asked = false;
         int d3d12_crashed = 0;
+#if defined(PT_IOS)
+        // the drawable's share of the screen's native pixels per axis (a phone GPU does not keep up with its native resolution)
+        float render_scale = 0.667f;
+#else
+        float render_scale = 1.0f;
+#endif
     } display;
     struct Input {
         float mouse_sensitivity = 1.0f;
@@ -104,7 +110,11 @@ struct AppSettings {
         bool operator==(const Game&) const = default;
     } game;
     struct Extras {
+#if defined(PT_IOS)
+        bool fast_walk = true;  // a phone: the on-screen Run button (touch_controls.cpp)
+#else
         bool fast_walk = false;
+#endif
         int speedrun = 0;
         bool livesplit = false;
         std::string livesplit_host = "127.0.0.1";

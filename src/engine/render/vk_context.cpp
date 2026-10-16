@@ -22,6 +22,9 @@
 
 #include "engine/core/resource_path.h"
 #endif
+#if defined(PT_IOS)
+#include "engine/platform/ios_display.h"
+#endif
 
 #include "engine/core/crash_report.h"
 #include "engine/core/log.h"
@@ -139,11 +142,17 @@ std::string VulkanLibraryPath() {
     static const std::string path = [] {
         /* MoltenVK lists all its extensions at every start otherwise; MVK_CONFIG_LOG_LEVEL set by the user still wins */
         setenv("MVK_CONFIG_LOG_LEVEL", "2", 0);
+#if defined(PT_IOS)
+        /* a phone's CPU: vkQueueSubmit hands the frame to MoltenVK's own thread to encode into Metal instead of encoding it on
+           the game's thread before it returns */
+        setenv("MVK_CONFIG_SYNCHRONOUS_QUEUE_SUBMITS", "0", 0);
+#endif
         if (const char* env = std::getenv("PT_VULKAN_LIBRARY"); env && *env) return std::string(env);
         const std::filesystem::path base = ExecutableDir();
         std::error_code ec;
         for (const std::filesystem::path& candidate :
-             {base / ".." / "Frameworks" / "libMoltenVK.dylib", base / "libMoltenVK.dylib", std::filesystem::path("/opt/homebrew/lib/libMoltenVK.dylib"),
+             {base / "Frameworks" / "MoltenVK.framework" / "MoltenVK",  // the iOS app bundle (cmake/IOS.cmake)
+              base / ".." / "Frameworks" / "libMoltenVK.dylib", base / "libMoltenVK.dylib", std::filesystem::path("/opt/homebrew/lib/libMoltenVK.dylib"),
               std::filesystem::path("/usr/local/lib/libMoltenVK.dylib"), std::filesystem::path("/usr/local/lib/libvulkan.1.dylib")}) {
             if (std::filesystem::is_regular_file(candidate, ec)) return std::filesystem::weakly_canonical(candidate, ec).string();
         }
@@ -166,15 +175,6 @@ bool Context::Init(SDL_Window* window, bool validation, bool want_hdr) {
     if (loader) {
         /* With Streamline loaded, instance, device and swapchain must come from its proxies, so volk takes the interposer's loader instead of vulkan-1.dll. */
         volkInitializeCustom(loader);
-    } else if (PT_IOS) {
-        // SDL3 knows how to locate the statically linked MoltenVK image on Apple platforms.
-        if (!Check(SDL_Vulkan_LoadLibrary(nullptr), "SDL_Vulkan_LoadLibrary")) {
-            return false;
-        }
-        auto proc = reinterpret_cast<PFN_vkGetInstanceProcAddr>(SDL_Vulkan_GetVkGetInstanceProcAddr());
-        if (!proc || !Check(volkInitializeCustom(proc), "volkInitializeCustom(MoltenVK)")) {
-            return false;
-        }
     } else if (!Check(volkInitialize(), "volkInitialize")) {
         return false;
     }
@@ -271,6 +271,9 @@ bool Context::Init(SDL_Window* window, bool validation, bool want_hdr) {
             LogError("SDL_Vulkan_CreateSurface: {}", SDL_GetError());
             return false;
         }
+#if defined(PT_IOS)
+        ios::ScaleMetalDrawable(window, surface_scale);
+#endif
     }
 
     uint32_t device_count = 0;
@@ -338,7 +341,7 @@ bool Context::Init(SDL_Window* window, bool validation, bool want_hdr) {
             {"descriptorBindingUpdateUnusedWhilePending", have12.descriptorBindingUpdateUnusedWhilePending},
             {"descriptorBindingStorageBufferUpdateAfterBind", have12.descriptorBindingStorageBufferUpdateAfterBind},
             {"scalarBlockLayout", have12.scalarBlockLayout}, {"samplerAnisotropy", have2.features.samplerAnisotropy},
-            {"textureCompressionBC", have2.features.textureCompressionBC}, {"fillModeNonSolid", have2.features.fillModeNonSolid},
+            {"fillModeNonSolid", have2.features.fillModeNonSolid},
             {"shaderInt16", have2.features.shaderInt16}, {"shaderClipDistance", have2.features.shaderClipDistance},
         };
         bool complete = true;
@@ -370,7 +373,15 @@ bool Context::Init(SDL_Window* window, bool validation, bool want_hdr) {
     VkPhysicalDeviceFeatures2 features{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
     features.pNext = &features12;
     features.features.samplerAnisotropy = VK_TRUE;
-    features.features.textureCompressionBC = PT_IOS ? VK_FALSE : VK_TRUE;
+    // the game's textures are BC; a GPU without them (Apple's A-series chips) gets them decoded on the CPU (render/bc_decode.h).
+    // PT_FORCE_BC_DECODE=1 takes that path on a GPU that has BC too (a developer test: both paths on one machine)
+    {
+        VkPhysicalDeviceFeatures have{};
+        vkGetPhysicalDeviceFeatures(physical, &have);
+        bc_textures = have.textureCompressionBC == VK_TRUE && !std::getenv("PT_FORCE_BC_DECODE");
+        features.features.textureCompressionBC = have.textureCompressionBC;
+        if (!bc_textures) LogInfo("vulkan: no BC texture support, textures are decoded on the CPU");
+    }
     features.features.fillModeNonSolid = VK_TRUE;
     features.features.shaderInt16 = VK_TRUE;
     features.features.shaderClipDistance = VK_TRUE;
@@ -648,6 +659,18 @@ void Context::Shutdown() {
 }
 
 bool Context::CreateSwapchain(uint32_t width, uint32_t height, bool vsync, bool want_hdr) {
+#if defined(PT_IOS)
+    // the drawable's size is the swapchain's (caps.currentExtent): put display.render_scale back on the Metal layer before each
+    // swapchain, as a window change can give the layer the screen's native size again
+    if (window_) {
+        uint32_t drawable_width = 0, drawable_height = 0;
+        ios::ScaleMetalDrawable(window_, surface_scale, &drawable_width, &drawable_height);
+        if (drawable_width && drawable_height) {
+            width = drawable_width;
+            height = drawable_height;
+        }
+    }
+#endif
     vkDeviceWaitIdle(device);
     swapchain_refused = false;
     vsync = force_vsync ? true : (vsync && !force_vsync_off);
@@ -710,6 +733,10 @@ bool Context::CreateSwapchain(uint32_t width, uint32_t height, bool vsync, bool 
             present_mode == VK_PRESENT_MODE_IMMEDIATE_KHR ? "immediate" : present_mode == VK_PRESENT_MODE_MAILBOX_KHR ? "mailbox" : "fifo",
             vsync ? "on" : "off");
     VkExtent2D extent = caps.currentExtent;
+#if defined(PT_IOS)
+    // the scaled drawable (display.render_scale), whatever size the surface reports: MoltenVK sizes the layer's drawable to it
+    extent = {0xFFFFFFFFu, 0xFFFFFFFFu};
+#endif
     if (extent.width == 0xFFFFFFFFu) {
         extent.width = std::clamp(width, caps.minImageExtent.width, caps.maxImageExtent.width);
         extent.height = std::clamp(height, caps.minImageExtent.height, caps.maxImageExtent.height);

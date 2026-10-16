@@ -191,7 +191,7 @@ public:
             descriptor.outputHeight = create.display.height;
             descriptor.autoExposureEnabled = NO;
             descriptor.inputContentPropertiesEnabled = NO;
-            if (@available(macOS 14.4, *)) {
+            if (@available(macOS 14.4, iOS 17.4, *)) {
                 descriptor.reactiveMaskTextureEnabled = reactive_mask;
                 if (reactive_mask) {
                     descriptor.reactiveMaskTextureFormat = reactive;
@@ -206,7 +206,7 @@ public:
                 return false;
             }
             temporal_ = scaler;
-            reactive_mask_ = @available(macOS 14.4, *) && reactive_mask;
+            reactive_mask_ = @available(macOS 14.4, iOS 17.4, *) && reactive_mask;
             // the scaler's own names for the signs, for the log and for the test overrides to flip
             static const float jitter_sign = [] {
                 const char* e = std::getenv("PT_METALFX_JITTER_SIGN");

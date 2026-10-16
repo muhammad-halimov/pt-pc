@@ -108,6 +108,7 @@ bool LoadAppSettings(const std::filesystem::path& path, AppSettings& out) {
     Read(v, "display.rendering_api", out.display.rendering_api);
     Read(v, "display.rendering_api_asked", out.display.rendering_api_asked);
     Read(v, "display.d3d12_crashed", out.display.d3d12_crashed);
+    Read(v, "display.render_scale", out.display.render_scale);
     Read(v, "input.mouse_sensitivity", out.input.mouse_sensitivity);
     Read(v, "input.gamepad_sensitivity", out.input.gamepad_sensitivity);
     Read(v, "input.gamepad_dead_zone", out.input.gamepad_dead_zone);
@@ -252,6 +253,7 @@ bool LoadAppSettings(const std::filesystem::path& path, AppSettings& out) {
     out.display.fullscreen = std::clamp(out.display.fullscreen, 0, 2);
     out.display.fps_limit = out.display.fps_limit <= 0 ? 0 : std::clamp(out.display.fps_limit, 20, 1000);
     out.display.letterbox = std::clamp(out.display.letterbox, 0, 2);
+    out.display.render_scale = std::isfinite(out.display.render_scale) ? std::clamp(out.display.render_scale, 0.33f, 1.0f) : 1.0f;
     out.input.mouse_sensitivity = std::clamp(out.input.mouse_sensitivity, 0.05f, 20.0f);
     out.input.gamepad_sensitivity = std::isfinite(out.input.gamepad_sensitivity) ? std::clamp(out.input.gamepad_sensitivity, 0.25f, 4.0f) : 1.0f;
     out.input.gamepad_dead_zone = std::clamp(out.input.gamepad_dead_zone, 0.0f, 0.9f);
@@ -304,7 +306,12 @@ bool SaveAppSettings(const std::filesystem::path& path, const AppSettings& s) {
          << "rendering_api_asked = " << (s.display.rendering_api_asked ? 1 : 0) << "\n"
          << "; an earlier start died while DirectX 12 was starting (1 its check, 2 its device, 3 its first frames): DirectX 12 stays\n"
          << "; off until a start with --backend d3d12 draws its first frames; 0 never\n"
-         << "d3d12_crashed = " << s.display.d3d12_crashed << "\n\n"
+         << "d3d12_crashed = " << s.display.d3d12_crashed << "\n"
+#if defined(PT_IOS)
+         << "; share of the screen's native resolution the game draws at, 0.33 to 1 (iOS)\n"
+         << "render_scale = " << s.display.render_scale << "\n"
+#endif
+         << "\n"
          << "[input]\n"
          << "mouse_sensitivity = " << s.input.mouse_sensitivity << "\n"
          << "; gamepad turn speed after the original stick response, 1 keeps the original\n"

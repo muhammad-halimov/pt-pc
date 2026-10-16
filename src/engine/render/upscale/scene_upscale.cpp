@@ -504,7 +504,7 @@ void SceneRenderer::RecordOpaqueSnapshot(gpu::CommandList& cmd, RenderTarget& ou
 
 void SceneRenderer::RecordUpscaleInputs(gpu::CommandList& cmd, const ViewSetup& view) {
     FrameSlot& slot = slots_[renderer_->FrameIndex()];
-    cmd.WriteTimestamp(slot.upscale_queries, 0);
+    if (queries_) cmd.WriteTimestamp(slot.upscale_queries, 0);
     cmd.UseTargets({{&depth_, gpu::Layout::DepthReadOnly}, {&motion_, gpu::Layout::ColorAttachment}});
     cmd.BeginPass(extent_, {{&motion_, false, {}}}, &depth_, true, false);
     gpu::PassPush push;
@@ -600,7 +600,7 @@ void SceneRenderer::RecordUpscaleInputs(gpu::CommandList& cmd, const ViewSetup& 
         cmd.EndPass();
         cmd.UseTargets({{&opaque_, gpu::Layout::ShaderReadOnly}, {&handy_factor_, gpu::Layout::ShaderReadOnly}});
     }
-    cmd.WriteTimestamp(slot.upscale_queries, 1);
+    if (queries_) cmd.WriteTimestamp(slot.upscale_queries, 1);
 }
 
 void SceneRenderer::RecordNeuralRendering(gpu::CommandList& cmd) {
@@ -678,7 +678,7 @@ void SceneRenderer::RecordUpscalePrepare(float dt) {
     FrameSlot& slot = slots_[renderer_->FrameIndex()];
     gpu::CommandList& cmd = renderer_->List();
     up_dispatch_ = UpscaleDispatch{};
-    cmd.WriteTimestamp(slot.upscale_queries, 2);
+    if (queries_) cmd.WriteTimestamp(slot.upscale_queries, 2);
     cmd.UseTargets({{&exposure_image_, gpu::Layout::TransferDst}});
     gpu::ClearColor value{};
     value.float32[0] = exposure_;
@@ -945,8 +945,8 @@ void SceneRenderer::RecordUpscaleResolve(gpu::CommandList& cmd, bool upscaled) {
         cmd.UseTargets({{&hdr_, gpu::Layout::ShaderReadOnly}, {&upscaled_, gpu::Layout::ShaderReadOnly}});
         up_.warp_history = true;
     }
-    cmd.WriteTimestamp(slot.upscale_queries, 3);
-    slot.upscale_timed = true;
+    if (queries_) cmd.WriteTimestamp(slot.upscale_queries, 3);
+    slot.upscale_timed = static_cast<bool>(queries_);
 }
 
 void SceneRenderer::RecordUpscale(gpu::CommandList& cmd, float dt) {

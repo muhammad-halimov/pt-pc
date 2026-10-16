@@ -2766,11 +2766,21 @@ void SceneRenderer::Render(const Camera& camera, const std::vector<DrawItem>& it
         SettleExposure(lighting_->exposure);
     }
     gpu::CommandList& cmd = renderer_->List();
-    cmd.ResetQueries(slot.queries, 0, kTimestamps);
-    if (up_.enabled) {
-        cmd.ResetQueries(slot.upscale_queries, 0, 4);
+#if defined(PT_IOS)
+    // MoltenVK on an Apple GPU ends the Metal encoder at every timestamp: the pass timers sample one frame in 30
+    const bool sample_timers = frame_counter_ % 30 == 0;
+#else
+    const bool sample_timers = true;
+#endif
+    if (sample_timers) {
+        cmd.ResetQueries(slot.queries, 0, kTimestamps);
+        if (up_.enabled) {
+            cmd.ResetQueries(slot.upscale_queries, 0, 4);
+        }
+        queries_ = slot.queries;
+    } else {
+        queries_ = {};
     }
-    queries_ = slot.queries;
     Stamp(cmd, 0);
     BindSets(cmd, gpu::BindPoint::Graphics);
     cmd.BeginLabel("shadows");
@@ -2941,8 +2951,8 @@ void SceneRenderer::Render(const Camera& camera, const std::vector<DrawItem>& it
     }
     Stamp(cmd, 6);
     queries_ = {};
-    last_timed_slot_ = renderer_->FrameIndex();
-    slot.timed = true;
+    if (sample_timers) last_timed_slot_ = renderer_->FrameIndex();
+    slot.timed = sample_timers;
     slot.measured = true;
     slot.exposure_used = exposure_;
     slot.vr_eye = vr_eye_;

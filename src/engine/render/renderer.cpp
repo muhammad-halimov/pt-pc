@@ -973,6 +973,13 @@ void Renderer::EndFrame(bool draw_ui) {
                                   Layout::ColorAttachment, PipelineStage::Transfer, gpu::Bits(Access::TransferRead), Layout::TransferSrc));
     }
     vkEndCommandBuffer(cmd);
+#if defined(PT_IOS)
+    // a phone keeps the CPU and the GPU overlapped: the rest of the frame waits for MetalFX on the GPU (the submit's wait below)
+    // instead of the game's thread stopping until it is done
+    const VkSemaphore gpu_split_wait = split_wait_;
+    const uint64_t gpu_split_value = split_wait_value_;
+    split_wait_ = VK_NULL_HANDLE;
+#endif
     if (split_wait_) {
         VkSemaphoreWaitInfo split_wait{VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO};
         split_wait.semaphoreCount = 1;
@@ -997,7 +1004,7 @@ void Renderer::EndFrame(bool draw_ui) {
                          generated_frame.sync(fg_signal.semaphore, fg_signal_value, fg_wait, fg_wait_value);
     fg_signal.value = fg_signal_value;
     fg_signal.stageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
-    VkSemaphoreSubmitInfo waits[2] = {wait, fg_signal};
+    VkSemaphoreSubmitInfo waits[3] = {wait, fg_signal, fg_signal};
     VkSemaphoreSubmitInfo signals[2] = {signal, fg_signal};
     uint32_t wait_count = 0;
     uint32_t signal_count = 0;
@@ -1012,6 +1019,15 @@ void Renderer::EndFrame(bool draw_ui) {
     if (fg_sync) {
         signals[signal_count++] = fg_signal;
     }
+#if defined(PT_IOS)
+    if (gpu_split_wait) {
+        VkSemaphoreSubmitInfo& external = waits[wait_count++];
+        external = {VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO};
+        external.semaphore = gpu_split_wait;
+        external.value = gpu_split_value;
+        external.stageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
+    }
+#endif
     submit.waitSemaphoreInfoCount = wait_count;
     submit.pWaitSemaphoreInfos = waits;
     submit.signalSemaphoreInfoCount = signal_count;
