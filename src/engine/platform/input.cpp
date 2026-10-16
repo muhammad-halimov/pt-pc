@@ -477,59 +477,6 @@ InputDevice::Pad* InputDevice::Find(uint32_t id) {
     return nullptr;
 }
 
-void InputDevice::UpdateTouch(const SDL_Event& event) {
-#if defined(PT_IOS)
-    const auto id = static_cast<uint64_t>(event.tfinger.fingerID);
-    TouchPoint* point = nullptr;
-    for (auto& t : touches_) {
-        if (t.active && t.id == id) { point = &t; break; }
-    }
-    if (event.type == SDL_EVENT_FINGER_DOWN && !point) {
-        for (auto& t : touches_) {
-            if (!t.active) { point = &t; t.active = true; t.id = id; break; }
-        }
-    }
-    if (!point) return;
-    if (event.type == SDL_EVENT_FINGER_UP || event.type == SDL_EVENT_FINGER_CANCELED) {
-        point->active = false;
-        point->x = point->y = 0.0f;
-    } else {
-        point->x = event.tfinger.x;
-        point->y = event.tfinger.y;
-    }
-
-    // iOS layout: left side is a virtual movement stick; right side is free-look.
-    // The four action zones are deliberately generous so simultaneous touches remain reliable.
-    touch_raw_ = 0;
-    touch_left_ = {0.0f, 0.0f};
-    touch_look_ = {0.0f, 0.0f};
-    for (const auto& t : touches_) {
-        if (!t.active) continue;
-        if (t.x < 0.45f) {
-            const glm::vec2 center(0.18f, 0.72f);
-            glm::vec2 d((t.x - center.x) / 0.16f, (t.y - center.y) / 0.16f);
-            if (glm::length(d) > 1.0f) d = glm::normalize(d);
-            touch_left_ = d;
-            continue;
-        }
-        if (event.type == SDL_EVENT_FINGER_MOTION && t.id == id) {
-            touch_look_ += glm::vec2(event.tfinger.dx, event.tfinger.dy) * glm::vec2(2200.0f, 1200.0f);
-        }
-        if (t.y > 0.58f) {
-            if (t.x > 0.78f) touch_raw_ |= kRawCross;
-            else if (t.x > 0.60f) touch_raw_ |= kRawCircle;
-        }
-    }
-    any_edge_ = any_edge_ || event.type == SDL_EVENT_FINGER_DOWN;
-    last_from_gamepad_ = false;
-    if (event.type == SDL_EVENT_FINGER_DOWN) {
-        if (event.tfinger.x > 0.78f && event.tfinger.y > 0.58f) click_edge_ = true;
-    }
-#else
-    (void)event;
-#endif
-}
-
 void InputDevice::Open(uint32_t id) {
     if (Find(id)) {
         return;
@@ -626,12 +573,6 @@ glm::vec2 InputDevice::Stick(const Pad& pad, int x_axis, int y_axis) const {
 
 void InputDevice::ProcessEvent(const SDL_Event& event) {
     switch (event.type) {
-    case SDL_EVENT_FINGER_DOWN:
-    case SDL_EVENT_FINGER_UP:
-    case SDL_EVENT_FINGER_MOTION:
-    case SDL_EVENT_FINGER_CANCELED:
-        UpdateTouch(event);
-        break;
     case SDL_EVENT_GAMEPAD_ADDED:
         Open(event.gdevice.which);
         if (const Pad* pad = Find(event.gdevice.which)) {
@@ -805,9 +746,6 @@ InputState InputDevice::Poll(bool keyboard_free, MouseUse mouse, bool pads_free)
         return false;
     };
     glm::vec2 move(0.0f);
-#if defined(PT_IOS)
-    move = touch_left_;
-#endif
     if (held(KeyAction::WalkForward)) move.y += 1.0f;
     if (held(KeyAction::WalkBack)) move.y -= 1.0f;
     if (held(KeyAction::WalkRight)) move.x += 1.0f;
@@ -868,11 +806,6 @@ InputState InputDevice::Poll(bool keyboard_free, MouseUse mouse, bool pads_free)
     if (mouse == MouseUse::Look) {
         state.mouse_look = glm::vec2(mouse_dx_, mouse_dy_) * settings.mouse_sensitivity;
     }
-#if defined(PT_IOS)
-    state.right_stick = glm::clamp(touch_look_ / 180.0f, glm::vec2(-1.0f), glm::vec2(1.0f));
-    state.mouse_look += touch_look_ * settings.mouse_sensitivity;
-    raw |= touch_raw_;
-#endif
     if (mouse != last_mouse_use_) {
         last_mouse_use_ = mouse;
         mouse_settle_ = kPromptMouseSettle;
@@ -937,7 +870,10 @@ InputState InputDevice::Poll(bool keyboard_free, MouseUse mouse, bool pads_free)
     if (pad_raw) {
         state.from_gamepad = true;
     }
-    state.fast_walk = state.fast_walk || (pad_raw & kRawCross) != 0;
+    // a click of the left stick (L3) hurries until it is clicked again or the stick is let go
+    if (pad_raw & ~previous_raw_ & kRawL3) pad_run_ = !pad_run_;
+    if (glm::length(left) < 0.2f) pad_run_ = false;
+    state.fast_walk = state.fast_walk || pad_run_;
     raw |= pad_raw;
     UpdateGyroSensors();
     {

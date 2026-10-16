@@ -58,6 +58,7 @@
 #include "engine/fs/vfs.h"
 #include "engine/physics/collision_world.h"
 #include "engine/platform/input.h"
+#include "engine/platform/touch_controls.h"
 #include "engine/platform/controller_speaker.h"
 #include "engine/platform/controller_feedback.h"
 #include "engine/platform/livesplit.h"
@@ -166,32 +167,19 @@ bool ProbeD3D12(std::string& reason) {
 namespace {
 
 #if defined(PT_IOS)
-void DrawIosTouchOverlay() {
+// SDL reports the window in the screen's native pixels, the swapchain is smaller by display.render_scale: ImGui draws into the
+// swapchain, so its framebuffer scale comes from the swapchain's size
+void MatchImGuiToSwapchain(const pt::vk::Context& ctx) {
     ImGuiIO& io = ImGui::GetIO();
-    if (io.DisplaySize.x <= 0.0f || io.DisplaySize.y <= 0.0f) return;
-    ImDrawList* draw = ImGui::GetForegroundDrawList();
-    const float w = io.DisplaySize.x;
-    const float h = io.DisplaySize.y;
-    const float scale = std::min(w, h) / 900.0f;
-    const ImVec2 left_center(w * 0.18f, h * 0.72f);
-    const float stick = 72.0f * scale;
-    const float button = 42.0f * scale;
-    auto circle = [&](ImVec2 p, float r, const char* label) {
-        draw->AddCircleFilled(p, r, IM_COL32(20, 20, 20, 72), 32);
-        draw->AddCircle(p, r, IM_COL32(255, 255, 255, 110), 32, 2.0f);
-        if (label) {
-            const ImVec2 size = ImGui::CalcTextSize(label);
-            draw->AddText(ImVec2(p.x - size.x * 0.5f, p.y - size.y * 0.5f), IM_COL32(255, 255, 255, 190), label);
-        }
-    };
-    draw->AddCircleFilled(left_center, stick, IM_COL32(20, 20, 20, 48), 40);
-    draw->AddCircle(left_center, stick, IM_COL32(255, 255, 255, 90), 40, 2.0f);
-    circle(ImVec2(w * 0.82f, h * 0.72f), button, "A");
-    circle(ImVec2(w * 0.70f, h * 0.79f), button, "B");
-    circle(ImVec2(w * 0.90f, h * 0.84f), button * 0.82f, "MENU");
-    draw->AddText(ImVec2(w * 0.54f, h * 0.90f), IM_COL32(255, 255, 255, 80), "drag right side to look");
+    if (io.DisplaySize.x > 0.0f && io.DisplaySize.y > 0.0f && ctx.swapchain.extent.width > 0) {
+        io.DisplayFramebufferScale = ImVec2(static_cast<float>(ctx.swapchain.extent.width) / io.DisplaySize.x,
+                                            static_cast<float>(ctx.swapchain.extent.height) / io.DisplaySize.y);
+    }
 }
 #endif
+
+// display.render_scale steps in PC settings (iOS)
+constexpr float kRenderScales[] = {0.5f, 0.6f, 0.667f, 0.75f, 0.85f, 1.0f};
 
 #ifdef PT_RELEASE_LOCKS
 constexpr bool kReleaseLocks = true;
@@ -688,6 +676,9 @@ void WriteWav(const std::filesystem::path& path, const std::vector<float>& sampl
 }
 
 struct App {
+#if defined(PT_IOS)
+    pt::TouchControls touch;
+#endif
     Options options;
     pt::AppSettings settings;
     pt::update::Checker updates;
@@ -2540,6 +2531,20 @@ public:
         const pt::AppSettings& s = app_.settings;
         pt::game::PcSettingSection display{"pc_section_display", 0, {}};
         const int mode = std::clamp(s.display.fullscreen, 0, 2);
+#if defined(PT_IOS)
+        // a phone has one screen size: instead of the window mode and size, the share of it the game draws at
+        {
+            pt::game::PcSettingRow scale = Row(kRenderScale, "pc_render_scale", {}, 0, "pc_note_render_scale");
+            for (size_t i = 0; i < std::size(kRenderScales); ++i) {
+                scale.values.push_back(std::format("{}%", static_cast<int>(std::lround(kRenderScales[i] * 100.0f))));
+                if (std::abs(kRenderScales[i] - s.display.render_scale) < 0.01f) scale.value = static_cast<int>(i);
+            }
+            scale.wrap = false;
+            display.rows.push_back(std::move(scale));
+        }
+        if (false)
+#endif
+        {
         display.rows.push_back(Row(kDisplayMode, "pc_display_mode", {"pc_window", "pc_borderless", "pc_fullscreen"}, mode, "pc_note_display_mode"));
         const char* resolution_note = mode == 0 ? "pc_note_resolution" : "pc_note_resolution_fullscreen";
         pt::game::PcSettingRow resolution = Row(kResolution, "pc_resolution", {}, 0, resolution_note);
@@ -2551,6 +2556,7 @@ public:
         resolution.wrap = false;
         resolution.enabled = mode != 1;
         display.rows.push_back(std::move(resolution));
+        }
         const bool dlssg_vsync = pt::streamline::Active() && pt::streamline::FrameGenNeedsVsyncOff() &&
                                  app_.scene.upscale.frame_generation == pt::FrameGenKind::Dlss;
         const bool metalfx_vsync = app_.scene.upscale.frame_generation == pt::FrameGenKind::Metalfx;
@@ -3064,6 +3070,9 @@ public:
             app_.livesplit.Configure(s.extras.livesplit, s.extras.livesplit_host, s.extras.livesplit_port);
             Save();
             return;
+        case kRenderScale:
+            s.display.render_scale = kRenderScales[std::clamp(value, 0, static_cast<int>(std::size(kRenderScales)) - 1)];
+            break;
         case kDisplayMode:
             s.display.fullscreen = std::clamp(value, 0, 2);
             ApplyFullscreen(app_);
@@ -3706,6 +3715,7 @@ private:
     enum RowId {
         kDisplayMode,
         kResolution,
+        kRenderScale,
         kVsync, kFpsLimit, kHdr, kHdrPaperWhite, kHdrPeak, kSurround, kControllerSpeaker, kControllerSpeakerVolume, kRumbleProfile, kPromptStyle,
         kFocusPause,
         kFocusMute,
@@ -4335,8 +4345,14 @@ private:
     std::vector<pt::UpscalerKind> Upscalers(std::vector<std::string>* notes) const {
         std::vector<pt::UpscalerKind> kinds{pt::UpscalerKind::Off};
         if (notes) notes->assign(1, std::string());
-        for (const pt::UpscalerKind kind : {pt::UpscalerKind::Fsr, pt::UpscalerKind::Fsr4, pt::UpscalerKind::Dlss, pt::UpscalerKind::Xess,
-                                            pt::UpscalerKind::MetalFx}) {
+#if defined(PT_IOS)
+        // the SDK upscalers are desktop binaries; iOS has Apple's own
+        constexpr pt::UpscalerKind kListed[] = {pt::UpscalerKind::MetalFx};
+#else
+        constexpr pt::UpscalerKind kListed[] = {pt::UpscalerKind::Fsr, pt::UpscalerKind::Fsr4, pt::UpscalerKind::Dlss, pt::UpscalerKind::Xess,
+                                                pt::UpscalerKind::MetalFx};
+#endif
+        for (const pt::UpscalerKind kind : kListed) {
             std::string reason;
             const bool available = app_.scene.UpscalerAvailable(kind, reason);
             kinds.push_back(kind);
@@ -4457,6 +4473,11 @@ bool PumpEvents(App& app, pt::InputDevice* input, bool& running, pt::KeyPressLat
     SDL_Event event;
     while (SDL_PollEvent(&event)) {
         ImGui_ImplSDL3_ProcessEvent(&event);
+#if defined(PT_IOS)
+        if (app.touch.ProcessEvent(event)) {
+            continue;
+        }
+#endif
         if (input) {
             input->ProcessEvent(event);
         }
@@ -5603,6 +5624,9 @@ int RunGame(App& app, pt::Vfs& vfs) {
         pending_input.left_stick = polled.left_stick;
         pending_input.right_stick = polled.right_stick;
         pending_input.fast_walk = polled.fast_walk;
+#if defined(PT_IOS)
+        pending_input.fast_walk = pending_input.fast_walk || app.touch.RunActive();
+#endif
         pending_input.mouse_look += polled.mouse_look;
         pending_input.gyro_turn += polled.gyro_turn;
         pending_input.gyro_light = polled.gyro_light;
@@ -5882,6 +5906,15 @@ int RunGame(App& app, pt::Vfs& vfs) {
             }
             const auto tick_t2 = std::chrono::steady_clock::now();
             ui.Update(theater ? theater->theater->Sandbox() : game, state, step);
+#if defined(PT_IOS)
+            using TouchMode = pt::TouchControls::Mode;
+            app.touch.SetFastWalk(app.settings.extras.fast_walk);
+            app.touch.SetUseAvailable(!theater && game.Floor().CurrentFloorName() == "f050");
+            app.touch.SetJackAvailable(!theater && game.VoiceListening() && !game.Paused());
+            app.touch.SetMode(ui_ready && ui.MenuOpen() && !theater
+                                  ? (ui.Menu().CurrentPage() == pt::game::OptionsMenu::Page::Original ? TouchMode::OriginalMenu : TouchMode::PcMenu)
+                                  : TouchMode::Gameplay);
+#endif
             const auto tick_t3 = std::chrono::steady_clock::now();
             frame_phases.current[FramePhases::kTicks] += std::chrono::duration<float, std::milli>(tick_t3 - tick_t0).count();
             static const bool io_log = std::getenv("PT_IO_LOG") != nullptr;
@@ -6178,6 +6211,12 @@ int RunGame(App& app, pt::Vfs& vfs) {
         }
 
         const bool voice_key_tapped = voice_key_press.Consume();
+#if defined(PT_IOS)
+        if (app.touch.TakeJack() && game.VoiceListening() && !game.Paused() && !ui.MenuOpen()) {
+            pt::LogInfo("voice: fallback Jack from the touch controls");
+            game.OnVoiceKeyword("jack");
+        }
+#endif
         if ((voice_key_tapped || polled.voice_keyword_pressed) && (app.window || options.virtual_pads) && voice_key != SDL_SCANCODE_UNKNOWN &&
             game.VoiceListening() && !game.Paused() && !ui.MenuOpen() && !show_settings && !show_debug && !app.microphone_test) {
             pt::LogInfo("voice: fallback Jack from {}", polled.voice_keyword_pressed ? "controller" : "keyboard");
@@ -6347,6 +6386,9 @@ int RunGame(App& app, pt::Vfs& vfs) {
             io.ConfigFlags = show_settings ? io.ConfigFlags | ImGuiConfigFlags_NavEnableGamepad : io.ConfigFlags & ~ImGuiConfigFlags_NavEnableGamepad;
             app.renderer.ImGuiNewFrame();
             ImGui_ImplSDL3_NewFrame();
+#if defined(PT_IOS)
+            MatchImGuiToSwapchain(app.renderer.Context());
+#endif
             ImGui::NewFrame();
             if (show_debug) {
                 pt::game::DrawGameDebugPanel(game);
@@ -6361,13 +6403,18 @@ int RunGame(App& app, pt::Vfs& vfs) {
                 DrawSettingsWindow(app, input, sound, game);
             }
 #if defined(PT_IOS)
-            if (!show_settings && !show_debug && !photo_mode && !game.Paused()) {
-                DrawIosTouchOverlay();
+            if (!show_settings && !show_debug && !photo_mode) {
+                app.touch.Draw(ImGui::GetForegroundDrawList(), ImGui::GetIO().DisplaySize.x, ImGui::GetIO().DisplaySize.y);
             }
 #endif
             ImGui::Render();
         }
         VkExtent2D base_render_extent{};
+#if defined(PT_IOS)
+        // iOS: the frame is the swapchain's size, display.render_scale of the screen (ios_display.mm), not the window's pixels
+        if (app.window) base_render_extent = app.renderer.Context().swapchain.extent;
+        else
+#endif
         if (!vr && app.window && app.settings.display.fullscreen != 2) {
             int width = 0;
             int height = 0;
@@ -6920,6 +6967,14 @@ bool WouldOpenWindow(const Options& options) {
 }
 
 int main(int argc, char** argv) {
+#if defined(PT_IOS)
+    // iOS starts the app in /: relative paths (--screenshot, --input-script, a route's shots) are in its Documents, which the
+    // Files app and devicectl reach (the container's absolute path changes with every install)
+    if (const char* documents = SDL_GetUserFolder(SDL_FOLDER_DOCUMENTS)) {
+        std::error_code ec;
+        std::filesystem::current_path(reinterpret_cast<const char8_t*>(documents), ec);
+    }
+#endif
 #ifdef _WIN32
     const HANDLE inherited = GetStdHandle(STD_ERROR_HANDLE);
     if ((inherited == nullptr || inherited == INVALID_HANDLE_VALUE) && AttachConsole(ATTACH_PARENT_PROCESS)) {
@@ -7365,6 +7420,9 @@ int main(int argc, char** argv) {
             return 1;
         }
         ApplyFullscreen(app);
+#if defined(PT_IOS)
+        app.touch.Init(app.window);
+#endif
         if (SDL_GetWindowFlags(app.window) & SDL_WINDOW_MINIMIZED) SDL_RestoreWindow(app.window);
         SDL_RaiseWindow(app.window);
         const bool in_front = pt::os::ActivateWindow(WindowHandle(app.window));
@@ -7427,6 +7485,7 @@ int main(int argc, char** argv) {
     ApplyGraphicsSettings(app);
     const pt::RayTracingSettings& rt = app.scene.raytracing;
     app.renderer.Context().want_ray_query = true;
+    app.renderer.Context().surface_scale = app.settings.display.render_scale;
     pt::UpscaleHost::Get().SetStartupUpscaler(app.scene.upscale.kind);
     app.streamline_marker = StartStreamline(app, d3d12);
     int result = 1;
@@ -7690,6 +7749,9 @@ int main(int argc, char** argv) {
     }
     pt::PresenceStop();
     if (app.window) {
+#if defined(PT_IOS)
+        app.touch.Shutdown();
+#endif
         SDL_DestroyWindow(app.window);
     }
     if (pt::devices::Stop()) SDL_Quit();

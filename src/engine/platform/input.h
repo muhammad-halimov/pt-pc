@@ -252,6 +252,7 @@ private:
     float mouse_dy_ = 0.0f;
     uint32_t previous_held_ = 0;
     uint32_t previous_raw_ = 0;
+    bool pad_run_ = false;
     bool previous_gouge_key_ = false;
     bool previous_house_key_ = false;
     uint32_t previous_menu_keys_ = 0;
