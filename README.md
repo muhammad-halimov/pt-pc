@@ -1,8 +1,6 @@
 # P.T. for iOS
 
-![The hallway on an iPhone 15](docs/media/ios_hallway.gif)
-
-*The hallway on an iPhone 15 (A16), drawn on the phone at 67 % of its screen.*
+![Lisa in the hallway](docs/media/lisa.gif)
 
 This is the iPhone and iPad build of [LoreanXavier's native P.T. port](https://github.com/LoreanXavier/pt-pc), the
 2014 PS4 teaser by Kojima Productions rebuilt in C++ on Vulkan. It is not an emulator: every level, model, texture,
@@ -47,6 +45,12 @@ In the menus the buttons follow a pad: L1, Resume and Zoom along the top left, B
 right, language and brightness (or the directions) bottom left, the camera inversion bottom right. The controls keep
 clear of the notch, the Dynamic Island and the home indicator.
 
+![Touch controls in play](docs/media/ios_touch_play.jpg)
+
+![Touch controls in the original options](docs/media/ios_touch_menu.jpg)
+
+*The touch controls in play and in the original options, captured on an iPhone 15.*
+
 Gamepad: any controller iOS knows works as the PS4 pad, with the original's prompts and vibration. Whatever was used
 last rules: pressing a button or moving a stick on the pad hides the touch controls, touching the screen brings them back.
 Clicking the left stick (L3) hurries until you click it again or stop.
@@ -64,7 +68,9 @@ Clicking the left stick (L3) hurries until you click it again or stop.
   generation, VR, and the iOS Simulator (MoltenVK's iOS release has
   no simulator slice).
 
-![The hallway, still, on an iPhone 15](docs/media/ios_hallway.jpg)
+![The hallway on an iPhone 15](docs/media/ios_hallway.gif)
+
+*The hallway on an iPhone 15 (A16), rendered on the phone at 67 % of its screen.*
 
 Performance on an iPhone 15 (60 Hz screen, v-sync on, so frame rates step through 60, 30 and 20): the original preset at
 67 % without an upscaler draws in about 26 to 30 ms on the GPU, MetalFX at Ultra performance about 24 ms, which holds
